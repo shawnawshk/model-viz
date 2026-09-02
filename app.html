@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>并行策略与显存分布</title>
+<script>window.REG = { instances: {}, models: {} };</script>
+<script src="data/instances.js"></script>
+<script src="data/models/kimi-k3.js"></script>
+<style>
+  /* Light is the base; the dark column is the same hues re-stepped for the dark
+     surface (both modes validated against their own surface, not an auto-flip).
+     Declared on :root so body text and the tooltip layer resolve them too. */
+  :root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --muted:          #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-attn:    #2a78d6;
+    --series-expert:  #eb6834;
+    --series-kv:      #1baf7a;
+    --series-kda:     #eda100;
+    --overhead:       #898781;
+    --track:          #ecece6;
+    --st-good:        #0ca30c;
+    --st-warning:     #fab219;
+    --st-critical:    #d03b3b;
+    --st-warning-ink: #8a5d00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-attn:    #3987e5;
+      --series-expert:  #d95926;
+      --series-kv:      #199e70;
+      --series-kda:     #c98500;
+      --track:          #2c2c2a;
+      --st-warning-ink: #fab219;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-attn:    #3987e5;
+    --series-expert:  #d95926;
+    --series-kv:      #199e70;
+    --track:          #2c2c2a;
+    --st-warning-ink: #fab219;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--page);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.55;
+  }
+  .viz-root { background: var(--page); color: var(--text-primary); min-height: 100vh; padding: 28px 24px 64px; }
+  .wrap { max-width: 1400px; margin: 0 auto; }
+
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 22px; }
+  .sub code { background: var(--surface-1); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; font-size: 12px; }
+
+  /* ---- one filter row above everything it scopes ---- */
+  .controls {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 8px;
+    display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end;
+  }
+  .grp { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+  .ctl { display: flex; flex-direction: column; gap: 5px; }
+  .ctl > label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .ctl select, .ctl input[type=range] { font-family: inherit; font-size: 13px; }
+  .ctl select {
+    background: var(--page); color: var(--text-primary); border: 1px solid var(--baseline);
+    border-radius: 6px; padding: 6px 8px; min-width: 74px; min-height: 32px;
+  }
+  .ctl input[type=range] { width: 170px; min-height: 32px; accent-color: var(--series-kv); }
+  /* 读数类元素必须固定宽度:否则数字变长会改变 flex 换行决策,
+     整行重排,连正在拖动的滑块都会跳到别的行去。min-width 按最长内容取。 */
+  .eq { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums;
+        padding-bottom: 7px; text-align: left; }
+  .eq b { color: var(--text-primary); font-weight: 600; }
+  #eq     { min-width: 208px; }   /* TP 32 × DP 32 × PP 32 = 128 张 GPU */
+  #totlab { min-width: 224px; }   /* 4,096 路 × 1M = 4.29B tokens */
+  /* label 里的动态后缀同理 */
+  .ctl > label > span { display: inline-block; text-align: left; font-variant-numeric: tabular-nums; }
+  #conclab   { min-width: 66px; }  /* = 4,096 路 */
+  #ctxlab    { min-width: 50px; }  /* = 128K */
+  #utillab   { min-width: 122px; } /* = 1.00 → 269 GiB */
+  #expFmtLab { min-width: 74px; }  /* = 5072 GiB */
+  #precLab   { min-width: 66px; }  /* = 107 GiB */
+  #epLab     { min-width: 42px; }  /* ≤ 128 */
+  .spacer { flex: 1 1 auto; }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; }
+  .presets button, .ghost {
+    font-family: inherit; font-size: 12px; cursor: pointer;
+    background: var(--page); color: var(--text-secondary);
+    border: 1px solid var(--baseline); border-radius: 6px; padding: 6px 10px; min-height: 30px;
+  }
+  .presets button:hover, .ghost:hover { color: var(--text-primary); border-color: var(--muted); }
+  /* 选中态:实心边框 + 加粗。与下面的 focus 环刻意区分,避免「点过就以为还选着」 */
+  .presets button[aria-pressed=true] { color: var(--text-primary); border-color: var(--text-primary); border-width: 2px; padding: 5px 9px; }
+  .presets button[aria-pressed=true] .pn { font-weight: 700; }
+  .presets button:focus-visible, .ghost:focus-visible { outline: 2px solid var(--series-attn); outline-offset: 2px; }
+  /* 预设自带机型;当前机型不匹配时变淡 —— 点它会把机型一起切过去 */
+  .presets button { display: flex; flex-direction: column; align-items: flex-start; gap: 0; line-height: 1.35; text-align: left; }
+  .presets button[data-off="1"] { opacity: .5; }
+  .presets .pn { font-size: 12px; }
+  .presets .pi { font-size: 9.5px; color: var(--muted); font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+
+  /* ---- 边界声明 ---- */
+  .scope {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 3px solid var(--st-warning); border-radius: 8px;
+    padding: 12px 16px; margin: 14px 0 0; font-size: 12.5px;
+  }
+  .scope .sc-t { font-weight: 600; color: var(--st-warning-ink); margin-bottom: 6px; }
+  .scope ul { margin: 0; padding-left: 20px; color: var(--text-secondary); }
+  .scope li { margin-bottom: 3px; }
+  .scope .sc-f { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--grid); color: var(--text-secondary); }
+  /* provenance 标记:图标/文字承载,不靠颜色单独表意 */
+  .pv { font-size: 10px; font-weight: 700; border-radius: 3px; padding: 1px 4px; white-space: nowrap;
+        border: 1px solid var(--baseline); color: var(--text-secondary); }
+  .pv-g::before { content: "◆ "; }
+  .pv-e::before { content: "◇ "; }
+  .pv-s::before { content: "● "; }
+
+  /* ---- banners ---- */
+  .banners { display: flex; flex-direction: column; gap: 6px; margin: 14px 0 18px; }
+  .banner {
+    display: flex; gap: 10px; align-items: baseline;
+    border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
+    background: var(--surface-1); padding: 9px 13px; font-size: 13px;
+  }
+  .banner .ico { font-weight: 700; font-size: 13px; flex: none; }
+  .banner .bt { font-weight: 600; flex: none; }
+  .banner .bd { color: var(--text-secondary); }
+  .b-critical { border-left-color: var(--st-critical); } .b-critical .ico, .b-critical .bt { color: var(--st-critical); }
+  .b-warning  { border-left-color: var(--st-warning); }  .b-warning  .ico, .b-warning  .bt { color: var(--st-warning-ink); }
+  .b-good     { border-left-color: var(--st-good); }     .b-good     .ico, .b-good     .bt { color: var(--st-good); }
+  .b-info     { border-left-color: var(--baseline); }    .b-info     .ico, .b-info     .bt { color: var(--text-secondary); }
+
+  /* ---- stat tiles / hero ---- */
+  .tiles { display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+  @media (max-width: 940px) { .tiles { grid-template-columns: 1fr 1fr; } }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .tl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; margin-bottom: 5px; }
+  .tile .tv { font-size: 25px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; }
+  .tile.hero .tv { font-size: 48px; }
+  .tile .tu { font-size: 13px; font-weight: 400; color: var(--text-secondary); margin-left: 5px; }
+  .tile .td { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
+
+  /* ---- node grid ---- */
+  .sechead { display: flex; align-items: baseline; gap: 12px; margin: 0 0 10px; }
+  .sechead h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .sechead .note { font-size: 12px; color: var(--muted); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 14px; font-size: 12px; color: var(--text-secondary); }
+  .legend .item { display: flex; align-items: center; gap: 6px; }
+  .legend .sw { width: 11px; height: 11px; border-radius: 2px; flex: none; }
+
+  .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(430px, 1fr)); gap: 12px; }
+  .node { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px 14px; }
+  .node.over { border-color: var(--st-critical); }
+  .node .nh { display: flex; align-items: baseline; gap: 8px; border-bottom: 1px solid var(--grid); padding-bottom: 8px; margin-bottom: 4px; }
+  .node .nh .nn { font-size: 13px; font-weight: 600; }
+  .node .nh .ns { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+
+  .gpu { display: grid; grid-template-columns: 46px 1fr 62px; gap: 9px; align-items: center; padding: 4px 0; }
+  /* 首行要给 caprule 的数值标签留位,否则与节点标题行撞 */
+  .node .gpu:first-of-type { padding-top: 12px; }
+  .gpu .gid { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .gpu .gtot { font-size: 11px; color: var(--text-secondary); text-align: right; font-variant-numeric: tabular-nums; }
+  .gpu.over .gtot { color: var(--st-critical); font-weight: 600; }
+
+  .barwrap { display: flex; flex-direction: column; gap: 3px; }
+  .bar {
+    position: relative; height: 14px; background: var(--track);
+    border-radius: 3px; display: flex; overflow: visible;
+  }
+  .seg { height: 14px; position: relative; cursor: default; }
+  .seg + .seg { margin-left: 2px; }          /* 2px surface gap between fills */
+  .bar { gap: 0; }
+  .seg:first-child { border-radius: 3px 0 0 3px; }
+  .seg.last { border-radius: 0 4px 4px 0; }  /* 4px rounded data-end */
+  .seg:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
+  .seg.s-attn   { background: var(--series-attn); }
+  .seg.s-expert { background: var(--series-expert); }
+  .seg.s-kv     { background: var(--series-kv); }
+  .seg.s-kda    { background: var(--series-kda); }
+  .seg.s-oh     { background: var(--overhead); }
+  /* util 预算刻度线:标出引擎真正的天花板在哪,而不是凭空多画一段色块 */
+  .caprule { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--baseline); }
+  .caprule.over { background: var(--st-critical); }
+  .caprule[data-l]::after { content: attr(data-l); position: absolute; top: -14px; left: 3px; font-size: 9px; color: var(--muted); font-weight: 700; white-space: nowrap; }
+  .caprule.over::after { color: var(--st-critical); }
+  .badges { display: flex; flex-wrap: wrap; gap: 4px; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .badge { border: 1px solid var(--grid); border-radius: 3px; padding: 0 4px; white-space: nowrap; }
+  .badge.hl { border-color: var(--baseline); color: var(--text-secondary); }
+
+  /* ---- tooltip ---- */
+  #tip {
+    position: fixed; z-index: 50; pointer-events: none; opacity: 0;
+    transition: opacity .09s; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--baseline); border-radius: 7px; padding: 8px 10px;
+    font-size: 12px; box-shadow: 0 6px 22px rgba(0,0,0,.16); max-width: 300px;
+  }
+  #tip .tt { font-weight: 600; margin-bottom: 3px; display: flex; align-items: center; gap: 6px; }
+  #tip .tt .sw { width: 9px; height: 9px; border-radius: 2px; }
+  #tip .tr { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+  /* ---- comm + table ---- */
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 22px; }
+  @media (max-width: 940px) { .twocol { grid-template-columns: 1fr; } }
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .panel h3 { font-size: 13px; font-weight: 600; margin: 0 0 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tbody tr:last-child td { border-bottom: none; }
+  td .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  .xnode { color: var(--st-critical); font-weight: 600; }
+  .innode { color: var(--st-good); }
+
+  details.assump { margin-top: 22px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+  details.assump summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  details.assump ul { margin: 10px 0 0; padding-left: 20px; color: var(--text-secondary); font-size: 12.5px; }
+  details.assump li { margin-bottom: 5px; }
+  details.assump code { background: var(--page); border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="viz-root">
+<div class="wrap">
+
+  <h1 id="h1"></h1>
+  <p class="sub" id="sub"></p>
+
+  <!-- filter row: one row above everything it scopes -->
+  <div class="controls">
+    <div class="grp">
+      <div class="ctl"><label for="instId">机型</label><select id="instId"></select></div>
+      <div class="ctl"><label for="n">台数</label><select id="n"></select></div>
+      <div class="ctl"><label for="tp">TP</label><select id="tp"></select></div>
+      <div class="ctl"><label for="dp">DP</label><select id="dp"></select></div>
+      <div class="ctl"><label for="pp">PP</label><select id="pp"></select></div>
+      <div class="ctl"><label for="ep" id="epLabel">EP <span id="epLab"></span></label><select id="ep"></select></div>
+      <div class="eq" id="eq"></div>
+    </div>
+    <div class="grp">
+      <div class="ctl"><label for="conc">并发请求 <span id="conclab"></span></label><input type="range" id="conc" min="0" step="1"></div>
+      <div class="ctl"><label for="ctx">上下文长度 <span id="ctxlab"></span></label><input type="range" id="ctx" min="0" step="1"></div>
+      <div class="eq" id="totlab"></div>
+    </div>
+    <div class="grp">
+      <div class="ctl"><label for="util">gpu_mem_utilization <span id="utillab"></span></label><input type="range" id="util" min="70" max="100" step="1"></div>
+      <div class="ctl"><label for="expFmt">expert 权重 <span id="expFmtLab"></span></label><select id="expFmt"></select></div>
+      <div class="ctl"><label for="prec">非 expert 权重 <span id="precLab"></span></label><select id="prec"></select></div>
+      <div class="ctl"><label for="kvDt">KV cache dtype <span id="kvDtLab"></span></label><select id="kvDt"></select></div>
+      <div class="ctl"><label for="theme">主题</label><button class="ghost" id="theme">切换深色</button></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="ctl"><label>预设</label><div class="presets" id="presets"></div></div>
+  </div>
+
+  <!-- 边界声明:此页可能被外部读者看到,数字的适用范围必须在页面上,不能只写在设计文档里 -->
+  <div class="scope">
+    <div class="sc-t">这张图只算显存。读数字前请先看这四条。</div>
+    <ul>
+      <li><b>不回答吞吐、延迟、TTFT/ITL。</b> 完全不涉及 FLOPS 与通信耗时 —— 「装得下」不等于「跑得快」。</li>
+      <li><b>不回答价格与可得性。</b> 不含 $/小时、region 覆盖、Capacity Blocks 约束。因此本页<b>不能</b>用于回答「哪个实例更值」。</li>
+      <li><b>头号数字建立在一个猜测值上。</b> 每卡 12 GiB 的「激活 + 通信 buffer」是拍的,无实测依据,而它直接决定最大并发。凡带 <span class="pv pv-g">猜测</span> 标记的数字都不可作为承诺。</li>
+      <li id="scope-params"></li>
+    </ul>
+    <div class="sc-f">用途:配置可行性自查与教学。<b>不是</b>容量规划或采购依据 —— 那需要在目标机型上实测一次(读引擎自报的 KV block 数反解真实 overhead)。</div>
+  </div>
+
+  <div class="banners" id="banners"></div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="sechead">
+    <h2>每台机器 / 每张 GPU 的显存构成</h2>
+    <span class="note" id="barnote">底槽 = 物理显存 · 竖线 = util 预算(真正的天花板)· 悬停或聚焦任一色块看精确值 · 徽章标出该卡在各并行维度中的 rank</span>
+  </div>
+  <div class="legend" id="legend"></div>
+  <div class="nodes" id="nodes"></div>
+
+  <div class="twocol">
+    <div class="panel">
+      <h3>每个 decode step 的通信(93 层)</h3>
+      <table id="commtbl"></table>
+    </div>
+    <div class="panel">
+      <h3>表格视图 — 单卡显存明细</h3>
+      <table id="tbl"></table>
+    </div>
+  </div>
+
+  <details class="assump">
+    <summary>计算口径与假设(点开)</summary>
+    <ul id="assumplist"></ul>
+  </details>
+
+</div>
+</div>
+<div id="tip" role="tooltip" aria-live="polite"></div>
+
+<script>
+"use strict";
+
+// ---------------- 模型常量(来自 Kimi-K3 config.json) ----------------
+const GIB = 1024 ** 3;
+const PV_LABEL = { s: "推导", e: "估算", g: "猜测", m: "实测" };
+
+// ---------------- 注册表 → 当前模型 ----------------
+const MODEL_ID = new URLSearchParams(location.search).get("model") || "kimi-k3";
+const MD = REG.models[MODEL_ID];
+if (!MD) {
+  document.body.innerHTML = `<p style="padding:48px;font-family:system-ui">未知模型 <code>${MODEL_ID}</code>。`
+    + `可用:${Object.keys(REG.models).join(", ")}</p>`;
+  throw new Error("unknown model: " + MODEL_ID);
+}
+
+// attention family 的语义表。KV 复制因子与 state 可切性按 family 而异,不是全局常数。
+// 加一个 family 就是加一条,引擎不动。
+// perTokenElems 返回「元素数」而不是字节 —— KV cache 的 dtype 是引擎运行时选项
+// (--kv-cache-dtype),不是模型属性,由 UI 选择后在 compute() 里乘上去。见 ADR-0007。
+const FAMILY = {
+  // MLA:压缩 latent 被所有 head 共享 → TP 组内每卡各存一份完整副本(即不除以 TP)
+  mla:    { perTokenElems: g => g.kvLoraRank + g.qkRopeDim,
+            perReqBytes:   () => 0,
+            stateShardableByTp: false },
+  // 线性注意力:recurrent state 与序列长度无关,per-head 可按 TP 真正切开
+  linear: { perTokenElems: () => 0,
+            perReqBytes:   g => g.heads * g.headDim * g.headDim * g.stateDtypeBytes,
+            stateShardableByTp: true },
+};
+
+const M = {
+  layers: MD.totalLayers, moeLayers: MD.moe.layers,
+  nExperts: MD.moe.experts, topk: MD.moe.topk, sharedExperts: MD.moe.sharedExperts,
+  moeLatent: MD.moe.latent, moeInter: MD.moe.inter,
+  bf16Params: MD.weights.bf16Params, f32Params: MD.weights.f32Params,
+};
+M.nonExpertParams = M.bf16Params + M.f32Params;
+M.nonExpertBytes  = M.bf16Params * 2 + M.f32Params * 4;
+M.expertBytesNative = MD.weights.totalBytes - M.nonExpertBytes;  // 实测:total_size 减非 expert
+M.paramsPerExpert = 3 * M.moeLatent * M.moeInter;
+M.expertParams    = M.moeLayers * M.nExperts * M.paramsPerExpert;
+M.totalParams     = M.expertParams + M.nonExpertParams;
+M.expertBytesPerParam = M.expertBytesNative / M.expertParams;   // K3 上恰为 0.53125
+
+// 按 family 汇总:每 token 的 KV 元素数(未复制、与 dtype 无关)、每请求的 state 字节(未切分)
+M.kvElemsPerToken = 0; M.stateBytesPerReq = 0; M.stateShardableByTp = false;
+for (const g of MD.layers) {
+  const f = FAMILY[g.family];
+  if (!f) throw new Error("未知 attention family: " + g.family);
+  M.kvElemsPerToken  += g.count * f.perTokenElems(g);
+  const per = g.count * f.perReqBytes(g);
+  M.stateBytesPerReq += per;
+  if (per > 0 && f.stateShardableByTp) M.stateShardableByTp = true;
+}
+
+// 显存真值来自 describe-instance-types 的 MemoryInfo.SizeInMiB(见 data/instances.js);
+// 内部一律用字节,UI 一律 GiB。切勿把 GiB 当十进制 GB —— 那会低估 7.4%。
+const HW = {
+  get id()          { return S.instId; },
+  get spec()        { return REG.instances[S.instId]; },
+  get gpusPerNode() { return this.spec.gpusPerInstance; },   // 每实例卡数
+  get domain()      { return this.spec.nvlinkDomainGpus; },  // NVLink 域 = TP 上限
+  get gpuMem()      { return this.spec.gpuMemMiB * 1024 * 1024; },
+  overheadPerGpu: 12 * GIB,
+};
+
+const CONC_STEPS = [1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,4096];
+const CTX_STEPS  = [1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576];
+
+const PRESETS = MD.presets.filter(p => {
+  if (REG.instances[p.inst] && MD.candidateInstances.includes(p.inst)) return true;
+  console.warn(`预设「${p.name}」引用了非候选机型 ${p.inst},已跳过。`
+    + `请把它加进 candidateInstances,或改掉这个预设。`);
+  return false;
+});
+
+// ---------------- 状态 ----------------
+// ?instance=<id> 可直接指定机型(须在该模型的 candidateInstances 内),便于分享链接
+const qsInst = new URLSearchParams(location.search).get("instance");
+const S = { instId: MD.candidateInstances.includes(qsInst) ? qsInst : MD.defaultInstance,
+            n: 4, tp: 8, dp: 4, pp: 1, ep: 32,
+            concIdx: 0, ctxIdx: 7, util: 90,   // 并发默认 1 路:hero 已给出上限,
+                                               // 滑块从 1 起才是干净的探索起点,不会一打开就撞红
+            expFmt: MD.quantFormat,                    // 默认原生格式
+            neFmt: MD.nonExpertFormats[0].id,          // 默认实际存储格式
+            kvDt: MD.kvDtypes[0].id };                 // 默认引擎默认值(不加参数就是这一档)
+
+const divisors = n => { const r = []; for (let i = 1; i <= n; i++) if (n % i === 0) r.push(i); return r; };
+const world = () => S.n * HW.gpusPerNode;
+let epClamp = null;   // 记录 EP 被自动夹取的那一次,渲染后清空
+const stageGpus = () => S.tp * S.dp;
+
+// ---------------- 核心计算 ----------------
+function compute() {
+  const W = world(), stage = stageGpus();
+  // 非 expert:BF16 是实际存储(精确);FP8 是假设重量化。F32 的 norms 两种情况都不动。
+  const neFmt = MD.nonExpertFormats.find(f => f.id === S.neFmt) || MD.nonExpertFormats[0];
+  const nonExpertBytes = M.bf16Params * neFmt.bf16Bytes + M.f32Params * 4;
+  // expert:原生格式用实测字节数;其余是重量化后的推算值
+  const expFmt = MD.expertFormats.find(f => f.id === S.expFmt) || MD.expertFormats[0];
+  const expertNative = expFmt.bytesPerParam === null;
+  const expertBytesTotal = expertNative ? M.expertBytesNative
+                                        : M.expertParams * expFmt.bytesPerParam;
+
+  // 每 GPU:非 expert 权重按 PP 切层、再按 TP 切矩阵;DP 维度上是复制
+  const attn   = nonExpertBytes / S.pp / S.tp;
+  // 每 GPU:expert bank 按 PP 切层、再按 EP 分专家;stage 内 EP 不足则复制
+  const expert = expertBytesTotal / S.pp / S.ep;
+  const oh     = HW.overheadPerGpu;
+
+  const conc = CONC_STEPS[S.concIdx], ctx = CTX_STEPS[S.ctxIdx];
+  const kvTokens = conc * ctx;
+
+  // KV dtype:引擎运行时选项(--kv-cache-dtype),不是模型属性 —— 由 UI 选,见 ADR-0007
+  const kvDt = MD.kvDtypes.find(f => f.id === S.kvDt) || MD.kvDtypes[0];
+  const kvBytesPerToken = M.kvElemsPerToken * kvDt.bytes;
+
+  // KV:随上下文长度涨。MLA 的 latent 被所有 head 共享 → TP 内复制,故不除 TP
+  const kvPerReq = ctx * kvBytesPerToken / S.dp / S.pp;
+  const kv = conc * kvPerReq;
+  // recurrent state:与上下文长度无关,只随并发涨。per-head 可按 TP 切开,不复制
+  const statePerReq = M.stateBytesPerReq / (M.stateShardableByTp ? S.tp : 1) / S.dp / S.pp;
+  const state = conc * statePerReq;
+
+  // 引擎能动用的预算 = 物理显存 × gpu_memory_utilization
+  const budget = HW.gpuMem * (S.util / 100);
+
+  const used = attn + expert + oh + kv + state;
+  const free = budget - used;
+
+  // 容量:预算里扣掉权重和 overhead,剩下的在当前上下文长度下能收多少路并发
+  const freeForState = budget - attn - expert - oh;
+  const perReq = kvPerReq + statePerReq;
+  const maxConc = freeForState > 0 ? freeForState / perReq : 0;
+  const kvCapacity = maxConc * ctx;
+
+  // 敏感度:换成另一档 KV dtype 后的并发。ADR-0004 要求能翻转结论的假设必须把反事实一起显示,
+  // 不许只给一个干净数字。(kvDtypes 是两档列表,故「另一档」= 第一个 id 不同的项。)
+  const kvAlt = MD.kvDtypes.find(f => f.id !== kvDt.id) || kvDt;
+  const perReqAlt = ctx * M.kvElemsPerToken * kvAlt.bytes / S.dp / S.pp + statePerReq;
+  const maxConcAlt = freeForState > 0 ? freeForState / perReqAlt : 0;
+
+  // 集群总存量
+  const totalAttnStored   = attn * W;
+  const totalExpertStored = expert * W;
+
+  const expertsPerGpuPerLayer = M.nExperts / S.ep;
+  const expertBankCopies = stage / S.ep;
+
+  return { W, stage, attn, expert, oh, kv, state, used, free, budget, kvTokens, kvCapacity,
+           expFmt, neFmt, expertNative, expertBytesTotal, nonExpertBytes,
+           kvDt, kvBytesPerToken, kvAlt, maxConcAlt,
+           conc, ctx, kvPerReq, statePerReq, perReq, maxConc,
+           totalAttnStored, totalExpertStored, expertsPerGpuPerLayer, expertBankCopies,
+           freeForState };
+}
+
+function ranks(g) {
+  const stage = stageGpus();
+  const pp = Math.floor(g / stage), local = g % stage;
+  return { pp, dp: Math.floor(local / S.tp), tp: local % S.tp, ep: local % S.ep, node: Math.floor(g / HW.gpusPerNode), local };
+}
+
+// ---------------- 格式化 ----------------
+const gib = b => (b / GIB);
+const fgib = b => { const v = gib(b); return (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1)); };
+function ftok(t) {
+  if (t >= 1e9) return (t / 1e9).toFixed(2) + "B";
+  if (t >= 1e6) return (t / 1e6).toFixed(t >= 1e7 ? 1 : 2) + "M";
+  if (t >= 1e3) return (t / 1e3).toFixed(0) + "K";
+  return t.toFixed(0);
+}
+const fint = n => n.toLocaleString("en-US");
+const fctx = t => t >= 1048576 ? (t / 1048576) + "M" : (t / 1024) + "K";
+
+// ---------------- 控件 ----------------
+function fillSelect(el, opts, val) {
+  el.innerHTML = opts.map(o => `<option value="${o}"${o === val ? " selected" : ""}>${o}</option>`).join("");
+}
+
+function syncOptions(changed) {
+  const W = world();
+
+  // 硬约束 TP × DP × PP = world:动谁就调另一个,永不进入非法态
+  const fix = () => {
+    if (changed === "dp" || changed === "n" || changed === "instId") {
+      if (W % (S.dp * S.pp) !== 0) S.pp = 1;
+      S.tp = Math.max(1, W / (S.dp * S.pp));
+      if (!Number.isInteger(S.tp)) { S.pp = 1; S.dp = Math.min(S.dp, W); S.tp = W / S.dp; }
+    } else {
+      if (W % (S.tp * S.pp) !== 0) S.pp = 1;
+      S.dp = Math.max(1, W / (S.tp * S.pp));
+      if (!Number.isInteger(S.dp)) { S.pp = 1; S.tp = Math.min(S.tp, W); S.dp = W / S.tp; }
+    }
+  };
+  S.tp = Math.min(S.tp, W); S.pp = Math.min(S.pp, W); S.dp = Math.min(S.dp, W);
+  fix();
+
+  // EP:在一个 pipeline stage 内切专家 → 必须整除 stage 规模,且整除 896
+  const stage = stageGpus();
+  const epOpts = divisors(stage).filter(d => M.nExperts % d === 0);
+  if (!epOpts.includes(S.ep)) {
+    const from = S.ep;
+    S.ep = epOpts.reduce((a, b) => (Math.abs(b - S.ep) < Math.abs(a - S.ep) ? b : a), epOpts[0]);
+    if (from !== S.ep) epClamp = { from, to: S.ep, stage };   // 让这次自动调整可见,不静默
+  }
+
+  fillSelect(document.getElementById("instId"), MD.candidateInstances, S.instId);
+  fillSelect(document.getElementById("n"), [1,2,3,4,5,6,8,10,12,16], S.n);
+  fillSelect(document.getElementById("tp"), divisors(W), S.tp);
+  fillSelect(document.getElementById("dp"), divisors(W), S.dp);
+  fillSelect(document.getElementById("pp"), divisors(W), S.pp);
+  fillSelect(document.getElementById("ep"), epOpts, S.ep);
+  const eSel = document.getElementById("expFmt");
+  eSel.innerHTML = MD.expertFormats.map(f =>
+    `<option value="${f.id}"${f.id === S.expFmt ? " selected" : ""}>${f.label}</option>`).join("");
+  const nSel = document.getElementById("prec");
+  nSel.innerHTML = MD.nonExpertFormats.map(f =>
+    `<option value="${f.id}"${f.id === S.neFmt ? " selected" : ""}>${f.label}</option>`).join("");
+  const kSel = document.getElementById("kvDt");
+  kSel.innerHTML = MD.kvDtypes.map(f =>
+    `<option value="${f.id}"${f.id === S.kvDt ? " selected" : ""}>${f.label}</option>`).join("");
+
+  const cEl = document.getElementById("conc"), xEl = document.getElementById("ctx");
+  cEl.max = String(CONC_STEPS.length - 1); cEl.value = String(S.concIdx);
+  xEl.max = String(CTX_STEPS.length - 1);  xEl.value = String(S.ctxIdx);
+  document.getElementById("util").value = String(S.util);
+
+  document.getElementById("eq").innerHTML =
+    `TP <b>${S.tp}</b> × DP <b>${S.dp}</b> × PP <b>${S.pp}</b> = <b>${W}</b> 张 GPU`;
+  document.getElementById("epLab").textContent = `≤ ${stage}`;
+  document.getElementById("epLabel").title =
+    `EP 上限 = 一个 pipeline stage 的卡数 = world ÷ PP = ${W} ÷ ${S.pp} = ${stage}\n`
+    + `(不是总卡数 ${W}。PP 按层切分,每个 stage 只持有自己那几层,`
+    + `这些层的专家只能摊在本 stage 的 ${stage} 张卡上。)\n`
+    + `同时 EP 必须整除 routed expert 数 ${M.nExperts},故可选:${epOpts.join(", ")}`;
+  syncLoadLabels();
+}
+
+// 并发 × 上下文长度 = 总 tokens
+function syncLoadLabels() {
+  const conc = CONC_STEPS[S.concIdx], ctx = CTX_STEPS[S.ctxIdx];
+  document.getElementById("conclab").textContent = `= ${fint(conc)} 路`;
+  document.getElementById("ctxlab").textContent = `= ${fctx(ctx)}`;
+  document.getElementById("totlab").innerHTML =
+    `<b>${fint(conc)}</b> 路 × <b>${fctx(ctx)}</b> = <b>${ftok(conc * ctx)}</b> tokens`;
+  document.getElementById("utillab").textContent =
+    `= ${(S.util / 100).toFixed(2)} → ${fgib(HW.gpuMem * S.util / 100)} GiB`;
+}
+
+// ---------------- 校验 ----------------
+function banners(C) {
+  const out = [];
+  const fits = C.used <= C.budget;
+  const bud = `预算 ${fgib(C.budget)} GiB(${fgib(HW.gpuMem)} × ${(S.util / 100).toFixed(2)})`;
+
+  if (!fits) out.push(["critical", "✕", "装不下",
+    `单卡需要 ${fgib(C.used)} GiB,超出${bud} ${fgib(C.used - C.budget)} GiB` +
+    (C.used > HW.gpuMem ? `,连 ${fgib(HW.gpuMem)} GiB 物理显存都超了 ${fgib(C.used - HW.gpuMem)} GiB` : `(物理显存还剩 ${fgib(HW.gpuMem - C.used)} GiB,但引擎不会去碰)`) + "。" +
+    (C.attn > 40 * GIB ? ` 主因是非 expert 权重被复制了 ${S.dp} 份而 TP 只切 ${S.tp} 份 —— 单卡就要背 ${fgib(C.attn)} GiB。` : "")]);
+  else out.push(["good", "✓", "装得下", `单卡峰值 ${fgib(C.used)} GiB / ${bud},余量 ${fgib(C.free)} GiB。`]);
+
+  if (S.tp > HW.domain) {
+    const pcie = HW.spec.p2p.type === "pcie";
+    out.push(["critical", "!", `TP=${S.tp} 超出 NVLink 域(${HW.domain})`,
+      pcie
+        ? `${HW.id} 的 ${HW.gpusPerNode} 张卡之间没有 NVLink,只有 PCIe。TP 的 ${M.layers * 2} 次 all-reduce 全部走 PCIe —— 对这个层数不可接受。这类机型上 TP 的实际上限是 <b>1</b>,显存装得下也不代表能用。`
+        : `TP 组横跨 ${S.tp / HW.domain} 个 NVLink 域,${M.layers * 2} 次 all-reduce 走 EFA(${HW.spec.interDomainGbps} Gbps),而不是 NVSwitch(${HW.spec.p2p.gbs} GB/s)。这是这类硬件上最贵的一个决定。`]);
+  }
+  else if (S.tp === 1) out.push(["good", "✓", "TP=1,attention 无 all-reduce",
+    `没有张量并行就没有 all-reduce。代价在显存:非 expert 权重一张卡背满 ${fgib(C.attn)} GiB。`]);
+  else out.push(["good", "✓", `TP=${S.tp} 在 NVLink 域内(域 ${HW.domain})`,
+    `${M.layers * 2} 次 all-reduce 全部走 NVSwitch(${HW.spec.p2p.gbs} GB/s),不出域。`]);
+
+  // 量化格式 × 机型原生 dtype:三种情况后果完全不同(ADR-0005 §3 的明确破例)
+  const instHasNative = HW.spec.nativeDtypes.includes(MD.quantFormat);
+  if (!C.expertNative) {
+    // 用户主动把 expert 重量化了 —— 这不是模型的原生形态
+    const delta = C.expertBytesTotal - M.expertBytesNative;
+    out.push(["warning", "!", `expert 已重量化为 ${C.expFmt.label}`,
+      `这<b>不是</b> ${MD.name} 的原生格式(原生为 ${MD.quantFormat.toUpperCase()},实测 ${M.expertBytesPerParam} B/参数)。`
+      + `重量化换来的是原生张量核支持,代价是 expert 权重从 ${fgib(M.expertBytesNative)} GiB 涨到 `
+      + `<b>${fgib(C.expertBytesTotal)} GiB(+${fgib(delta)} GiB,+${(delta / M.expertBytesNative * 100).toFixed(0)}%)</b>。`
+      + `此格式下的字节数是<b>按参数量推算</b>的,不是实测值。`]);
+  } else if (!instHasNative) {
+    const fb = HW.spec.nativeDtypes.includes("fp8") ? "FP8" : "BF16";
+    out.push(["warning", "!", `${HW.spec.gpu} 无原生 ${MD.quantFormat.toUpperCase()}`,
+      `引擎有两条出路,<b>显存后果相反</b>:(a) 保持 4bit 在显存里、on-the-fly dequant 到 ${fb}`
+      + ` —— 就是本页当前算的 ${fgib(C.expertBytesTotal)} GiB,省显存但拿不到算力加速,且 kernel 成熟度是实际风险;`
+      + `(b) 直接把权重物化成 ${fb} —— 拿到原生张量核,但显存也省不到了。`
+      + `想看 (b) 的账,把上面的「expert 权重」切成 ${fb}。`]);
+  }
+
+  // KV dtype 敏感度(ADR-0007):同一配置在两档 dtype 下的并发相差约一倍,两个方向都必须说出来。
+  // 这条不受「装得下/装不下」影响,任何时候都在 —— 它标的是一个假设的量级,不是一个状态。
+  const kvIsDefault = C.kvDt.id === MD.kvDtypes[0].id;
+  const kvRatio = (C.maxConc >= 1 && C.maxConcAlt >= 1)
+    ? `,相差 ${(Math.max(C.maxConc, C.maxConcAlt) / Math.min(C.maxConc, C.maxConcAlt)).toFixed(1)}×`
+    : "";
+  out.push([kvIsDefault ? "info" : "warning", kvIsDefault ? "→" : "!",
+    `KV cache 按 ${C.kvDt.label} 计`,
+    (kvIsDefault
+      ? `这是引擎默认(<code>--kv-cache-dtype auto</code> = 模型 dtype)。`
+      : `<b>这不是引擎默认</b> —— 需要显式传 <code>--kv-cache-dtype fp8_e4m3</code>,并接受精度影响。`)
+    + `KV dtype 既不在 <code>config.json</code> 里也不在 checkpoint 里,是启动参数,本页无法从模型推出。`
+    + `换成 <b>${C.kvAlt.label}</b>,${fctx(C.ctx)} 下最大并发是 <b>${Math.floor(C.maxConcAlt)} 路</b>`
+    + `(当前 ${Math.floor(C.maxConc)} 路)${kvRatio} —— 这个量级超过每卡 12 GiB 的 overhead 猜测值。`]);
+
+  if (S.ep > HW.domain) out.push(["info", "→", `EP=${S.ep} 跨 NVLink 域`,
+    `MoE 的 ${M.moeLayers} 层 × 2 次 all-to-all 走 EFA。这是必要且正常的 —— 专家总量 ${fgib(C.expertBytesTotal)} GiB 本来就放不进一台机器。DeepEP 的 node-limited routing 会把每 token 的跨节点副本数从 top-${M.topk} 压到 ≤ 域数。`]);
+
+  if (epClamp) out.push(["info", "→", `EP 已自动从 ${epClamp.from} 调到 ${epClamp.to}`,
+    `EP 上限是一个 pipeline stage 的卡数 = world ÷ PP = ${C.W} ÷ ${S.pp} = <b>${epClamp.stage}</b>,`
+    + `不是总卡数 ${C.W}。PP 按层切分,每个 stage 只持有自己那几层,这些层的专家只能摊在本 stage 的卡上 —— `
+    + `摊不到别的 stage 去,因为那些卡装的是别的层。EP 还须整除 routed expert 数 ${M.nExperts}。`]);
+
+  if (C.expertBankCopies > 1) out.push(["warning", "!", `expert bank 被复制了 ${C.expertBankCopies} 份`,
+    `EP=${S.ep} 只把专家切成 ${S.ep} 份,而一个 stage 有 ${C.stage} 张卡,于是同一批专家存了 ${C.expertBankCopies} 遍,白占 ${fgib(C.expertBytesTotal * (C.expertBankCopies - 1))} GiB。把 EP 提到 ${C.stage} 就能消掉。`]);
+
+  if (S.pp > 1) out.push(["warning", "!", `PP=${S.pp} 的代价不在显存里`,
+    `按层切分省显存(非 expert 权重只存 1 份),但引入流水线气泡:需要同时有 ≥${S.pp} 个 micro-batch 在飞才能填满 ${S.pp} 级流水。93 层切 ${S.pp} 段每段 ${(M.layers / S.pp).toFixed(1)} 层,且 24 个 MLA 层与 embedding / LM head 分布不均,要手工配平。低并发单流场景会亏。`]);
+
+  if (S.dp > 1) out.push(["info", "→", `DP=${S.dp}:复制 ${(100 * M.nonExpertParams / M.totalParams).toFixed(1)}% 的参数,共用 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%`,
+    `非 expert 权重存 ${S.dp} 份 = ${fgib(C.totalAttnStored)} GiB;expert bank 全集群只有 ${C.expertBankCopies} 份。没有任何一台机器持有完整模型 —— 每过一层 MoE,token 必须离开本 NVLink 域去找专家。`]);
+
+  return out;
+}
+
+// ---------------- 渲染 ----------------
+const SERIES = [
+  { key: "attn",   cls: "s-attn",   varName: "--series-attn",   label: "非 expert 权重(attention / shared expert / dense / embed)", pv: "s", pvNote: "由 HF safetensors 元数据推导:BF16 57,179,884,544 × 2 B + F32 11,122,432 × 4 B" },
+  { key: "expert", cls: "s-expert", varName: "--series-expert", label: "routed expert 权重", pv: "s", pvNote: "index.json 的 total_size 减去非 expert 部分;÷ 逻辑参数量恰为 0.53125,与 mxfp4+scale 吻合" },
+  // pv 是 e 而不是 s:元素数是推导值,但字节数取决于引擎的 --kv-cache-dtype(假设项)。
+  // 具体 note 在表格里按当前 dtype 重写。
+  { key: "kv",     cls: "s-kv",     varName: "--series-kv",     label: "MLA KV cache(随上下文长度涨)", short: "MLA KV cache", pv: "e", pvNote: "元素数由 config.json 推导;字节数取决于引擎的 --kv-cache-dtype" },
+  { key: "state",  cls: "s-kda",    varName: "--series-kda",    label: "recurrent state(只随并发涨)", short: "recurrent state", pv: "e", pvNote: "结构由 config 推导,但 state dtype 假设为 FP32(若引擎用 BF16 则减半)" },
+  { key: "oh",     cls: "s-oh",     varName: "--overhead",      label: "激活 + 通信 buffer(估 12 GiB)", short: "激活 + buffer", pv: "g", pvNote: "纯猜测,无实测依据;实际随 batch、CUDA graph、DeepEP buffer 变化" },
+];
+SERIES[0].short = "非 expert 权重"; SERIES[1].short = "routed expert 权重";
+
+function render() {
+  const C = compute();
+
+  // 副标题:模型描述 + 当前机型规格
+  const sp = HW.spec, p2p = sp.p2p.type === "nvswitch" ? `NVSwitch ${sp.p2p.gbs} GB/s` : "无 NVLink,仅 PCIe";
+  document.getElementById("sub").innerHTML = `${MD.blurb} · expert 权重 ${C.expFmt.label}${C.expertNative ? "" : "(已重量化,非原生)"}<br>`
+    + `<b>${HW.id}</b> — ${sp.gpu} × ${sp.gpusPerInstance} · 每卡 <code>${fgib(HW.gpuMem)} GiB</code>(${sp.gpuMemMiB} MiB)`
+    + ` · NVLink 域 <code>${sp.nvlinkDomainGpus}</code> · 域内 <code>${p2p}</code> · 跨域 <code>${sp.interDomainGbps} Gbps ${sp.efaGen}</code>`;
+  document.getElementById("barnote").innerHTML = `底槽 = ${fgib(HW.gpuMem)} GiB(${sp.gpuMemMiB} MiB)物理显存 · 竖线 = util 预算(真正的天花板)· 悬停或聚焦任一色块看精确值 · 徽章标出该卡在各并行维度中的 rank`;
+
+  // 边界声明里的这一条不能只说「参数是推导值」就完事 —— 两个 dtype 是假设,而其中 KV 那个
+  // 能把头号数字翻倍。ADR-0007:反事实必须与结论同时出现。
+  document.getElementById("scope-params").innerHTML = (C.expertNative
+    ? `<b>模型参数已全部落实为推导值</b>(来自 HF safetensors 元数据 + index.json 的 total_size),不再含残差估算。`
+    : `<b>expert 权重已被切换为 ${C.expFmt.label},不是模型的原生格式</b> —— 该项字节数按参数量<b>推算</b>,`
+      + `非实测,标记为 <span class="pv pv-e">估算</span>。切回 ${MD.quantFormat.toUpperCase()} 可回到实测值。`)
+    + ` <b>但有两个 dtype 是假设,不是推导:</b>`
+    + `(1) <b>KV cache 的 dtype 不是模型属性</b>,是引擎启动参数 <code>--kv-cache-dtype</code>,`
+    + `本页按 <b>${C.kvDt.label}</b> 计 —— 换成 ${C.kvAlt.label},上面的最大并发就是 `
+    + `<b>${Math.floor(C.maxConcAlt)} 路</b>而不是 ${Math.floor(C.maxConc)} 路;`
+    + `(2) recurrent state 按 FP32 计,若引擎用 BF16 则减半(对并发影响不到 2%)。`
+    + `两者都标记为 <span class="pv pv-e">估算</span>。`;
+
+  document.getElementById("expFmtLab").textContent = `= ${fgib(C.expertBytesTotal)} GiB`;
+  document.getElementById("precLab").textContent   = `= ${fgib(C.nonExpertBytes)} GiB`;
+  document.getElementById("kvDtLab").textContent   = `= ${fint(C.kvBytesPerToken)} B/token/份`;
+
+  // banners
+  document.getElementById("banners").innerHTML = banners(C).map(([lvl, ico, t, d]) =>
+    `<div class="banner b-${lvl}"><span class="ico">${ico}</span><span class="bt">${t}</span><span class="bd">${d}</span></div>`).join("");
+
+  // tiles — 恰好一个 hero
+  const fits = C.used <= C.budget;
+  document.getElementById("tiles").innerHTML = `
+    <div class="tile hero">
+      <div class="tl">${fctx(C.ctx)} 上下文下的最大并发</div>
+      <div class="tv">${C.maxConc < 1 ? C.maxConc.toFixed(2) : Math.floor(C.maxConc)}<span class="tu">路</span></div>
+      <div class="td">= ${ftok(C.kvCapacity)} tokens 的 KV 上限 · 每路请求吃 ${(C.perReq / 1e6).toFixed(1)} MB
+        (KV ${(C.kvPerReq / 1e6).toFixed(1)} + state ${(C.statePerReq / 1e6).toFixed(1)})<br>
+        当前设的 <b>${fint(C.conc)}</b> 路 ${fctx(C.ctx)} ${fits ? "装得下" : "<b style=\"color:var(--st-critical)\">装不下</b>"},
+        KV 每 token 被复制 <b>${S.tp}</b> 份(TP 组内),state 不复制</div>
+    </div>
+    <div class="tile">
+      <div class="tl">单卡峰值占用</div>
+      <div class="tv">${fgib(C.used)}<span class="tu">/ ${fgib(C.budget)} GiB 预算</span></div>
+      <div class="td">${fits ? `余 ${fgib(C.free)} GiB` : `<span style="color:var(--st-critical);font-weight:600">超出预算 ${fgib(C.used - C.budget)} GiB</span>`}
+        · 物理 ${fgib(HW.gpuMem)} GiB,util ${(S.util / 100).toFixed(2)} 留了 ${fgib(HW.gpuMem - C.budget)} GiB 不用</div>
+    </div>
+    <div class="tile">
+      <div class="tl">集群权重总存量</div>
+      <div class="tv">${(gib(C.totalAttnStored + C.totalExpertStored) / 1024).toFixed(2)}<span class="tu">TiB</span></div>
+      <div class="td">非 expert ${fgib(C.totalAttnStored)} GiB(${S.dp} 份) + expert ${fgib(C.totalExpertStored)} GiB</div>
+    </div>
+    <div class="tile">
+      <div class="tl">每 step 跨域集合操作</div>
+      <div class="tv">${crossNodeOps()}<span class="tu">次</span></div>
+      <div class="td">${crossNodeDesc()}</div>
+    </div>`;
+
+  // legend — 2+ series 必须有
+  document.getElementById("legend").innerHTML = SERIES.map(s =>
+    `<span class="item"><span class="sw" style="background:var(${s.varName})"></span>${s.label}</span>`).join("") +
+    `<span class="item"><span class="sw" style="background:var(--track)"></span>空闲</span>`;
+
+  // node grid
+  const nodes = [];
+  for (let n = 0; n < S.n; n++) {
+    let rows = "", nodeUsed = 0, nodeOver = false;
+    for (let k = 0; k < HW.gpusPerNode; k++) {
+      const g = n * HW.gpusPerNode + k, r = ranks(g);
+      nodeUsed += C.used; if (C.used > C.budget) nodeOver = true;
+
+      const parts = SERIES.map(s => ({ s, v: C[s.key] })).filter(p => p.v > 0);
+
+      // 底槽 = 物理显存;刻度线 = util 预算,始终画出来标明真正的天花板
+      const scale = Math.max(HW.gpuMem, C.used);
+      const overflow = C.used > C.budget;
+      let segs = parts.map((p, i) => {
+        const pct = (p.v / scale) * 100;
+        const isLast = i === parts.length - 1 && C.used <= HW.gpuMem;   // 4px rounded data-end
+        return `<span class="seg ${p.s.cls}${isLast ? " last" : ""}" style="width:${pct}%" tabindex="0"
+                 data-t="${p.s.label}" data-v="${fgib(p.v)} GiB" data-p="${((p.v / C.budget) * 100).toFixed(1)}% of ${fgib(C.budget)} GiB 预算" data-c="${p.s.varName}"></span>`;
+      }).join("");
+      // 刻度线每条都画,但只在第一条上标数值(其余靠 tile / 表头 / 图注承载)
+      segs += `<span class="caprule${overflow ? " over" : ""}"${g === 0 ? ` data-l="${fgib(C.budget)} GiB 预算"` : ""}
+                style="left:${(C.budget / scale) * 100}%"></span>`;
+
+      const expStart = r.ep * C.expertsPerGpuPerLayer;
+      const badges = [
+        `<span class="badge hl">TP ${r.tp}/${S.tp}</span>`,
+        S.dp > 1 ? `<span class="badge hl">DP 组 ${r.dp}</span>` : "",
+        S.pp > 1 ? `<span class="badge hl">PP 段 ${r.pp} (层 ${Math.round(r.pp * M.layers / S.pp)}–${Math.round((r.pp + 1) * M.layers / S.pp) - 1})</span>` : "",
+        `<span class="badge">EP ${r.ep}/${S.ep} · 专家 #${fint(expStart)}–${fint(expStart + C.expertsPerGpuPerLayer - 1)}(每层 ${fint(C.expertsPerGpuPerLayer)} 个)</span>`,
+      ].join("");
+
+      rows += `<div class="gpu${overflow ? " over" : ""}">
+        <span class="gid">GPU ${k}</span>
+        <span class="barwrap"><span class="bar">${segs}</span><span class="badges">${badges}</span></span>
+        <span class="gtot">${fgib(C.used)} GiB</span>
+      </div>`;
+    }
+    nodes.push(`<div class="node${nodeOver ? " over" : ""}">
+      <div class="nh"><span class="nn">${HW.id} #${n}</span>
+      <span class="ns">节点合计 ${fgib(nodeUsed)} / ${fgib(C.budget * HW.gpusPerNode)} GiB 预算</span></div>${rows}</div>`);
+  }
+  const nodesEl = document.getElementById("nodes");
+  nodesEl.style.gridTemplateColumns = `repeat(${S.n <= 1 ? 1 : S.n <= 4 ? 2 : S.n <= 9 ? 3 : 4}, minmax(0, 1fr))`;
+  nodesEl.innerHTML = nodes.join("");
+
+  // comm table
+  const tpX = S.tp > HW.domain, epX = S.ep > HW.domain;
+  document.getElementById("commtbl").innerHTML = `
+    <thead><tr><th>操作</th><th>次数 / step</th><th>组规模</th><th>走哪条线</th></tr></thead>
+    <tbody>
+      <tr><td>attention all-reduce</td><td>${M.layers * 2}</td><td>TP ${S.tp}</td>
+          <td class="${tpX ? "xnode" : "innode"}">${S.tp === 1 ? "无需通信" : tpX ? "EFA 跨域" : "NVLink 域内"}</td></tr>
+      <tr><td>MoE all-to-all(dispatch+combine)</td><td>${M.moeLayers * 2}</td><td>EP ${S.ep}</td>
+          <td class="${epX ? "xnode" : "innode"}">${S.ep === 1 ? "无需通信" : epX ? "EFA 跨域" : "NVLink 域内"}</td></tr>
+      <tr><td>PP 激活 send/recv</td><td>${S.pp - 1}</td><td>点对点</td>
+          <td class="${S.pp > 1 ? "xnode" : ""}">${S.pp > 1 ? `EFA 跨域(每 token 仅 ${(M.hidden / 1024).toFixed(0)} KB)` : "—"}</td></tr>
+      <tr><td>DP attention 之间</td><td>0</td><td>—</td><td class="innode">零通信</td></tr>
+      <tr><td colspan="3" style="font-weight:600">跨域集合操作合计</td>
+          <td class="${crossNodeOps() > 200 ? "xnode" : ""}" style="font-weight:600">${crossNodeOps()}</td></tr>
+    </tbody>`;
+
+  // table view (relief for the sub-3:1 aqua on light surface)
+  document.getElementById("tbl").innerHTML = `
+    <thead><tr><th>项</th><th>依据</th><th>每 GPU (GiB)</th><th>占 ${fgib(C.budget)} GiB 预算</th><th>集群合计 (GiB)</th></tr></thead>
+    <tbody>
+      ${SERIES.map(s => {
+        const v = C[s.key];
+        // expert 权重:原生格式是实测推导;重量化后是按参数量推算
+        const pv = (s.key === "expert" && !C.expertNative) ? "e" : s.pv;
+        const note = (s.key === "expert" && !C.expertNative)
+          ? `重量化为 ${C.expFmt.label} 后按 ${fint(M.expertParams)} × ${C.expFmt.bytesPerParam} B 推算,非实测`
+          : s.key === "kv"
+          ? `元素数由 config 推导:24 MLA 层 × (512+64) = ${fint(M.kvElemsPerToken)} 元素/token;`
+            + `dtype 是引擎运行时选项,当前按 ${C.kvDt.label} → ${fint(C.kvBytesPerToken)} B/token/份`
+          : s.pvNote;
+        return `<tr><td><span class="sw" style="background:var(${s.varName})"></span>${s.short}</td>
+          <td style="text-align:left"><span class="pv pv-${pv}" title="${note}">${PV_LABEL[pv]}</span></td>
+          <td>${fgib(v)}</td><td>${((v / C.budget) * 100).toFixed(1)}%</td><td>${fgib(v * C.W)}</td></tr>`;
+      }).join("")}
+      <tr><td><span class="sw" style="background:var(--track)"></span>预算内空闲</td>
+          <td></td><td>${fgib(C.free)}</td><td>${((C.free / C.budget) * 100).toFixed(1)}%</td><td>${fgib(C.free * C.W)}</td></tr>
+      <tr><td style="font-weight:600">合计</td><td></td><td style="font-weight:600" class="${fits ? "" : "xnode"}">${fgib(C.used)}</td>
+          <td style="font-weight:600">${((C.used / C.budget) * 100).toFixed(1)}%</td><td style="font-weight:600">${fgib(C.used * C.W)}</td></tr>
+      <tr><td style="color:var(--muted)">util 保留(引擎不碰)</td><td></td><td style="color:var(--muted)">${fgib(HW.gpuMem - C.budget)}</td>
+          <td style="color:var(--muted)">—</td><td style="color:var(--muted)">${fgib((HW.gpuMem - C.budget) * C.W)}</td></tr>
+    </tbody>`;
+
+  epClamp = null;   // 只提示触发它的那一次
+
+  document.getElementById("assumplist").innerHTML = `
+    <li><b>单位:全部是 GiB(2³⁰ 字节),不是十进制 GB。</b> 真值取 <code>describe-instance-types</code> 的 <code>MemoryInfo.SizeInMiB</code>(当前机型 <code>${HW.spec.gpuMemMiB} MiB/卡</code>),内部按字节计算。<br>
+      厂商标称的「GB」在不同 GPU 上含义不一致(A100/H100/H200/RTX PRO 按 GiB 标,A10G/L4/L40S 与 B300 按十进制标),所以不能拿标称数字直接当某一种单位用。此处曾把 H200 的 141 GiB 当成 141×10⁹ 字节,导致容量低估 7.4%(每卡 10.4 GB、32 卡 333 GB),最大并发被低估约 18%。已修正 —— <b>不要改回 <code>141e9</code></b>。</li>
+    <li><b>gpu_memory_utilization</b>:引擎能动用的预算 = <code>${fgib(HW.gpuMem)} GiB × util</code>,权重 + overhead + KV + state 都必须挤在这个预算里,剩下的物理显存引擎不会碰。vLLM 默认 0.90,这里也默认 0.90。util=1.00 是理论上界,不是可规划值。</li>
+    <li><b>routed expert 逻辑参数量</b>由 config 推出:<code>92 层 × 896 experts × 3 × 3584 × 3072 = ${fint(M.expertParams)}</code>(${(M.expertParams / 1e12).toFixed(4)}T),占总参数 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%。存储字节数见下条,实测每参数 <code>${M.expertBytesPerParam}</code> B。</li>
+    <li><b>非 expert 参数量 = 57.19B,由权威一手件推导</b>(不再是残差估算)。来源:HF <code>/api/models/moonshotai/Kimi-K3</code> 的 <code>safetensors.parameters</code> 给出 <code>BF16 57,179,884,544</code> + <code>F32 11,122,432</code>,字节数 = <code>BF16×2 + F32×4 = 114,404,258,816 B = 106.5 GiB</code>。<br>
+      它含 24 MLA + 69 KDA 的投影、2 个 shared expert、MoE latent 投影、dense 层 0、embedding + LM head。<code>quantization_config</code> 明确排除 attention / shared experts / MLP projections,所以这部分不是 MXFP4。<br>
+      <b>此前用「2.8T 减 expert 部分」估为 77.3B,高估了 35%。</b>2.8T 本身是向上取整的标称值,真实总参数为 2.7799T。</li>
+    <li><b>expert 权重 = 1347.0 GiB,同样为推导值</b>。<code>model.safetensors.index.json</code> 的 <code>metadata.total_size = 1,560,860,324,864 B</code> 减去非 expert 部分即得。除以逻辑参数量 <code>2,722,740,830,208</code> 恰好等于 <b>0.53125</b>,与「4 bit + 每 32 元素一个 8 bit scale」的理论值完全吻合 —— 三条独立来源互相印证。<br>
+      取该文件必须用 <code>resolve</code> 端点;<code>raw</code> 端点只返回 git-lfs 指针。</li>
+    <li><b>KV cache</b> = ${MD.layers.filter(g => g.family === "mla").map(g => `${g.count} 层 × (kv_lora_rank ${g.kvLoraRank} + qk_rope ${g.qkRopeDim})`).join(" + ")} = <b>${fint(M.kvElemsPerToken)} 元素/token/份</b>,× ${C.kvDt.bytes} B(当前选的 ${C.kvDt.label})= <b>${fint(C.kvBytesPerToken)} B/token/份</b>。MLA 的 latent 是所有 head 共享的,所以 <b>TP 组内每张卡都要存一份完整副本</b>——这就是它被复制 TP 份的原因。DP 和 PP 都不复制它。<br>单卡占用 = <code>并发 × 上下文 × ${fint(C.kvBytesPerToken)} ÷ DP ÷ PP</code>(注意没有 ÷TP)。<br>
+      <b>元素数是推导值,dtype 不是。</b>元素数来自 <code>config.json</code> 的 <code>kv_lora_rank</code> 与 <code>qk_rope_head_dim</code>;而 KV 用什么 dtype 存<b>既不在 config.json 里也不在 checkpoint 里</b> —— 它是引擎启动参数(SGLang / vLLM 的 <code>--kv-cache-dtype</code>,默认 <code>auto</code> = 模型 dtype = BF16;FP8 要显式开)。所以它被提成了上方的可切输入,而不是数据文件里的常数:同一配置下 ${fctx(C.ctx)} 的最大并发,BF16 与 FP8 相差约一倍(当前 ${Math.floor(C.maxConc)} 路,换成 ${C.kvAlt.label} 是 ${Math.floor(C.maxConcAlt)} 路)。见 <code>docs/adr/0007</code>。</li>
+    <li><b>recurrent state</b>(本模型为 KDA 线性注意力)= ${MD.layers.filter(g => g.family === "linear").map(g => `${g.count} 层 × ${g.heads} head × ${g.headDim} × ${g.headDim} × ${g.stateDtypeBytes} B`).join(" + ")} = <b>${(M.stateBytesPerReq / 1e6).toFixed(0)} MB / 并发请求</b>,<b>与上下文长度无关</b>。state 是 per-head 的,所以 TP 能真正按 head 切开,<b>不复制</b>。<br>
+      单卡占用 = <code>并发 × ${(M.stateBytesPerReq / 1e6).toFixed(0)} MB ÷ TP ÷ DP ÷ PP</code>。<br>
+      <b>dtype 按 FP32 假设</b>(线性注意力的 state 通常为数值稳定性保留 fp32),若引擎用 BF16 则减半 —— 但它只随并发涨、不随长度涨,对最大并发的影响不到 2%,敏感度远低于上一条的 KV dtype。<br>
+      高并发短上下文场景下它会<b>反超</b> KV cache —— 两者相等的临界上下文长度 = <code>${Math.round(M.stateBytesPerReq / C.kvBytesPerToken)} ÷ TP</code> tokens(当前 TP=${S.tp} → 约 ${Math.round(M.stateBytesPerReq / C.kvBytesPerToken / S.tp)} tokens)。拖到 4096 路 × 1K 看得最清楚。</li>
+    <li><b>12 GiB/卡的激活 + 通信 buffer 是粗估</b>,实际随 batch、CUDA graph、DeepEP buffer 大小变化。</li>
+    <li>PP 的层切分按均分算,<b>忽略了</b> embedding(stage 0)、LM head(末 stage)和 MLA 层分布不均带来的 stage 失衡。</li>
+    <li>MXFP4 在 Hopper(H200)上<b>没有原生张量核支持</b>,引擎走 dequant 到 BF16/FP8 的路径:显存节省保留,算力加速拿不到。这张图只算显存,不算这部分性能损失。</li>
+  `;
+}
+
+function crossNodeOps() {
+  let n = 0;
+  if (S.tp > HW.domain) n += M.layers * 2;
+  if (S.ep > HW.domain) n += M.moeLayers * 2;
+  if (S.pp > 1) n += S.pp - 1;
+  return n;
+}
+function crossNodeDesc() {
+  const p = [];
+  if (S.tp > HW.domain) p.push(`TP all-reduce ${M.layers * 2}`);
+  if (S.ep > HW.domain) p.push(`EP all-to-all ${M.moeLayers * 2}`);
+  if (S.pp > 1) p.push(`PP send ${S.pp - 1}`);
+  return p.length ? p.join(" + ") : "全部通信留在 NVLink 域内";
+}
+
+// ---------------- tooltip(hover 层,默认就有;键盘 focus 等价) ----------------
+const tip = document.getElementById("tip");
+function showTip(el, x, y) {
+  tip.innerHTML = `<div class="tt"><span class="sw" style="background:var(${el.dataset.c})"></span>${el.dataset.t}</div>
+                   <div class="tr">${el.dataset.v} · ${el.dataset.p}</div>`;
+  tip.style.opacity = "1";
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.min(x + 12, innerWidth - r.width - 8) + "px";
+  tip.style.top = Math.max(8, y - r.height - 12) + "px";
+}
+document.addEventListener("mousemove", e => {
+  const s = e.target.closest?.(".seg");
+  if (s) showTip(s, e.clientX, e.clientY); else tip.style.opacity = "0";
+});
+document.addEventListener("focusin", e => {
+  const s = e.target.closest?.(".seg");
+  if (s) { const r = s.getBoundingClientRect(); showTip(s, r.left + r.width / 2, r.top); }
+});
+document.addEventListener("focusout", () => { tip.style.opacity = "0"; });
+
+// ---------------- 绑定 ----------------
+function bind(id, key, parse = Number) {
+  document.getElementById(id).addEventListener("change", e => {
+    S[key] = parse(e.target.value); syncOptions(key); render(); markPreset();
+  });
+}
+["n","tp","dp","pp","ep"].forEach(id => bind(id, id));
+document.getElementById("instId").addEventListener("change", e => {
+  S.instId = e.target.value; syncOptions("instId"); render(); markPreset();
+});
+bind("prec", "neFmt", String);
+bind("expFmt", "expFmt", String);
+bind("kvDt", "kvDt", String);
+[["conc", "concIdx"], ["ctx", "ctxIdx"], ["util", "util"]].forEach(([id, key]) => {
+  document.getElementById(id).addEventListener("input", e => {
+    S[key] = Number(e.target.value); syncLoadLabels(); render();
+  });
+});
+
+const shortInst = id => id.replace(/\.(48|24)xlarge$/, "");
+document.getElementById("presets").innerHTML = PRESETS.map((p, i) =>
+  `<button data-i="${i}" title="${p.name} — ${p.inst} ×${p.n},TP${p.tp}/DP${p.dp}/PP${p.pp}/EP${p.ep}">`
+  + `<span class="pn">${p.name}</span>`
+  + `<span class="pi">${shortInst(p.inst)} ×${p.n}</span></button>`).join("");
+document.getElementById("presets").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  const p = PRESETS[+b.dataset.i];
+  // 并发一并回到 1:预设描述的是并行切分,不是负载。让每个预设都以自己的干净上限呈现,
+  // 而不是受上一次拖到哪的影响。
+  Object.assign(S, { instId: p.inst, n: p.n, tp: p.tp, dp: p.dp, pp: p.pp, ep: p.ep, concIdx: 0 });
+  syncOptions("preset"); syncLoadLabels(); render(); markPreset();
+});
+function markPreset() {
+  document.querySelectorAll("#presets button").forEach((b, i) => {
+    const p = PRESETS[i];
+    b.setAttribute("aria-pressed", String(p.inst === S.instId && p.n === S.n
+      && p.tp === S.tp && p.dp === S.dp && p.pp === S.pp && p.ep === S.ep));
+    // 机型不是当前选中的 → 变淡,提示「点它会连机型一起换」
+    b.setAttribute("data-off", p.inst === S.instId ? "0" : "1");
+  });
+}
+
+const themeBtn = document.getElementById("theme");
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  themeBtn.textContent = t === "dark" ? "切换浅色" : "切换深色";
+}
+themeBtn.addEventListener("click", () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  setTheme(t);
+  try { localStorage.setItem("viz-theme", t); } catch (e) { /* file:// 下可能被禁,忽略 */ }
+});
+// 优先级:?theme= 参数 > 上次手动选择 > 系统偏好
+const qsTheme = new URLSearchParams(location.search).get("theme");
+let saved = null; try { saved = localStorage.getItem("viz-theme"); } catch (e) {}
+setTheme(["light", "dark"].includes(qsTheme) ? qsTheme
+       : ["light", "dark"].includes(saved) ? saved
+       : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
+
+document.getElementById("h1").textContent = `${MD.name} 在 N 台 GPU 实例上的并行切分与显存分布`;
+syncOptions("init"); render(); markPreset();
+</script>
+</body>
+</html>
