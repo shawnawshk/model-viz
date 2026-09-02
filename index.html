@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM 并行切分与显存分布 — 模型索引</title>
+<script>window.REG = { instances: {}, models: {} };</script>
+<script src="data/instances.js"></script>
+<script src="data/models/kimi-k3.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb; --page: #f9f9f7;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
+    --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
+    --accent: #2a78d6; --st-warning: #fab219; --st-warning-ink: #8a5d00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --surface-1: #1a1a19; --page: #0d0d0d;
+      --text-primary: #ffffff; --text-secondary: #c3c2b7;
+      --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
+      --accent: #3987e5; --st-warning-ink: #fab219;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
+    --accent: #3987e5; --st-warning-ink: #fab219;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6; padding: 40px 24px 64px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .lede { color: var(--text-secondary); margin: 0 0 4px; }
+  .lede code { background: var(--surface-1); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; font-size: 12.5px; }
+
+  .scope {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-left: 3px solid var(--st-warning); border-radius: 8px;
+    padding: 12px 16px; margin: 22px 0; font-size: 12.5px;
+  }
+  .scope b { color: var(--st-warning-ink); }
+  .scope ul { margin: 6px 0 0; padding-left: 20px; color: var(--text-secondary); }
+
+  h2 { font-size: 14px; font-weight: 600; margin: 30px 0 12px; color: var(--text-secondary);
+       text-transform: uppercase; letter-spacing: 0.06em; }
+
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 10px; transition: border-color .12s;
+  }
+  a.card:hover { border-color: var(--accent); }
+  a.card .nm { font-size: 16px; font-weight: 600; margin-bottom: 3px; }
+  a.card .nm .hf { font-size: 11.5px; font-weight: 400; color: var(--muted); margin-left: 8px; }
+  a.card .bl { color: var(--text-secondary); font-size: 12.5px; }
+  a.card .meta { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--grid);
+                 font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 14px; }
+  a.card .meta b { color: var(--text-secondary); font-weight: 600; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+  th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tbody tr:last-child td { border-bottom: none; }
+  .no { color: var(--muted); }
+
+  .docs { margin-top: 30px; font-size: 12.5px; color: var(--text-secondary); }
+  .docs a { color: var(--accent); }
+  .docs li { margin-bottom: 2px; }
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--grid);
+           font-size: 11.5px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>LLM 并行切分与显存分布</h1>
+  <p class="lede">
+    给定模型、机型、台数和 <code>TP/DP/PP/EP</code>,算出每张卡的显存构成、装不装得下、能收多少并发。
+  </p>
+
+  <div class="scope">
+    <b>这套工具只算显存。</b>
+    <ul>
+      <li>不回答吞吐、延迟、TTFT/ITL —— 「装得下」不等于「跑得快」。</li>
+      <li>不回答价格与可得性,因此<b>不能</b>用于判断「哪个机型更值」。</li>
+      <li>是<b>校验器不是求解器</b>:你给配置,它判定;它不会替你搜索最优解。</li>
+      <li>结果含一个纯猜测的 overhead 常量,<b>不可作为容量规划或采购承诺</b>。</li>
+    </ul>
+  </div>
+
+  <h2>模型</h2>
+  <div id="models"></div>
+
+  <h2>机型目录</h2>
+  <p class="lede" style="font-size:12.5px;margin:-4px 0 10px">
+    这是<b>目录</b>。每个模型页面的机型下拉只提供其中一个<b>子集</b> —— 哪些机型值得为某个模型考虑是业务判断,逐个确认后写在模型定义里。
+  </p>
+  <table id="insts"></table>
+
+  <div class="docs">
+    <h2 style="margin-top:26px">设计文档</h2>
+    <ul>
+      <li><a href="docs/glossary.md">glossary.md</a> — 领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径</li>
+      <li><a href="docs/instance-specs.md">instance-specs.md</a> — G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)</li>
+      <li><a href="docs/adr/">adr/0001–0006</a> — 已锁定的设计决策</li>
+    </ul>
+  </div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+"use strict";
+const GIB = 1024 ** 3;
+const gib = mib => (mib * 1048576 / GIB);
+const f1 = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
+
+// ---- 模型卡片 ----
+document.getElementById("models").innerHTML = Object.entries(REG.models).map(([id, m]) => {
+  const nonExpert = m.weights.bf16Params * 2 + m.weights.f32Params * 4;
+  const totalGiB  = m.weights.totalBytes / GIB;
+  const nCand = m.candidateInstances.length;
+  return `<a class="card" href="app.html?model=${id}">
+    <div class="nm">${m.name}<span class="hf">${m.hf}</span></div>
+    <div class="bl">${m.blurb}</div>
+    <div class="meta">
+      <span>权重合计 <b>${f1(totalGiB)} GiB</b></span>
+      <span>其中 expert <b>${f1((m.weights.totalBytes - nonExpert) / GIB)} GiB</b></span>
+      <span>非 expert <b>${f1(nonExpert / GIB)} GiB</b></span>
+      <span>量化 <b>${m.quantFormat.toUpperCase()}</b></span>
+      <span>候选机型 <b>${nCand}</b> 个</span>
+    </div>
+  </a>`;
+}).join("");
+
+// ---- 机型表 ----
+const rows = Object.entries(REG.instances).map(([id, s]) => {
+  const nvl = s.p2p.type === "nvswitch";
+  const users = Object.values(REG.models).filter(m => m.candidateInstances.includes(id)).map(m => m.name);
+  return `<tr>
+    <td><code>${id}</code></td><td>${s.gpu}</td><td>${s.gpusPerInstance}</td>
+    <td>${f1(gib(s.gpuMemMiB))}</td><td>${f1(gib(s.gpuMemMiB) * s.gpusPerInstance)}</td>
+    <td${nvl ? "" : ' class="no"'}>${s.nvlinkDomainGpus}</td>
+    <td${nvl ? "" : ' class="no"'}>${nvl ? s.p2p.gbs + " GB/s" : "PCIe"}</td>
+    <td>${s.interDomainGbps} ${s.efaGen}</td>
+    <td${s.nativeDtypes.includes("mxfp4") ? "" : ' class="no"'}>${s.nativeDtypes.includes("mxfp4") ? "✓" : "✗"}</td>
+    <td${users.length ? "" : ' class="no"'}>${users.length ? users.join(" ") : "—"}</td>
+  </tr>`;
+}).join("");
+document.getElementById("insts").innerHTML =
+  `<thead><tr><th>实例</th><th>GPU</th><th>卡</th><th>GiB/卡</th><th>GiB/实例</th>
+   <th>NVLink 域</th><th>域内 P2P</th><th>跨域</th><th>原生 FP4</th><th>被哪些模型列为候选</th></tr></thead><tbody>${rows}</tbody>`;
+
+// 主题:?theme= > localStorage(与 app.html 共用同一个键,跳转不丢) > 系统偏好
+const qsTheme = new URLSearchParams(location.search).get("theme");
+let saved = null; try { saved = localStorage.getItem("viz-theme"); } catch (e) {}
+document.documentElement.dataset.theme =
+  ["light","dark"].includes(qsTheme) ? qsTheme
+  : ["light","dark"].includes(saved) ? saved
+  : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+
+document.getElementById("foot").textContent =
+  `${Object.keys(REG.models).length} 个模型 · ${Object.keys(REG.instances).length} 个机型 · `
+  + `显存真值取 describe-instance-types 的 MiB,界面一律 GiB`;
+</script>
+</body>
+</html>
