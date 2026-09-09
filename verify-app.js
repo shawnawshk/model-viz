@@ -26,33 +26,45 @@ if (idxSrcs.join(",") !== srcs.join(","))
 const CASES = [
   { model: "kimi-k3", label: "推荐 4×p5en TP8/DP4/EP32",
     state: { instId: "p5en.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32, neFmt: "bf16", expFmt: "mxfp4" },
-    expect: { bf16: [27648, 69], fp8: [13824, 136] },
-    // 第 3 个(推荐)的 69 与第 6 个(b200 四台)的 109 与 ADR-0007 / 数据文件注释里
+    expect: { bf16: [27648, 68], fp8: [13824, 136] },
+    // 第 3 个(推荐)的 68 与第 6 个(b200 四台)的 108 与 ADR-0007 / 数据文件注释里
     // 独立记下的数一致;第 4 个(反例 纯 DP32)本来就该是 0 —— 单卡 160.6 GiB 超 126.9 预算
-    expectPresets: [20, 81, 69, 0, 77, 109] },
+    expectPresets: [20, 81, 68, 0, 76, 108] },
   { model: "glm-5.3-flash", label: "1×p5en TP8/DP1/EP8(KV ×8)",
     state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
     expect: { bf16: [11616, 53], fp8: [5984, 102] },
-    expectPresets: [53, 325, 191, 365, 838, 918] },
+    expectPresets: [53, 320, 188, 364, 832, 912] },
   { model: "glm-5.3-flash", label: "1×p5en TP1/DP8/EP8(KV ×1)",
     state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 325], fp8: [5984, 585] } },
+    expect: { bf16: [11616, 320], fp8: [5984, 584] } },
   { model: "glm-5.3-flash", label: "PP2 1×p5en TP1/DP4/PP2/EP4",
     state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 4, pp: 2, ep: 4, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 365], fp8: [5984, 656] } },
+    expect: { bf16: [11616, 364], fp8: [5984, 656] } },
   { model: "glm-5.3-flash", label: "两台 2×p5en TP1/DP16/EP16",
     state: { instId: "p5en.48xlarge", n: 2, tp: 1, dp: 16, pp: 1, ep: 16, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 838], fp8: [5984, 1506] } },
+    expect: { bf16: [11616, 832], fp8: [5984, 1504] } },
   { model: "glm-5.3-flash", label: "1×p6-b300 TP1/DP8/EP8",
     state: { instId: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 918], fp8: [5984, 1649] } },
+    expect: { bf16: [11616, 912], fp8: [5984, 1648] } },
+  // 截图口径:1 路请求只能落在一个 DP rank,不能均摊成每卡 1/8 路。
+  { model: "glm-5.3-flash", label: "1×p6-b300 TP1/DP8/EP8 · 1M/util 0.91",
+    ctxIdx: 10, util: 91,
+    state: { instId: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [11616, 120], fp8: [5984, 240] },
+    expectLoad: {
+      conc: 1,
+      requestsByDp: [1, 0, 0, 0, 0, 0, 0, 0],
+      perDpCapacity: 15,
+      peakUsedGiB: 75.2,
+      minUsedGiB: 63.7,
+    } },
   // 换口径:1M 上下文 + util 1.00。预设路数必须整组跟着变(与上面那条 128K/0.90 对照)
   { model: "glm-5.3-flash", label: "换口径 1M/util 1.00", ctxIdx: 10, util: 100,
     state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
     expect: { bf16: [11616, 7], fp8: [5984, 15] },
-    // 与上面 128K/0.90 的 [53,325,191,365,838,918] 对照:同一组切分,口径一换整组缩到约 1/6。
+    // 与上面 128K/0.90 的 [53,320,188,364,832,912] 对照:同一组切分,口径一换整组缩到约 1/6。
     // 这就是预设路数不能写死在数据文件里的原因。
-    expectPresets: [7, 53, 29, 59, 132, 142] },
+    expectPresets: [7, 48, 28, 56, 128, 136] },
 ];
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
@@ -87,14 +99,23 @@ function run(c) {
   const PROBE = `
 globalThis.__probe = [];
 for (const kv of ["bf16", "fp8"]) {
-  Object.assign(S, ${JSON.stringify(c.state)}, { concIdx: 0, ctxIdx: ${c.ctxIdx ?? 7}, util: ${c.util ?? 90}, kvDt: kv });
+  Object.assign(S, ${JSON.stringify(c.state)}, { concIdx: ${c.expectLoad ? `CONC_STEPS.indexOf(${c.expectLoad.conc})` : "0"}, ctxIdx: ${c.ctxIdx ?? 7}, util: ${c.util ?? 90}, kvDt: kv });
   syncOptions("probe");
   const C = compute();
+  const gpuTotal = Array.from({ length: C.W }, (_, g) => gpuMemory(C, ranks(g)).used)
+    .reduce((a, b) => a + b, 0);
   globalThis.__probe.push({ kv, bytesPerToken: C.kvBytesPerToken, maxConc: Math.floor(C.maxConc),
                             altConc: Math.floor(C.maxConcAlt),
+                            requestsByDp: C.requestsByDp,
+                            perDpCapacity: C.perDpCapacity,
+                            totalDeltaBytes: gpuTotal - C.totalUsed,
+                            peakUsedGiB: C.used / GIB, minUsedGiB: C.minUsed / GIB,
                             tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep });
   render();
+  globalThis.__probe[globalThis.__probe.length - 1].commHtml =
+    document.getElementById("commtbl").innerHTML;
 }
+globalThis.__packExamples = [1, 8, 9].map(n => distributeRequests(n, 8));
 // 预设按钮第三行的路数走 presetCompute(),必须跟当前口径(util / ctxIdx / kvDt)一起变。
 // 这里在 kvDt=fp8 的那一轮结束后再切回 bf16,才好与 expectPresets 对账。
 Object.assign(S, { kvDt: "bf16" }); syncOptions("probe"); render();
@@ -128,6 +149,24 @@ markPreset();
   }
   if (b.altConc !== f.maxConc || f.altConc !== b.maxConc)
     fail.push(`反事实不对称:bf16.alt=${b.altConc} vs fp8.max=${f.maxConc};fp8.alt=${f.altConc} vs bf16.max=${b.maxConc}`);
+  for (const p of [b, f])
+    if (Math.abs(p.totalDeltaBytes) > 1)
+      fail.push(`${p.kv}:逐卡显存求和与集群合计相差 ${p.totalDeltaBytes} B`);
+  if (c.expectLoad) {
+    if (String(b.requestsByDp) !== String(c.expectLoad.requestsByDp))
+      fail.push(`DP 请求分配应为 [${c.expectLoad.requestsByDp}],实为 [${b.requestsByDp}]`);
+    if (b.perDpCapacity !== c.expectLoad.perDpCapacity)
+      fail.push(`每个 DP rank 应容纳 ${c.expectLoad.perDpCapacity} 路,实为 ${b.perDpCapacity} 路`);
+    if (b.peakUsedGiB.toFixed(1) !== c.expectLoad.peakUsedGiB.toFixed(1))
+      fail.push(`单卡峰值应为 ${c.expectLoad.peakUsedGiB.toFixed(1)} GiB,实为 ${b.peakUsedGiB.toFixed(1)} GiB`);
+    if (b.minUsedGiB.toFixed(1) !== c.expectLoad.minUsedGiB.toFixed(1))
+      fail.push(`单卡最低占用应为 ${c.expectLoad.minUsedGiB.toFixed(1)} GiB,实为 ${b.minUsedGiB.toFixed(1)} GiB`);
+    const packs = [[1,0,0,0,0,0,0,0], [1,1,1,1,1,1,1,1], [2,1,1,1,1,1,1,1]];
+    if (String(globalThis.__packExamples) !== String(packs))
+      fail.push(`DP 整数分配 1/8/9 路不正确:实为 ${JSON.stringify(globalThis.__packExamples)}`);
+    if (!b.commHtml.includes("<td>attention all-reduce</td><td>0</td><td>TP 1</td>"))
+      fail.push("TP=1 时 communication table 应显示 0 次 attention all-reduce");
+  }
 
   // 预设按钮上的路数(BF16 KV,该用例的 util / ctxIdx 口径下)
   if (c.expectPresets && String(globalThis.__presets) !== String(c.expectPresets))
