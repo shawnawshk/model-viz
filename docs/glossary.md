@@ -85,10 +85,14 @@ Kimi K3 有 896 = 2⁷ × 7 个 routed expert，而 stage 规模总是 2 的幂�
 一个 token 的 KV 在集群里存了几遍。**由 attention family 决定，不是全局常数**：
 
 - **MLA**（Kimi K3 的 24 个 full-attn 层）：压缩 latent 被所有 head 共享 → TP 组内每张卡各存一份完整副本 → **复制 TP 份**
+- **DSA**（DeepSeek Sparse Attention，GLM-5.3-Flash 的 11 个 full-attn 层）：与 MLA 完全相同的 latent 复制行为，**外加** lightning indexer 自己的一份 per-token key cache（同样是单头共享 → 同样复制 TP 份，但走自己的 dtype，不受 `--kv-cache-dtype` 影响）
 - **GQA**：KV 按 kv head 切分 → `n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时开始复制 `TP / n_kv_heads` 份
 - **线性注意力 / SSM 的 recurrent state**：per-head，可按 head 切 → 不复制
 
 DP 和 PP 在任何 family 下都不复制 KV。
+
+### 稀疏注意力 ≠ 省显存
+DSA 这类稀疏注意力的 `index_topk` 决定的是每个 query 去**看**多少个 token，不是**存**多少个。全部 token 的 KV 依然要留在 cache 里，**显存开销与 full attention 一模一样**。省下的是 attention 的 FLOPS 与 KV 读带宽，而按 [[adr-0003]] 这两样都不在本工具范围内。把「稀疏」当成显存优化是本工具最容易被误读的一点。
 
 ### KV cache 的 dtype
 **不是模型属性，是引擎启动参数**（`--kv-cache-dtype`，默认 `auto` = 模型 dtype = BF16；FP8 要显式开）。`config.json` 与 checkpoint 里都没有这项信息，工具无论怎么查模型都推不出来。它把每 token 的 KV 字节数直接翻倍/砍半，是本工具敏感度最高的单项，因此必须作为界面输入并显示反事实，不能当常数。详见 [[adr-0007]]。
@@ -108,7 +112,7 @@ DP 和 PP 在任何 family 下都不复制 KV。
 | 级别 | 含义 | 例 |
 |---|---|---|
 | `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB |
-| `derived` | 由 `config.json` / HF safetensors 元数据 / `index.json` 的 `total_size` 算出 | routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB |
-| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数 |
+| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账 |
+| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数 |
 | `guessed` | 拍的，无依据 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，且它直接决定最大并发**） |
 | `measured` | 目标硬件实测 | （暂无） |
