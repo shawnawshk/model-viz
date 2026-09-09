@@ -42,9 +42,9 @@
 
 | 模型 | 权重 | 结构 | 一台 p5en 能收多少并发 |
 |---|---|---|---|
-| [Kimi K3](data/models/kimi-k3.js) | 1453.7 GiB(MXFP4) | 93 层 = 69 KDA + 24 MLA · 896 experts / top-16 | 装不下,4 台起 → 69 路 |
-| [GLM-5.3-Flash](data/models/glm-5.3-flash.js) | 305.8 GiB(FP8) | 45 层 = 34 KDA + 11 DSA · 288 experts / top-8 | 325 路(TP1×DP8)|
+| [Kimi K3](data/models/kimi-k3.js) | 1453.7 GiB(MXFP4) | 93 层 = 69 KDA + 24 MLA · 896 experts / top-16 | 装不下,4 台起 → 68 路 |
+| [GLM-5.3-Flash](data/models/glm-5.3-flash.js) | 305.8 GiB(FP8) | 45 层 = 34 KDA + 11 DSA · 288 experts / top-8 | 320 路(TP1×DP8)|
 
-> 上面这两个路数都是 **128K 上下文 / util 0.90 / BF16 KV / 原生量化** 下的读数。**任何路数都必须连口径一起报** —— 同一个 TP1×DP8,换成 1M 上下文只剩 44 路,换成 FP8 KV 则翻到 585 路。页面上预设按钮的路数是按你当前拖到的口径**现算**的,并直接标在数字旁边(`325 路 @128K/0.90`)。
+> 上面这两个路数都是 **128K 上下文 / util 0.90 / BF16 KV / 原生量化** 下的读数。**任何路数都必须连口径一起报** —— 同一个 TP1×DP8,换成 1M 上下文只剩 40 路,换成 FP8 KV 则翻到 584 路。页面上预设按钮的路数是按你当前拖到的口径**现算**的,并直接标在数字旁边(`320 路 @128K/0.90`)。
 
-两个模型的切分权衡**方向相反**:K3 的非 expert 权重有 106.5 GiB,DP 复制它很贵;GLM 只有 15.5 GiB,复制几乎免费,而 TP 会把 KV latent 复制 TP 份 —— 同一台机器上 128K 时 TP1×DP8 是 325 路、TP8/DP1 只有 53 路。但这个 6 倍差距随口径缩水:1K 上下文下只剩 1.11×,而且那时 TP2×DP4 会反超两者。所以工具**不标「推荐」**,排序交给现算的数字(见 [ADR-0008 §9](docs/adr/0008-two-bucket-measured-weights-and-dsa.md))。
+两个模型的切分权衡**方向相反**:K3 的非 expert 权重有 106.5 GiB,DP 复制它很贵;GLM 只有 15.5 GiB,复制几乎免费,而 TP 会把 KV latent 复制 TP 份 —— 同一台机器上 128K 时 TP1×DP8 是 320 路、TP8/DP1 只有 53 路。但这个 6 倍差距随口径缩水:1K 上下文下只剩 1.11×,而且那时 TP2×DP4 会反超两者。所以工具**不标「推荐」**,排序交给现算的数字(见 [ADR-0008 §9](docs/adr/0008-two-bucket-measured-weights-and-dsa.md))。
