@@ -12,6 +12,7 @@ REG.models["kimi-k3"] = {
   name: "Kimi K3",
   hf: "moonshotai/Kimi-K3",
   blurb: "2.7799T 总参数 · 104B 激活 · 93 层混合注意力(69 KDA + 24 Gated MLA)· 896 routed experts / top-16",
+  hidden: 7168,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构:分段列表,混合注意力是常态而非特例 ----
   layers: [
@@ -38,15 +39,19 @@ REG.models["kimi-k3"] = {
     latent: 3584, inter: 3072,
   },
 
-  // ---- 权重字节数:全部 derived,不含残差估算 ----
+  // ---- 权重:两桶实测字节 + 两个参数量,全部 derived,不含残差估算(口径见 ADR-0008)----
   weights: {
-    bf16Params: 57_179_884_544,        // HF safetensors.parameters.BF16 —— 非 expert 主体
-    f32Params:      11_122_432,        // 同上 .F32 —— norms / scales
-    totalBytes: 1_560_860_324_864,     // index.json metadata.total_size
-    // 下面两项由上面三项推出,写在这里便于核对:
-    // nonExpertBytes = bf16*2 + f32*4 = 114,404,258,816 B = 106.5 GiB
-    // expertBytes    = totalBytes - nonExpertBytes = 1,446,456,066,048 B = 1347.0 GiB
-    // expertBytes / expertParams 恰为 0.53125,与 mxfp4(4bit + 每32元素一个8bit scale)吻合
+    totalBytes:   1_560_860_324_864,   // index.json metadata.total_size
+    expertBytes:  1_446_456_066_048,   // routed expert 桶 = 1347.0 GiB。K3 的 quantization_config
+                                       // 排除了所有非 expert 模块,所以「总字节 − 非 expert」这个
+                                       // 残差恰好就是纯 routed expert,无需逐张量求和
+    expertParams:     2_722_740_830_208,   // 92 × 896 × 3 × 3584 × 3072,由 config 推出
+    nonExpertParams:     57_191_006_976,   // HF safetensors.parameters:BF16 57,179,884,544 + F32 11,122,432
+    nonExpertBf16Params: 57_179_884_544,   // 其中可被「非 expert 权重」开关切成 FP8 的那部分
+    nonExpertFixedBytes:     44_489_728,   // F32 norms/scales(11,122,432 × 4 B),开关不动它
+    // 两条闭合校验,引擎加载时会硬断言:
+    //   57,179,884,544 × 2 + 44,489,728 = 114,404,258,816 B = 106.5 GiB = totalBytes − expertBytes ✓
+    //   expertBytes ÷ expertParams = 0.53125,与 mxfp4(4bit + 每32元素一个8bit scale)吻合 ✓
   },
 
   // ---- 量化 ----
@@ -82,6 +87,8 @@ REG.models["kimi-k3"] = {
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5e.48xlarge",
   ],
   defaultInstance: "p5en.48xlarge",
+  // 打开页面的起始切分。1453.7 GiB 权重装不进一台,所以 4 台起。
+  defaultParallel: { n: 4, tp: 8, dp: 4, pp: 1, ep: 32 },
 
   // 每个预设都绑定机型 —— 点它会连机型一起切过去,所以 UI 上必须把机型显示出来。
   presets: [
@@ -95,5 +102,26 @@ REG.models["kimi-k3"] = {
     // 同时构成与「推荐」同台数的对照:同样 4 台,b200 的 109 路 vs p5en 的 69 路
     // (默认 BF16 KV;切成 FP8 KV 则是 215 vs 136 —— 差一倍,这就是 kvDtypes 必须可切的原因)。
     { name: "b200 四台(同台数胜 p5en)", inst: "p6-b200.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32 },
+  ],
+
+  // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
+  // 通用条目(单位、util、KV、state、overhead、PP)由引擎给;这里只放 K3 自己的一手件溯源。
+  notes: [
+    `<b>非 expert 参数量 = 57.19B,由权威一手件推导</b>(不再是残差估算)。来源:HF `
+    + `<code>/api/models/moonshotai/Kimi-K3</code> 的 <code>safetensors.parameters</code> 给出 `
+    + `<code>BF16 57,179,884,544</code> + <code>F32 11,122,432</code>,字节数 = `
+    + `<code>BF16×2 + F32×4 = 114,404,258,816 B = 106.5 GiB</code>。<br>`
+    + `它含 24 MLA + 69 KDA 的投影、2 个 shared expert、MoE latent 投影、dense 层 0、embedding + LM head。`
+    + `<code>quantization_config</code> 明确排除 attention / shared experts / MLP projections,所以这部分不是 MXFP4。<br>`
+    + `<b>此前用「2.8T 减 expert 部分」估为 77.3B,高估了 35%。</b>2.8T 本身是向上取整的标称值,真实总参数为 2.7799T。`,
+
+    `<b>expert 权重 = 1347.0 GiB,同样为推导值</b>。<code>model.safetensors.index.json</code> 的 `
+    + `<code>metadata.total_size = 1,560,860,324,864 B</code> 减去非 expert 部分即得。除以逻辑参数量 `
+    + `<code>2,722,740,830,208</code> 恰好等于 <b>0.53125</b>,与「4 bit + 每 32 元素一个 8 bit scale」的`
+    + `理论值完全吻合 —— 三条独立来源互相印证。<br>`
+    + `取该文件必须用 <code>resolve</code> 端点;<code>raw</code> 端点只返回 git-lfs 指针。`,
+
+    `MXFP4 在 Hopper(H200)上<b>没有原生张量核支持</b>,引擎走 dequant 到 BF16/FP8 的路径:`
+    + `显存节省保留,算力加速拿不到。这张图只算显存,不算这部分性能损失。`,
   ],
 };
