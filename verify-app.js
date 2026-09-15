@@ -174,7 +174,9 @@ for (const kv of ["bf16", "fp8"]) {
                             totalDeltaBytes: gpuTotal - C.totalUsed,
                             peakUsedGiB: C.used / GIB, minUsedGiB: C.minUsed / GIB,
                             lookupGiB: C.lookup / GIB,
-                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep });
+                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep,
+                            insightHtml: document.getElementById("roofactions").innerHTML,
+                            insightDisplay: document.getElementById("roofactions").style.display });
   render();
   globalThis.__probe[globalThis.__probe.length - 1].commHtml =
     document.getElementById("commtbl").innerHTML;
@@ -190,6 +192,24 @@ globalThis.__packExamples = [1, 8, 9].map(n => distributeRequests(n, 8));
 Object.assign(S, { kvDt: "bf16" }); syncOptions("probe"); render();
 globalThis.__presets = PRESETS.map(p => Math.floor(presetCompute(p).maxConc));
 markPreset();
+// 三个模型都必须能针对当前机型 / 台数给出容量方向的同机型切分反事实。
+// 具体候选仍由各 family 的 compute() 约束过滤,不能绕过 KV 复制或 engram 显存规则。
+{
+  const keep = { ...S }, keepGoal = roofGoal;
+  roofGoal = "capacity"; render();
+  globalThis.__capacityInsight = document.getElementById("roofactions").innerHTML;
+  Object.assign(S, keep); roofGoal = keepGoal; syncOptions("probe"); render();
+}
+// Kimi 决策层的「建议已采用完」状态:B300 + FP8 KV + 最短上下文。
+// 此时降低延迟目标下不应拿同一条「实测校准」重复补满三栏;校准动作只留在「下一次验证」。
+if (${JSON.stringify(c.model)} === "kimi-k3") {
+  const keep = { ...S };
+  Object.assign(S, { instId: "p6-b300.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32,
+                     concIdx: 0, ctxIdx: 0, kvDt: "fp8", neFmt: "bf16", expFmt: "mxfp4" });
+  syncOptions("probe"); render();
+  globalThis.__exhaustedInsight = document.getElementById("roofactions").innerHTML;
+  Object.assign(S, keep); roofGoal = "latency"; syncOptions("probe"); render();
+}
 `;
   // ---- 按 html 里的顺序执行:inline[0] → data 文件 → inline[1](主脚本)----
   eval(inline[0]);
@@ -261,6 +281,56 @@ markPreset();
     if (r.regime !== c.roof.regime) fail.push(`roofline regime 应为 ${c.roof.regime},实为 ${r.regime}`);
     if (!near(r.ridge, c.roof.ridge)) fail.push(`拐点应为 ${c.roof.ridge},实为 ${typeof r.ridge === "number" ? r.ridge.toFixed(1) : r.ridge}`);
     if (!near(r.kvCross, c.roof.kvCross)) fail.push(`临界上下文应为 ${c.roof.kvCross},实为 ${r.kvCross}`);
+  }
+
+  // 所有模型页面都必须把 roofline 诊断翻成目标、反事实动作和「先别做」。
+  // 候选仍受各自 compute() 的 family 约束,并固定当前 PP、不新引入跨 NVLink 域 TP。
+  const insight = b.insightHtml;
+  for (const text of ["下一步怎么做", "降低延迟", "提高吞吐", "增加容量", "同机型切分可尝试", "先别做"])
+    if (!insight.includes(text)) fail.push(`${c.model} 决策层缺少「${text}」`);
+  if (b.insightDisplay === "none") fail.push(`${c.model} 决策层不应隐藏`);
+  if (insight.includes('data-tp="16"') || insight.includes('data-tp="32"'))
+    fail.push(`${c.model} 同机型建议不应新引入跨 NVLink 域的 TP`);
+
+  const capacityInsight = String(globalThis.__capacityInsight || "");
+  if (capacityInsight.includes("data-roof-parallel")) {
+    if (!capacityInsight.includes(`data-pp="${c.state.pp}"`))
+      fail.push(`${c.model} 同机型建议 v1 应固定当前 PP=${c.state.pp}`);
+    if (capacityInsight.includes(`data-tp="${c.state.tp}" data-dp="${c.state.dp}" data-pp="${c.state.pp}" data-ep="${c.state.ep}"`))
+      fail.push(`${c.model} 同机型切分候选不应重复当前切分`);
+  }
+
+  if (c.model === "kimi-k3") {
+    if (!capacityInsight.includes("data-roof-parallel"))
+      fail.push("Kimi 容量目标下没有可应用的同机型并行切分");
+    if (!insight.includes("没有可信的同机型切分改善"))
+      fail.push("Kimi 默认延迟目标应诚实说明没有可信的同机型切分改善");
+    const exhausted = String(globalThis.__exhaustedInsight || "");
+    const exhaustedCards = (exhausted.match(/class="ra-card"/g) || []).length;
+    if (exhaustedCards !== 0)
+      fail.push(`建议采用完后动作卡应为空,实为 ${exhaustedCards} 张`);
+    if (exhausted.includes("先做实测校准"))
+      fail.push("「实测校准」不应作为重复动作卡,只应留在下一次验证");
+  }
+  if (c.model === "glm-5.3-flash" && c.label.startsWith("1×p5en TP8/DP1")) {
+    if (!capacityInsight.includes("data-roof-parallel"))
+      fail.push("GLM 容量目标下没有可应用的同机型并行切分");
+    if (!capacityInsight.includes("TP1 / DP8 / PP1 / EP8"))
+      fail.push("GLM 容量建议应识别 TP1/DP8 可减少 KV 复制");
+    if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×8 降到 ×1"))
+      fail.push("GLM 容量建议应解释 TP1/DP8 的收益来自减少 KV 副本");
+  }
+  if (c.model === "deepseek-v4.1-flash" && c.label.startsWith("官方 MP=8")) {
+    if (!capacityInsight.includes("data-roof-parallel"))
+      fail.push("DeepSeek 容量目标下没有可应用的同机型并行切分");
+    if (!capacityInsight.includes("TP4 / DP2 / PP1 / EP8"))
+      fail.push("DeepSeek 容量建议应保留装得下 engram 的 TP4/DP2");
+    if (capacityInsight.includes("TP1 / DP8") || capacityInsight.includes("TP2 / DP4"))
+      fail.push("DeepSeek 容量建议不应包含装不下 engram 的 TP1/TP2");
+    if (!capacityInsight.includes("每卡engram 查表 23.6 → 47.3 GiB"))
+      fail.push("DeepSeek 容量建议应显式写出降低 TP 会增加单卡 engram 的代价");
+    if (capacityInsight.includes('data-roof-set="kvDt"'))
+      fail.push("DeepSeek 的 KV dtype 架构固定,不应建议切换 KV dtype");
   }
 
   return { fail, probe: globalThis.__probe, presets: globalThis.__presets };

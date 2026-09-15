@@ -2,7 +2,7 @@
 
 - 状态：**Accepted → 已在 `app.html` + `index.html` + `data/` 实施**（2026-09-15）
 - 触发：用户要一个「给定模型 / 机型 / 并行策略 → 理论上界」的模型，用来给部署选型和 benchmark 设计定方向
-- 影响：**取代** [ADR-0003](0003-scope-memory-feasibility-only.md) 后果里的「不回答哪个 instance 吞吐更高」与 [ADR-0005](0005-validator-not-solver-and-instance-list.md) §4 的「不算 FLOPS、不算吞吐、不算延迟」；**不动**成本 / 可得性那一条，**不动**校验器语义。data 契约：`instances` 加 `hbmGBs` / `denseTflops`，稀疏 family 的层组加 `indexTopk`
+- 影响：**取代** [ADR-0003](0003-scope-memory-feasibility-only.md) 后果里的「不回答哪个 instance 吞吐更高」与 [ADR-0005](0005-validator-not-solver-and-instance-list.md) §4 的「不算 FLOPS、不算吞吐、不算延迟」；**不动**成本 / 可得性那一条。其「只对当前配置给数」于同日被 [ADR-0011](0011-bounded-counterfactual-advisor.md) 部分取代,允许同机型、同台数的 Pareto 反事实。data 契约：`instances` 加 `hbmGBs` / `denseTflops`，稀疏 family 的层组加 `indexTopk`
 - 相关：[ADR-0002](0002-page-per-model.md)（单引擎）、[ADR-0004](0004-provenance-first-class.md)（provenance）、[ADR-0007](0007-kv-dtype-is-an-input.md)（KV dtype 是输入）、[ADR-0009](0009-third-weight-bucket-and-csa2.md)（family 钩子）
 
 ## 为什么重开 ADR-0003
@@ -18,7 +18,7 @@ ADR-0003 把吞吐排除的理由有两条：成本没依据，所以不能回�
 **不取代的：**
 
 - 成本 / 可得性仍然不算。roofline 给的是每卡 tok/s 上界，不是 $/token。
-- 校验器不是求解器（ADR-0005 §1）。roofline 只对**当前配置**给数，不排序、不推荐、不搜索。
+- 不做全局求解器（ADR-0011）。roofline 可在**当前机型、当前台数**内枚举合法切分并展示 Pareto 改善,但不跨机型 / 台数搜索,不声称实测或采购意义上的最优。
 - 每卡 12 GiB overhead 等既有软数字的处理一律不动。
 
 ## 决议
