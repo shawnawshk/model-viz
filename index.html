@@ -83,10 +83,9 @@
   .scope .sc-t { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--st-warning-ink); margin-bottom: 10px; }
   .scope .sc-i { flex: none; width: 16px; height: 16px; border: 1.5px solid currentColor; border-radius: 50%;
                  font-size: 11px; line-height: 13px; text-align: center; }
-  .scope ul { margin: 0; padding-left: 18px; color: var(--text-secondary);
-              display: grid; grid-template-columns: 1fr 1fr; gap: 8px 32px; }
+  .scope ul { margin: 0; padding-left: 18px; color: var(--text-secondary); }
+  .scope li + li { margin-top: 4px; }
   .scope li b { color: var(--st-warning-ink); }
-  @media (max-width: 720px) { .scope ul { grid-template-columns: 1fr; } }
 
   h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
 
@@ -114,18 +113,21 @@
   .spec b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 
-  /* ---- 机型目录:分组表头(显存 / 互联 / 算力),无 NVLink 机型前一行分隔 ---- */
+  /* ---- 机型目录:单行表头、单位写进列名;文本列左对齐,数字列右对齐;无 NVLink 机型前一行分隔 ---- */
   .sechead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 0 0 16px; }
   .sechead h2 { margin: 0; }
-  .tablewrap { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-card); overflow-x: auto; }
+  /* 12 列比 960px 正文栏宽,允许表格向两侧各溢出最多 80px(居中);窄屏收回到正文宽,横向滚动 */
+  .tablewrap { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-card);
+               overflow-x: auto; width: min(1120px, 100vw - 64px); margin-left: calc(50% - min(560px, 50vw - 32px)); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
-  th, td { text-align: right; padding: 8px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
-  /* 表头不做 uppercase:GiB / NVLink / dense 的大小写是口径的一部分,变成 GIB 就错了 */
-  th { background: var(--surface-2); color: var(--muted); font-weight: 600; font-size: 11px;
-       letter-spacing: 0.04em; vertical-align: bottom; }
-  th.grp { text-align: center; padding: 6px 10px; }
-  th.l, td:first-child { text-align: left; padding-left: 16px; font-variant-numeric: normal; }
-  td:first-child { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  th, td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  /* 表头不做 uppercase:GiB / NVLink 的大小写是口径的一部分,变成 GIB 就错了 */
+  th { background: var(--surface-2); color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: 0.02em; }
+  th.l, td.l { text-align: left; font-variant-numeric: normal; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
+  td:first-child { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td .x { color: var(--muted); margin-left: 4px; }
   tbody tr:hover td { background: var(--surface-2); }
   tbody tr:last-child td { border-bottom: none; }
   tr.grp td { text-align: left; font-size: 11px; color: var(--muted); background: var(--surface-2); padding: 6px 16px;
@@ -220,8 +222,10 @@ document.getElementById("models").innerHTML = Object.entries(REG.models).map(([i
 }).join("");
 
 // ---- 机型表 ----
-// 表头两行:分组(显存 / 互联 / 算力)+ 叶子列,共 11 个叶子列。改列数要同步改分隔行的 colspan,verify-app.js 会对账。
-const LEAF_COLS = 11;
+// 单行表头,12 列:GPU 与卡数合成一格(H200 ×8),dense TFLOPS 拆成 BF16 / FP8 / FP4 三列。
+// 改列数要同步改分隔行的 colspan,verify-app.js 会对账(叶子列数 = 不带 colspan 的 th 数)。
+const LEAF_COLS = 12;
+const num = v => v ? v.toLocaleString("en-US") : `<span class="no">—</span>`;
 let prevNoNvl = false;
 const rows = Object.entries(REG.instances).map(([id, s]) => {
   const nvl = s.p2p.type === "nvswitch";
@@ -230,25 +234,24 @@ const rows = Object.entries(REG.instances).map(([id, s]) => {
     ? `<tr class="grp"><td colspan="${LEAF_COLS}">以下机型卡间没有 NVLink(域 = 1):TP 的实际上限是 1,显存装得下也不代表能用</td></tr>`
     : "";
   prevNoNvl = !nvl;
+  const T = s.denseTflops || {};
   return divider + `<tr>
-    <td>${id}</td><td>${s.gpu}</td><td>${s.gpusPerInstance}</td>
+    <td class="l">${id}</td><td class="l">${s.gpu}<span class="x">×${s.gpusPerInstance}</span></td>
     <td>${f1(gib(s.gpuMemMiB))}</td><td>${f1(gib(s.gpuMemMiB) * s.gpusPerInstance)}</td>
     <td${nvl ? "" : ' class="no"'}>${s.nvlinkDomainGpus}</td>
     <td${nvl ? "" : ' class="no"'}>${nvl ? s.p2p.gbs : "PCIe"}</td>
     <td>${s.interDomainGbps} ${s.efaGen}</td>
     <td${s.nativeDtypes.includes("mxfp4") ? "" : ' class="no"'}>${s.nativeDtypes.includes("mxfp4") ? "✓" : "✗"}</td>
-    <td>${s.hbmGBs ? s.hbmGBs.toLocaleString("en-US") : "—"}</td>
-    <td>${s.denseTflops ? [s.denseTflops.bf16, s.denseTflops.fp8, s.denseTflops.fp4].map(v => v || "—").join(" / ") : "—"}</td>
+    <td>${num(s.hbmGBs)}</td><td>${num(T.bf16)}</td><td>${num(T.fp8)}</td><td>${num(T.fp4)}</td>
   </tr>`;
 }).join("");
 document.getElementById("insts").innerHTML =
-  `<thead>
-   <tr><th class="l" rowspan="2">实例</th><th rowspan="2">GPU</th><th rowspan="2">卡</th>
-       <th class="grp" colspan="2">显存</th><th class="grp" colspan="3">互联</th>
-       <th rowspan="2">原生 FP4</th><th class="grp" colspan="2" title="厂商 datasheet 的 dense 行,十进制">算力</th></tr>
-   <tr><th>GiB/卡</th><th>GiB/实例</th><th>NVLink 域</th><th title="NVSwitch 带宽,十进制 GB/s;无 NVLink 的机型只有 PCIe">域内 P2P GB/s</th><th title="EFA 线速,Gbps">跨域 Gbps</th>
-       <th title="厂商 datasheet,十进制 GB/s">HBM GB/s</th><th title="dense(非 sparsity)张量核算力,BF16 / FP8 / FP4">dense TFLOPS</th></tr>
-   </thead><tbody>${rows}</tbody>`;
+  `<thead><tr>
+     <th class="l">实例</th><th class="l">GPU</th><th>GiB/卡</th><th>GiB/实例</th><th>NVLink 域</th>
+     <th title="NVSwitch 带宽,十进制 GB/s;无 NVLink 的机型只有 PCIe">域内 P2P GB/s</th><th title="EFA 线速,Gbps">跨域 Gbps</th>
+     <th>原生 FP4</th><th title="厂商 datasheet,十进制 GB/s">HBM GB/s</th>
+     <th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">BF16 TFLOPS</th><th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">FP8 TFLOPS</th><th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">FP4 TFLOPS</th>
+   </tr></thead><tbody>${rows}</tbody>`;
 
 // ---- 主题:?theme= > localStorage(与 app.html 共用同一个键,跳转不丢) > 系统偏好 ----
 const themeBtn = document.getElementById("theme");

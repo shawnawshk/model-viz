@@ -331,7 +331,7 @@ function runIndex() {
   }
 
   const tbl = String(els.get("insts")?.innerHTML ?? "");
-  // 表头是两行(分组表头 + 叶子表头):叶子列数 = 不带 colspan 的 th 数;每个数据行的 td 数必须与之相等。
+  // 叶子列数 = 不带 colspan 的 th 数(表头一行或多行都成立);每个数据行的 td 数必须与之相等。
   // 分隔行(tr.grp,有 NVLink 与没有的机型之间那一行)不算数据行,但它的 colspan 必须横跨全部叶子列。
   const nTh = (tbl.match(/<th(?![^>]*\bcolspan=)[\s>]/g) || []).length;
   const bodyRows = (tbl.split("<tbody>")[1] || "").split("<tr").slice(1);
