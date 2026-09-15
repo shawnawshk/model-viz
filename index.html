@@ -4,86 +4,152 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM 并行切分与显存分布 — 模型索引</title>
+<!-- 字体走 Google Fonts;离线或被墙时回退到系统字体栈,display=swap 保证文字先出、不白屏 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <script>window.REG = { instances: {}, models: {} };</script>
 <script src="data/instances.js"></script>
 <script src="data/models/kimi-k3.js"></script>
 <script src="data/models/glm-5.3-flash.js"></script>
 <script src="data/models/deepseek-v4.1-flash.js"></script>
 <style>
+  /* 冷灰色板。浅色是基准,深色是同一组色相按深色底重新取阶(不是自动反色);
+     三个 series 色与 app.html 的堆叠条同色,在两种底色上都过了 CVD / 对比度校验。 */
   :root {
     color-scheme: light;
-    --surface-1: #fcfcfb; --page: #f9f9f7;
-    --text-primary: #0b0b0b; --text-secondary: #52514e; --muted: #898781;
-    --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
-    --accent: #2a78d6; --st-warning: #fab219; --st-warning-ink: #8a5d00;
+    --page: #f4f6f9; --surface-1: #ffffff; --surface-2: #f8fafc;
+    --text-primary: #0f172a; --text-secondary: #475569; --muted: #64748b;
+    --grid: #e5e9f0; --baseline: #cbd3df; --border: rgba(15,23,42,0.08);
+    --accent: #2563eb;
+    --series-attn: #2a78d6; --series-expert: #eb6834; --series-lookup: #8a5cd6; --track: #e9edf3;
+    --st-warning: #fab219; --st-warning-ink: #8a5d00;
+    --shadow-card: 0 1px 2px rgba(15,23,42,0.04);
   }
   @media (prefers-color-scheme: dark) {
     :root:where(:not([data-theme="light"])) {
       color-scheme: dark;
-      --surface-1: #1a1a19; --page: #0d0d0d;
-      --text-primary: #ffffff; --text-secondary: #c3c2b7;
-      --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-      --accent: #3987e5; --st-warning-ink: #fab219;
+      --page: #0b1220; --surface-1: #131a2a; --surface-2: #1a2336;
+      --text-primary: #f1f5f9; --text-secondary: #b8c3d6; --muted: #8a97ad;
+      --grid: #243049; --baseline: #34425c; --border: rgba(255,255,255,0.08);
+      --accent: #60a5fa;
+      --series-attn: #3987e5; --series-expert: #d95926; --series-lookup: #9d78e0; --track: #1f2a3f;
+      --st-warning-ink: #fbbf24; --shadow-card: none;
     }
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --surface-1: #1a1a19; --page: #0d0d0d;
-    --text-primary: #ffffff; --text-secondary: #c3c2b7;
-    --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
-    --accent: #3987e5; --st-warning-ink: #fab219;
+    --page: #0b1220; --surface-1: #131a2a; --surface-2: #1a2336;
+    --text-primary: #f1f5f9; --text-secondary: #b8c3d6; --muted: #8a97ad;
+    --grid: #243049; --baseline: #34425c; --border: rgba(255,255,255,0.08);
+    --accent: #60a5fa;
+    --series-attn: #3987e5; --series-expert: #d95926; --series-lookup: #9d78e0; --track: #1f2a3f;
+    --st-warning-ink: #fbbf24; --shadow-card: none;
   }
+
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--page); color: var(--text-primary);
-    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    font-size: 14px; line-height: 1.6; padding: 40px 24px 64px;
+    font-family: Inter, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.65; padding: 48px 32px 80px;
+    -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 900px; margin: 0 auto; }
-  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
-  .lede { color: var(--text-secondary); margin: 0 0 4px; }
-  .lede code { background: var(--surface-1); border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; font-size: 12.5px; }
+  @media (max-width: 720px) { body { padding: 28px 20px 56px; } }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+         background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; }
 
+  /* ---- 顶栏 ---- */
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 40px; }
+  .topbar .tb { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); }
+  .ghost {
+    font: inherit; font-size: 12.5px; cursor: pointer; color: var(--text-secondary);
+    background: var(--surface-2); border: 1px solid var(--baseline); border-radius: 8px; padding: 6px 12px; min-height: 32px;
+    transition: border-color .12s ease-out, color .12s ease-out;
+  }
+  .ghost:hover { color: var(--text-primary); border-color: var(--muted); }
+  .ghost:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  h1 { font-size: 26px; font-weight: 600; line-height: 1.2; letter-spacing: -0.02em; margin: 0 0 8px; }
+  .lede { color: var(--text-secondary); font-size: 12.5px; line-height: 1.55; margin: 0; }
+  .lede b { color: var(--text-primary); }
+
+  /* ---- 边界声明:先读这个。琥珀色左边线 + 两列要点,是提示不是报错 ---- */
   .scope {
-    background: var(--surface-1); border: 1px solid var(--border);
-    border-left: 3px solid var(--st-warning); border-radius: 8px;
-    padding: 12px 16px; margin: 22px 0; font-size: 12.5px;
+    background: var(--surface-1); border: 1px solid var(--border); border-left: 3px solid var(--st-warning);
+    border-radius: 12px; box-shadow: var(--shadow-card); padding: 16px 20px; margin: 32px 0 40px;
+    font-size: 12.5px; line-height: 1.55;
   }
-  .scope b { color: var(--st-warning-ink); }
-  .scope ul { margin: 6px 0 0; padding-left: 20px; color: var(--text-secondary); }
+  .scope .sc-t { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--st-warning-ink); margin-bottom: 10px; }
+  .scope .sc-i { flex: none; width: 16px; height: 16px; border: 1.5px solid currentColor; border-radius: 50%;
+                 font-size: 11px; line-height: 13px; text-align: center; }
+  .scope ul { margin: 0; padding-left: 18px; color: var(--text-secondary); }
+  .scope li + li { margin-top: 4px; }
+  .scope li b { color: var(--st-warning-ink); }
 
-  h2 { font-size: 14px; font-weight: 600; margin: 30px 0 12px; color: var(--text-secondary);
-       text-transform: uppercase; letter-spacing: 0.06em; }
+  h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 16px; }
 
+  /* ---- 模型卡:三列网格,每张卡一条权重构成迷你堆叠条 ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 40px; }
   a.card {
-    display: block; text-decoration: none; color: inherit;
-    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
-    padding: 16px 18px; margin-bottom: 10px; transition: border-color .12s;
+    display: flex; flex-direction: column; text-decoration: none; color: inherit;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-card);
+    padding: 20px; transition: border-color .12s ease-out;
   }
   a.card:hover { border-color: var(--accent); }
-  a.card .nm { font-size: 16px; font-weight: 600; margin-bottom: 3px; }
-  a.card .nm .hf { font-size: 11.5px; font-weight: 400; color: var(--muted); margin-left: 8px; }
-  a.card .bl { color: var(--text-secondary); font-size: 12.5px; }
-  a.card .meta { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--grid);
-                 font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 14px; }
-  a.card .meta b { color: var(--text-secondary); font-weight: 600; }
+  a.card .nm { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 16px; font-weight: 600; line-height: 1.3; }
+  a.card .nm .hf { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+                   font-size: 12px; font-weight: 400; color: var(--muted); }
+  a.card .bl { color: var(--text-secondary); font-size: 12.5px; line-height: 1.55; margin: 8px 0 16px; flex: 1 1 auto; }
+  /* 堆叠条:底槽 = 权重合计,2px 间隙靠 flex 收缩吸收,4px 圆角收尾靠容器裁切 */
+  .wbar { display: flex; gap: 2px; height: 14px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .wbar .s-attn   { background: var(--series-attn); }
+  .wbar .s-expert { background: var(--series-expert); }
+  .wbar .s-lookup { background: var(--series-lookup); }
+  .wtot { font-size: 11px; color: var(--muted); margin: 6px 0 14px; font-variant-numeric: tabular-nums; }
+  /* 单列:卡宽约 270px,两列会把「其中 expert」这类标签折行 */
+  .spec { display: grid; grid-template-columns: 1fr; gap: 6px; font-size: 12.5px; color: var(--muted); }
+  .spec div { display: flex; justify-content: space-between; gap: 8px; }
+  .spec b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
-  th, td { text-align: right; padding: 5px 7px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
-  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
-  th { color: var(--muted); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  /* ---- 机型目录:单行表头、单位写进列名;文本列左对齐,数字列右对齐;无 NVLink 机型前一行分隔 ---- */
+  .sechead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 0 0 16px; }
+  .sechead h2 { margin: 0; }
+  /* 12 列比 960px 正文栏宽,允许表格向两侧各溢出最多 80px(居中);窄屏收回到正文宽,横向滚动 */
+  .tablewrap { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-card);
+               overflow-x: auto; width: min(1120px, 100vw - 64px); margin-left: calc(50% - min(560px, 50vw - 32px)); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+  th, td { text-align: right; padding: 9px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  /* 表头不做 uppercase:GiB / NVLink 的大小写是口径的一部分,变成 GIB 就错了 */
+  th { background: var(--surface-2); color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: 0.02em; }
+  th.l, td.l { text-align: left; font-variant-numeric: normal; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
+  td:first-child { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td .x { color: var(--muted); margin-left: 4px; }
+  tbody tr:hover td { background: var(--surface-2); }
   tbody tr:last-child td { border-bottom: none; }
+  tr.grp td { text-align: left; font-size: 11px; color: var(--muted); background: var(--surface-2); padding: 6px 16px;
+              font-family: inherit; font-variant-numeric: normal; }
   .no { color: var(--muted); }
 
-  .docs { margin-top: 30px; font-size: 12.5px; color: var(--text-secondary); }
-  .docs a { color: var(--accent); }
-  .docs li { margin-bottom: 2px; }
-  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--grid);
-           font-size: 11.5px; color: var(--muted); }
+  /* ---- 文档 + 页脚 ---- */
+  .docs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-top: 40px; font-size: 12.5px; }
+  .docs .lbl { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .docs a { color: var(--accent); text-decoration: none; }
+  .docs a:hover { text-decoration: underline; }
+  .docs .sep { width: 1px; height: 12px; background: var(--baseline); }
+  footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--grid); font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
 <div class="wrap">
+
+  <div class="topbar">
+    <span class="tb">模型索引</span>
+    <button class="ghost" id="theme" type="button">切换深色</button>
+  </div>
 
   <h1>LLM 并行切分与显存分布</h1>
   <p class="lede">
@@ -91,7 +157,7 @@
   </p>
 
   <div class="scope">
-    <b>这套工具算显存,外加 decode 的 roofline 下界。</b>
+    <div class="sc-t"><span class="sc-i" aria-hidden="true">!</span>这套工具算显存,外加 decode 的 roofline 下界。</div>
     <ul>
       <li>吞吐与延迟只给<b>理论下界</b>,不是预测:按 spec 峰值算,不含每步固定开销、attention FLOPs、通信延迟,不算 prefill / TTFT。低并发下实测慢一个量级以上是正常的。</li>
       <li>不回答价格与可得性,因此<b>不能</b>用于判断「哪个机型更值」。</li>
@@ -101,22 +167,22 @@
   </div>
 
   <h2>模型</h2>
-  <div id="models"></div>
+  <div class="cards" id="models"></div>
 
-  <h2>机型目录</h2>
-  <p class="lede" style="font-size:12.5px;margin:-4px 0 10px">
-    这是<b>目录</b>。每个模型页面的机型下拉只提供其中一个<b>子集</b> —— 哪些机型值得为某个模型考虑是业务判断,逐个确认后写在模型定义里。
-  </p>
-  <table id="insts"></table>
+  <div class="sechead">
+    <h2>机型目录</h2>
+    <p class="lede">这是<b>目录</b>。每个模型页面的机型下拉只提供其中一个<b>子集</b> —— 哪些机型值得为某个模型考虑是业务判断,逐个确认后写在模型定义里。</p>
+  </div>
+  <div class="tablewrap"><table id="insts"></table></div>
 
   <div class="docs">
-    <h2 style="margin-top:26px">设计文档</h2>
-    <ul>
-      <!-- 指向 GitHub 而不是本地 docs/*.md:Pages 上 .md 会被浏览器当附件下载,GitHub 帮我们渲染。 -->
-      <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/glossary.md">glossary.md</a> — 领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径</li>
-      <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/instance-specs.md">instance-specs.md</a> — G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)</li>
-      <li><a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr">adr/0001–0010</a> — 已锁定的设计决策(0010:decode roofline 下界,部分取代 0003 的「只算显存」)</li>
-    </ul>
+    <!-- 指向 GitHub 而不是本地 docs/*.md:Pages 上 .md 会被浏览器当附件下载,GitHub 帮我们渲染。 -->
+    <span class="lbl">设计文档</span>
+    <a href="https://github.com/shawnawshk/model-viz/blob/main/docs/glossary.md" title="领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径">glossary.md</a>
+    <span class="sep"></span>
+    <a href="https://github.com/shawnawshk/model-viz/blob/main/docs/instance-specs.md" title="G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)">instance-specs.md</a>
+    <span class="sep"></span>
+    <a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr" title="已锁定的设计决策(0010:decode roofline 下界,部分取代 0003 的「只算显存」)">adr/0001–0010</a>
   </div>
 
   <footer id="foot"></footer>
@@ -127,54 +193,82 @@
 const GIB = 1024 ** 3;
 const gib = mib => (mib * 1048576 / GIB);
 const f1 = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
+const pct = (part, whole) => (part / whole * 100).toFixed(2) + "%";
 
 // ---- 模型卡片 ----
 document.getElementById("models").innerHTML = Object.entries(REG.models).map(([id, m]) => {
   // 第三桶(按 TP 切的查表)只有部分模型有,缺省 0 —— 与 app.html 的口径一致,见 ADR-0009 §1
   const tpSharded = m.weights.tpShardedBytes || 0;
   const nonExpert = m.weights.totalBytes - m.weights.expertBytes - tpSharded;
-  const totalGiB  = m.weights.totalBytes / GIB;
-  const nCand = m.candidateInstances.length;
+  const total = m.weights.totalBytes;
+  const lookupName = m.tpShardedShort || "查表";
+  // 堆叠条按三桶的固定顺序:非 expert → expert → 查表;下面的文字行带同色 swatch,身份不靠颜色单独承载
+  const segs = [["s-attn", nonExpert], ["s-expert", m.weights.expertBytes], ["s-lookup", tpSharded]]
+    .filter(([, v]) => v > 0)
+    .map(([cls, v]) => `<span class="${cls}" style="width:${pct(v, total)}"></span>`).join("");
   return `<a class="card" href="app.html?model=${id}">
     <div class="nm">${m.name}<span class="hf">${m.hf}</span></div>
     <div class="bl">${m.blurb}</div>
-    <div class="meta">
-      <span>权重合计 <b>${f1(totalGiB)} GiB</b></span>
-      <span>其中 expert <b>${f1(m.weights.expertBytes / GIB)} GiB</b></span>
-      ${tpSharded ? `<span>${m.tpShardedShort || "查表"} <b>${f1(tpSharded / GIB)} GiB</b></span>` : ""}
-      <span>非 expert <b>${f1(nonExpert / GIB)} GiB</b></span>
-      <span>量化 <b>${m.quantFormat.toUpperCase()}</b></span>
-      <span>候选机型 <b>${nCand}</b> 个</span>
+    <div class="wbar" role="img" aria-label="权重构成">${segs}</div>
+    <div class="wtot">权重合计 ${f1(total / GIB)} GiB</div>
+    <div class="spec">
+      <div><span><span class="sw" style="background:var(--series-attn)"></span>非 expert</span><b>${f1(nonExpert / GIB)} GiB</b></div>
+      <div><span><span class="sw" style="background:var(--series-expert)"></span>其中 expert</span><b>${f1(m.weights.expertBytes / GIB)} GiB</b></div>
+      ${tpSharded ? `<div><span><span class="sw" style="background:var(--series-lookup)"></span>${lookupName}</span><b>${f1(tpSharded / GIB)} GiB</b></div>` : ""}
+      <div><span>量化</span><b>${m.quantFormat.toUpperCase()}</b></div>
+      <div><span>候选机型</span><b>${m.candidateInstances.length} 个</b></div>
     </div>
   </a>`;
 }).join("");
 
 // ---- 机型表 ----
+// 单行表头,12 列:GPU 与卡数合成一格(H200 ×8),dense TFLOPS 拆成 BF16 / FP8 / FP4 三列。
+// 改列数要同步改分隔行的 colspan,verify-app.js 会对账(叶子列数 = 不带 colspan 的 th 数)。
+const LEAF_COLS = 12;
+const num = v => v ? v.toLocaleString("en-US") : `<span class="no">—</span>`;
+let prevNoNvl = false;
 const rows = Object.entries(REG.instances).map(([id, s]) => {
   const nvl = s.p2p.type === "nvswitch";
-  return `<tr>
-    <td><code>${id}</code></td><td>${s.gpu}</td><td>${s.gpusPerInstance}</td>
+  // 有 NVLink 的机型与没有的之间加一行分隔:域 = 1 是 TP 的硬上限(ADR-0001),显存装得下也不代表能用
+  const divider = (!nvl && !prevNoNvl)
+    ? `<tr class="grp"><td colspan="${LEAF_COLS}">以下机型卡间没有 NVLink(域 = 1):TP 的实际上限是 1,显存装得下也不代表能用</td></tr>`
+    : "";
+  prevNoNvl = !nvl;
+  const T = s.denseTflops || {};
+  return divider + `<tr>
+    <td class="l">${id}</td><td class="l">${s.gpu}<span class="x">×${s.gpusPerInstance}</span></td>
     <td>${f1(gib(s.gpuMemMiB))}</td><td>${f1(gib(s.gpuMemMiB) * s.gpusPerInstance)}</td>
     <td${nvl ? "" : ' class="no"'}>${s.nvlinkDomainGpus}</td>
-    <td${nvl ? "" : ' class="no"'}>${nvl ? s.p2p.gbs + " GB/s" : "PCIe"}</td>
+    <td${nvl ? "" : ' class="no"'}>${nvl ? s.p2p.gbs : "PCIe"}</td>
     <td>${s.interDomainGbps} ${s.efaGen}</td>
     <td${s.nativeDtypes.includes("mxfp4") ? "" : ' class="no"'}>${s.nativeDtypes.includes("mxfp4") ? "✓" : "✗"}</td>
-    <td>${s.hbmGBs ? s.hbmGBs.toLocaleString("en-US") : "—"}</td>
-    <td>${s.denseTflops ? [s.denseTflops.bf16, s.denseTflops.fp8, s.denseTflops.fp4].map(v => v || "—").join(" / ") : "—"}</td>
+    <td>${num(s.hbmGBs)}</td><td>${num(T.bf16)}</td><td>${num(T.fp8)}</td><td>${num(T.fp4)}</td>
   </tr>`;
 }).join("");
 document.getElementById("insts").innerHTML =
-  `<thead><tr><th>实例</th><th>GPU</th><th>卡</th><th>GiB/卡</th><th>GiB/实例</th>
-   <th>NVLink 域</th><th>域内 P2P</th><th>跨域</th><th>原生 FP4</th>
-   <th title="厂商 datasheet,十进制 GB/s">HBM GB/s</th><th title="dense(非 sparsity)张量核算力,BF16 / FP8 / FP4">dense TFLOPS</th></tr></thead><tbody>${rows}</tbody>`;
+  `<thead><tr>
+     <th class="l">实例</th><th class="l">GPU</th><th>GiB/卡</th><th>GiB/实例</th><th>NVLink 域</th>
+     <th title="NVSwitch 带宽,十进制 GB/s;无 NVLink 的机型只有 PCIe">域内 P2P GB/s</th><th title="EFA 线速,Gbps">跨域 Gbps</th>
+     <th>原生 FP4</th><th title="厂商 datasheet,十进制 GB/s">HBM GB/s</th>
+     <th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">BF16 TFLOPS</th><th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">FP8 TFLOPS</th><th title="厂商 datasheet 的 dense(非 sparsity)行,TFLOPS">FP4 TFLOPS</th>
+   </tr></thead><tbody>${rows}</tbody>`;
 
-// 主题:?theme= > localStorage(与 app.html 共用同一个键,跳转不丢) > 系统偏好
+// ---- 主题:?theme= > localStorage(与 app.html 共用同一个键,跳转不丢) > 系统偏好 ----
+const themeBtn = document.getElementById("theme");
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  themeBtn.textContent = t === "dark" ? "切换浅色" : "切换深色";
+}
+themeBtn.addEventListener("click", () => {
+  const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  setTheme(t);
+  try { localStorage.setItem("viz-theme", t); } catch (e) { /* file:// 下可能被禁,忽略 */ }
+});
 const qsTheme = new URLSearchParams(location.search).get("theme");
 let saved = null; try { saved = localStorage.getItem("viz-theme"); } catch (e) {}
-document.documentElement.dataset.theme =
-  ["light","dark"].includes(qsTheme) ? qsTheme
+setTheme(["light","dark"].includes(qsTheme) ? qsTheme
   : ["light","dark"].includes(saved) ? saved
-  : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
 
 document.getElementById("foot").textContent =
   `${Object.keys(REG.models).length} 个模型 · ${Object.keys(REG.instances).length} 个机型 · `

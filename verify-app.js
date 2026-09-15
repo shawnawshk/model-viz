@@ -371,11 +371,19 @@ function runIndex() {
   }
 
   const tbl = String(els.get("insts")?.innerHTML ?? "");
-  const nTh = (tbl.match(/<th[\s>]/g) || []).length;
-  const rows = tbl.split("<tr>").slice(2);        // [0] 是 thead 之前的片段,[1] 是表头行
+  // 叶子列数 = 不带 colspan 的 th 数(表头一行或多行都成立);每个数据行的 td 数必须与之相等。
+  // 分隔行(tr.grp,有 NVLink 与没有的机型之间那一行)不算数据行,但它的 colspan 必须横跨全部叶子列。
+  const nTh = (tbl.match(/<th(?![^>]*\bcolspan=)[\s>]/g) || []).length;
+  const bodyRows = (tbl.split("<tbody>")[1] || "").split("<tr").slice(1);
+  const rows = bodyRows.filter(r => !r.startsWith(' class="grp"'));
+  const grps = bodyRows.filter(r => r.startsWith(' class="grp"'));
   const tdCounts = [...new Set(rows.map(r => (r.match(/<td[\s>]/g) || []).length))];
   if (tdCounts.length !== 1) fail.push(`机型表各行 td 数不一致:${tdCounts.join(", ")}`);
-  else if (tdCounts[0] !== nTh) fail.push(`机型表 th=${nTh} 与 td=${tdCounts[0]} 不匹配,表格会错一列`);
+  else if (tdCounts[0] !== nTh) fail.push(`机型表叶子 th=${nTh} 与 td=${tdCounts[0]} 不匹配,表格会错一列`);
+  for (const g of grps) {
+    const m = g.match(/colspan="(\d+)"/);
+    if (!m || Number(m[1]) !== nTh) fail.push(`分隔行 colspan=${m ? m[1] : "无"},应为叶子列数 ${nTh}`);
+  }
   if (rows.length !== Object.keys(REG.instances).length)
     fail.push(`机型表 ${rows.length} 行,但 data 里有 ${Object.keys(REG.instances).length} 个机型`);
 
