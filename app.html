@@ -186,6 +186,16 @@
   .ra-split-label b { color: var(--text-primary); }
   .ra-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 14px; }
   .ra-cards:empty { display: none; }
+  .ra-parallel { margin-top: 14px; padding-top: 13px; border-top: 1px solid var(--grid); }
+  .ra-parallel-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+  .ra-parallel-head b { font-size: 12.5px; }
+  .ra-parallel-head span { color: var(--text-secondary); font-size: 11px; }
+  .ra-parallel-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .ra-par-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; }
+  .ra-par-title { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .ra-par-metric { font-size: 16px; font-weight: 650; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .ra-par-copy { color: var(--text-secondary); font-size: 11.5px; line-height: 1.5; margin: 4px 0 9px; }
+  .ra-par-empty { color: var(--text-secondary); font-size: 11.5px; line-height: 1.5; padding: 9px 11px; background: var(--surface-1); border: 1px dashed var(--baseline); border-radius: 7px; }
   .ra-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 12px 13px; min-height: 154px; display: flex; flex-direction: column; }
   .ra-card[data-primary="1"] { border-color: var(--text-primary); box-shadow: inset 0 0 0 1px var(--text-primary); }
   .ra-rank { color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
@@ -209,6 +219,7 @@
     .ra-head { grid-template-columns: 1fr; }
     .ra-goals { width: fit-content; }
     .ra-cards { grid-template-columns: 1fr; }
+    .ra-parallel-grid { grid-template-columns: 1fr; }
     .ra-card { min-height: 0; }
     .ra-bottom { grid-template-columns: 1fr; }
   }
@@ -1294,17 +1305,16 @@ const fsig = (v, d = 3) => v >= 1000 ? fint(Math.round(v)) : Number(v.toPrecisio
 // 任意 token 数的短写(临界上下文不是 2 的幂,fctx 会吐出 3.56640625M 这种东西)
 const ftokc = n => n >= 1048576 ? (n / 1048576).toFixed(1) + "M" : n >= 1024 ? Math.round(n / 1024) + "K" : String(n);
 
-// ---------------- Kimi K3 决策层原型 ----------------
-// 先只在一个模型页面试点。这里不引入新的性能模型,只把同一个 roofline 做成反事实:
-// 改 dtype / 上下文 / batch / 机型后,下界和容量会怎样变。
+// ---------------- decode 决策层 ----------------
+// 不引入新的性能模型,只把同一个 roofline 做成反事实:
+// 改 dtype / 上下文 / batch / 机型 / 同机型切分后,下界和容量会怎样变。
 let roofGoal = "latency";
-const roofPilot = MODEL_ID === "kimi-k3";
 const roofActionsEl = document.getElementById("roofactions");
 const roofMathEl = document.getElementById("roofmath");
 const roofMathSummary = document.getElementById("roofmathsum");
-roofActionsEl.style.display = roofPilot ? "" : "none";
-roofMathEl.open = !roofPilot;
-roofMathSummary.style.display = roofPilot ? "" : "none";
+roofActionsEl.style.display = "";
+roofMathEl.open = false;
+roofMathSummary.style.display = "";
 
 function capacityAt(C, ctx = C.ctx, kvDt = C.kvDt, sp = HW.spec) {
   const budget = sp.gpuMemMiB * 1024 * 1024 * (S.util / 100);
@@ -1330,9 +1340,98 @@ function actionCard(a, i) {
     ${a.key ? applyBtn(a.key, a.value) : ""}
   </article>`;
 }
-function renderRoofActions(C, R) {
-  if (!roofPilot) { roofActionsEl.innerHTML = ""; return; }
+function withParallelState(state, fn) {
+  const keep = { ...S };
+  Object.assign(S, state);
+  try { return fn(); }
+  finally { Object.assign(S, keep); }
+}
+function parallelAlternatives(C, R, goal) {
+  const W = C.W, current = {
+    itl: R.itl,
+    throughput: C.conc / R.itl,
+    capacity: Math.floor(C.maxConc),
+  };
+  const out = [];
+  // v1 刻意固定 PP,并且不新引入跨 NVLink 域的 TP:
+  // roofline 尚未计 PP send/recv、pipeline bubble 与集合通信延迟,让搜索器利用这些缺项会给出假优化。
+  const pp = S.pp, stage = W / pp;
+  for (const tp of divisors(stage).filter(x => x <= HW.domain)) {
+    const dp = stage / tp;
+    for (const ep of divisors(stage).filter(x => M.nExperts % x === 0)) {
+      if (tp === S.tp && dp === S.dp && ep === S.ep) continue;
+      const state = { tp, dp, pp, ep };
+      const candidate = withParallelState(state, () => {
+        const CC = compute();
+        if (CC.used > CC.budget + 1 || CC.maxConc < CC.conc) return null;
+        const RR = roofTerms(CC, CC.conc, CC.ctx);
+        return {
+          state, C: CC, R: RR,
+          itl: RR.itl,
+          throughput: CC.conc / RR.itl,
+          capacity: Math.floor(CC.maxConc),
+        };
+      });
+      if (candidate) out.push(candidate);
+    }
+  }
 
+  const improves = x => goal === "latency" ? x.itl < current.itl * 0.995
+    : goal === "throughput" ? x.throughput > current.throughput * 1.005
+    : x.capacity > current.capacity;
+  const dominates = (a, b) => {
+    if (goal === "latency")
+      return a.itl <= b.itl && a.capacity >= b.capacity && (a.itl < b.itl || a.capacity > b.capacity);
+    if (goal === "throughput")
+      return a.throughput >= b.throughput && a.capacity >= b.capacity
+        && (a.throughput > b.throughput || a.capacity > b.capacity);
+    return a.capacity >= b.capacity && a.itl <= b.itl && (a.capacity > b.capacity || a.itl < b.itl);
+  };
+  const frontier = out.filter(improves).filter(x => !out.some(y => y !== x && improves(y) && dominates(y, x)));
+  frontier.sort(goal === "latency"
+    ? ((a, b) => a.itl - b.itl || b.capacity - a.capacity)
+    : goal === "throughput"
+      ? ((a, b) => b.throughput - a.throughput || b.capacity - a.capacity)
+      : ((a, b) => b.capacity - a.capacity || a.itl - b.itl));
+
+  const seen = new Set();
+  return frontier.filter(x => {
+    const k = `${x.itl.toPrecision(6)}|${x.throughput.toPrecision(6)}|${x.capacity}`;
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  }).slice(0, 2);
+}
+function parallelCard(x, goal, C, R) {
+  const s = x.state;
+  const metric = goal === "latency"
+    ? `ITL ≥ ${fms(R.itl)} → ${fms(x.itl)} ms`
+    : goal === "throughput"
+      ? `吞吐 ≤ ${fint(Math.round(C.conc / R.itl))} → ${fint(Math.round(x.throughput))} tok/s`
+      : `容量 ${fint(Math.floor(C.maxConc))} → ${fint(x.capacity)} 路`;
+  const trade = goal === "capacity"
+    ? `当前负载的 ITL 下界 ${fms(R.itl)} → ${fms(x.itl)} ms`
+    : `最大并发 ${fint(Math.floor(C.maxConc))} → ${fint(x.capacity)} 路`;
+  const topology = [];
+  if (s.tp > HW.domain) topology.push(`TP 跨 NVLink 域`);
+  if (s.ep > HW.domain) topology.push(`EP 跨域`);
+  if (s.pp > 1) topology.push(`PP${s.pp} 流水`);
+  if (!topology.length) topology.push("集合通信留在 NVLink 域内");
+  const mechanism = [];
+  if (s.tp < S.tp && s.dp > S.dp)
+    mechanism.push(`每路 KV 的跨卡副本从 ×${S.tp} 降到 ×${s.tp},同时 DP${S.dp} → DP${s.dp}`);
+  if (x.C.lookup > C.lookup + 1024 * 1024)
+    mechanism.push(`代价是每卡${MD.tpShardedShort || "按 TP 切的查表"} ${fgib(C.lookup)} → ${fgib(x.C.lookup)} GiB`);
+  else if (x.C.lookup + 1024 * 1024 < C.lookup)
+    mechanism.push(`每卡${MD.tpShardedShort || "按 TP 切的查表"} ${fgib(C.lookup)} → ${fgib(x.C.lookup)} GiB`);
+  return `<article class="ra-par-card">
+    <div class="ra-par-title">TP${s.tp} / DP${s.dp} / PP${s.pp} / EP${s.ep}</div>
+    <div class="ra-par-metric">${metric}</div>
+    <div class="ra-par-copy">${trade};${mechanism.length ? mechanism.join(";") + ";" : ""}${topology.join("、")},通信下界 ${fms(x.R.tComm)} ms。仅表示当前模型下界的 Pareto 改善。</div>
+    <button type="button" class="ra-apply" data-roof-parallel
+      data-tp="${s.tp}" data-dp="${s.dp}" data-pp="${s.pp}" data-ep="${s.ep}">应用到页面</button>
+  </article>`;
+}
+function renderRoofActions(C, R) {
   const sp = HW.spec, candidates = MD.candidateInstances.map(id => ({ id, sp: REG.instances[id] }));
   const maxHbm = Math.max(...candidates.map(x => x.sp.hbmGBs));
   const hbmPeers = candidates.filter(x => x.sp.hbmGBs === maxHbm);
@@ -1419,6 +1518,7 @@ function renderRoofActions(C, R) {
 
   const byGoal = { latency, throughput, capacity };
   const actions = byGoal[roofGoal];
+  const parallel = parallelAlternatives(C, R, roofGoal);
   const goalName = { latency: "降低延迟", throughput: "提高吞吐", capacity: "增加容量" }[roofGoal];
   const regime = REGIME_LABEL[R.regime];
   const avoid = R.regime === "mem"
@@ -1433,7 +1533,7 @@ function renderRoofActions(C, R) {
   roofActionsEl.innerHTML = `
     <div class="ra-head">
       <div>
-        <div class="ra-eyebrow">下一步怎么做 · Kimi K3 原型</div>
+        <div class="ra-eyebrow">下一步怎么做 · ${MD.name}</div>
         <div class="ra-title">当前 ${fint(C.conc)} 路 @ ${fctx(C.ctx)}:<strong>${regime}</strong></div>
         <div class="ra-sub">每步下界 ${fms(R.step)} ms;当前目标是「${goalName}」。建议按预计收益排序,按钮只改变本页参数,不会修改部署。</div>
       </div>
@@ -1448,6 +1548,13 @@ function renderRoofActions(C, R) {
     </div>
     <div class="ra-split-label"><span><b>${weightShare.toFixed(0)}%</b> 权重读取</span><span><b>${cacheShare.toFixed(0)}%</b> KV / state 读取</span></div>
     <div class="ra-cards">${actions.slice(0, 3).map(actionCard).join("")}</div>
+    <section class="ra-parallel">
+      <div class="ra-parallel-head"><b>同机型切分可尝试 · ${shortInst(S.instId)} ×${S.n}</b>
+        <span>固定机型、台数、PP、dtype、上下文与 util;不新引入跨域 TP,只展示 Pareto 改善。</span></div>
+      ${parallel.length
+        ? `<div class="ra-parallel-grid">${parallel.map(x => parallelCard(x, roofGoal, C, R)).join("")}</div>`
+        : `<div class="ra-par-empty">当前目标下没有可信的同机型切分改善。PP 气泡 / send-recv 与跨域 TP 的集合通信延迟尚未建模,因此不会利用这些缺项硬凑建议。</div>`}
+    </section>
     <div class="ra-bottom">
       <div class="ra-avoid"><b>先别做:</b>${avoid}</div>
       <div class="ra-check"><b>下一次验证:</b>${check}</div>
@@ -1486,15 +1593,13 @@ function roofVerdict(C, R, ridge) {
 
 function renderRoof(C) {
   const R = roofTerms(C, C.conc, C.ctx), sp = HW.spec, T = sp.denseTflops, hbm = sp.hbmGBs * 1e9;
-  const ridgeMax = roofPilot && C.maxConc >= 1 ? Math.max(1, Math.floor(C.maxConc)) : CONC_STEPS[CONC_STEPS.length - 1];
+  const ridgeMax = C.maxConc >= 1 ? Math.max(1, Math.floor(C.maxConc)) : CONC_STEPS[CONC_STEPS.length - 1];
   const ridge = roofRidge(C, C.ctx, ridgeMax), cross = roofKvCross(C, C.conc);
   const pct = t => R.step > 0 ? `${(t / R.step * 100).toFixed(0)}%` : "—";
   const dt = d => d.toUpperCase();
   const cls = k => R.regime === k ? "xnode" : "";
 
-  document.getElementById("roofhead").textContent = roofPilot
-    ? `decode 优化方向 · ${MD.name}`
-    : `decode 每步耗时下界 · roofline(${sp.gpu} spec 峰值,未校准)`;
+  document.getElementById("roofhead").textContent = `decode 优化方向 · ${MD.name}`;
   roofMathSummary.textContent = `查看 roofline 下界与完整算式 · ${sp.gpu} spec 峰值,未校准`;
   renderRoofActions(C, R);
   document.getElementById("roofverdict").innerHTML = roofVerdict(C, R, ridge);
@@ -1652,6 +1757,19 @@ roofActionsEl.addEventListener("click", e => {
   if (goal) {
     roofGoal = goal.dataset.roofGoal;
     render();
+    return;
+  }
+  const parallel = e.target.closest?.("[data-roof-parallel]");
+  if (parallel) {
+    Object.assign(S, {
+      tp: Number(parallel.dataset.tp),
+      dp: Number(parallel.dataset.dp),
+      pp: Number(parallel.dataset.pp),
+      ep: Number(parallel.dataset.ep),
+    });
+    syncOptions("preset");
+    render();
+    markPreset();
     return;
   }
   const apply = e.target.closest?.("[data-roof-set]");
