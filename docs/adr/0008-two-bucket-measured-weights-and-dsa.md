@@ -147,6 +147,6 @@ K3 的预设名字**没动**：它的「推荐 TP8×DP4」在 128K/0.90 下是 6
 
 ## 仍未解决
 
-- **`overhead` 还是常数**，每卡 12 GiB 仍不可调。第二个模型没有改变这一点，见 CLAUDE.md 的待做项。
+- **`overhead` 还是常数**，每卡 12 GiB 仍不可调。第二个模型没有改变这一点，见 CLAUDE.local.md 的待做项。
 - **indexer key cache 的两个读数都不是一手依据。** 消除办法与 ADR-0007 的 KV dtype 相同：在目标机型上起一次服务，读引擎自报的 block 数反解。
 - **GQA family 仍未落地。** 届时 KV 复制因子是 `max(1, TP/n_kv_heads)`，是并行配置的函数，`FAMILY` 表的 `perTokenElems(g)` 签名不够，需要传入当前切分 —— 与本 ADR 新增的 `perTokenFixedBytes` 是两件事，不要混。

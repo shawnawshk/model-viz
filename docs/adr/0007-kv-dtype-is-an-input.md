@@ -66,6 +66,6 @@
 
 ## 仍未解决
 
-- **`overhead` 还是常数。** 每卡 12 GiB 仍是 `guessed`，且仍不可调 —— 按同样的理由它也该提成输入，见 CLAUDE.md 的待做项。
+- **`overhead` 还是常数。** 每卡 12 GiB 仍是 `guessed`，且仍不可调 —— 按同样的理由它也该提成输入，见 CLAUDE.local.md 的待做项。
 - **真正消除这两项的办法只有一个**：在目标机型上起一次服务，读引擎自报的 KV block 数反解真实 overhead 与真实 KV 单价，把 provenance 提到 `measured`（ADR-0004）。届时 `kvDtypes` 的选择会退化为「记录当时用了哪档」。
 - **GQA family 落地时**这条同样适用，但那时 KV 复制因子还额外依赖 `n_kv_heads` 与 TP 的关系（见 `glossary.md`），是并行配置的函数，两者不要混在一起处理。

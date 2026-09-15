@@ -1,0 +1,17 @@
+# verify-app.js 把 app.html 的 <script> 连同 data 文件在 Node DOM stub 里 eval 一遍并断言容器非空 ——
+# render() 中途抛异常时页面上半部分看着完全正常,所以这一步不能只靠截图。
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node verify-app.js
