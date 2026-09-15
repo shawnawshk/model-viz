@@ -8,6 +8,7 @@
 <script src="data/instances.js"></script>
 <script src="data/models/kimi-k3.js"></script>
 <script src="data/models/glm-5.3-flash.js"></script>
+<script src="data/models/deepseek-v4.1-flash.js"></script>
 <style>
   :root {
     color-scheme: light;
@@ -111,9 +112,10 @@
   <div class="docs">
     <h2 style="margin-top:26px">设计文档</h2>
     <ul>
-      <li><a href="docs/glossary.md">glossary.md</a> — 领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径</li>
-      <li><a href="docs/instance-specs.md">instance-specs.md</a> — G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)</li>
-      <li><a href="docs/adr/">adr/0001–0008</a> — 已锁定的设计决策</li>
+      <!-- 指向 GitHub 而不是本地 docs/*.md:Pages 上 .md 会被浏览器当附件下载,GitHub 帮我们渲染。 -->
+      <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/glossary.md">glossary.md</a> — 领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径</li>
+      <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/instance-specs.md">instance-specs.md</a> — G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)</li>
+      <li><a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr">adr/0001–0009</a> — 已锁定的设计决策</li>
     </ul>
   </div>
 
@@ -128,7 +130,9 @@ const f1 = v => v >= 100 ? v.toFixed(0) : v.toFixed(1);
 
 // ---- 模型卡片 ----
 document.getElementById("models").innerHTML = Object.entries(REG.models).map(([id, m]) => {
-  const nonExpert = m.weights.totalBytes - m.weights.expertBytes;
+  // 第三桶(按 TP 切的查表)只有部分模型有,缺省 0 —— 与 app.html 的口径一致,见 ADR-0009 §1
+  const tpSharded = m.weights.tpShardedBytes || 0;
+  const nonExpert = m.weights.totalBytes - m.weights.expertBytes - tpSharded;
   const totalGiB  = m.weights.totalBytes / GIB;
   const nCand = m.candidateInstances.length;
   return `<a class="card" href="app.html?model=${id}">
@@ -137,6 +141,7 @@ document.getElementById("models").innerHTML = Object.entries(REG.models).map(([i
     <div class="meta">
       <span>权重合计 <b>${f1(totalGiB)} GiB</b></span>
       <span>其中 expert <b>${f1(m.weights.expertBytes / GIB)} GiB</b></span>
+      ${tpSharded ? `<span>${m.tpShardedShort || "查表"} <b>${f1(tpSharded / GIB)} GiB</b></span>` : ""}
       <span>非 expert <b>${f1(nonExpert / GIB)} GiB</b></span>
       <span>量化 <b>${m.quantFormat.toUpperCase()}</b></span>
       <span>候选机型 <b>${nCand}</b> 个</span>

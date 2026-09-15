@@ -1,4 +1,4 @@
-// app.html 的脚本执行验证。CLAUDE.md 硬约束 #2:改完 app.html 必须在 DOM stub 下 eval 一遍,
+// app.html 的脚本执行验证。CLAUDE.local.md 硬约束 #2:改完 app.html 必须在 DOM stub 下 eval 一遍,
 // 并断言各容器非空 —— render() 中途抛异常时页面上半部分看着完全正常。
 //
 // 每个模型至少一个用例,且必须有一个 PP>1 的用例 —— PP 分支只在那时才渲染,
@@ -65,6 +65,40 @@ const CASES = [
     // 与上面 128K/0.90 的 [53,320,188,364,832,912] 对照:同一组切分,口径一换整组缩到约 1/6。
     // 这就是预设路数不能写死在数据文件里的原因。
     expectPresets: [7, 48, 28, 56, 128, 136] },
+
+  // ---- DeepSeek-V4.1-Flash(ADR-0009)----
+  // 这个模型的 kvDtypes 只有一档(FP4,架构固定),所以探针那两轮 bf16/fp8 会落到同一档 ——
+  // 期望值故意写成两个相同的数,再由 kvFixed 显式断言「切 dtype 确实无效」。
+  // 890 B/token 是独立外部核对点:它等于 model card 的头号数字「890 bytes per token」。
+  { model: "deepseek-v4.1-flash", label: "官方 MP=8:1×p5en TP8/DP1/EP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 488], fp8: [890, 488] }, kvFixed: true,
+    // 第 3、4 个预设(TP2/DP4 与 TP1×DP8)在 p5en 上是 0 —— engram 只能按 TP 切,
+    // TP<4 时单卡就背不动它。这两个 0 是本模型最该被钉住的东西,别当成写错了删掉。
+    expectPresets: [488, 538, 0, 0, 3364, 1680] },
+  // p5en 上 TP4/DP2 反超官方的 TP8/DP1:engram ÷4 比 ÷8 贵,但 KV 少复制一半。
+  { model: "deepseek-v4.1-flash", label: "1×p5en TP4/DP2/EP8(engram ÷4)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 538], fp8: [890, 538] }, kvFixed: true },
+  // 短上下文用例。ADR-0009 §5:滑窗环形 buffer 是 5.000 MiB/请求且与上下文无关,
+  // 1K 下它占单请求的 85% —— 漏乘它,1K 的期望值会差 6.75 倍,而 128K 只差 4.5%。
+  // **只有这条用例能抓住那个漏乘**,别把它删了。
+  { model: "deepseek-v4.1-flash", label: "1K 上下文:滑窗环 buffer 是主导项", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 9682], fp8: [890, 9682] }, kvFixed: true,
+    expectPresets: [9682, 10658, 0, 0, 66640, 33340] },
+  // PP>1(每个模型必须有一条)。这里同时钉住 ADR-0009 §8:engram 不按 PP 切,
+  // 所以 lookup 在 PP=2 下与 PP=1 相同(都是 189.13 ÷ TP 4 = 47.28 GiB)。
+  { model: "deepseek-v4.1-flash", label: "PP2 1×p5en TP4/DP1/PP2/EP4",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 1, pp: 2, ep: 4, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 561], fp8: [890, 561] }, kvFixed: true,
+    expectLookupGiB: 47.28 },
+  // 装不下的用例。前两个模型都没有「权重本身就超预算」的用例走过这条路径,
+  // 而这正是本模型最容易出现的状态(TP 太小 → engram 背不动)。
+  { model: "deepseek-v4.1-flash", label: "TP1×DP8:engram 不切 → 装不下",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 0], fp8: [890, 0] }, kvFixed: true,
+    expectLookupGiB: 189.13 },
 ];
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
@@ -110,6 +144,7 @@ for (const kv of ["bf16", "fp8"]) {
                             perDpCapacity: C.perDpCapacity,
                             totalDeltaBytes: gpuTotal - C.totalUsed,
                             peakUsedGiB: C.used / GIB, minUsedGiB: C.minUsed / GIB,
+                            lookupGiB: C.lookup / GIB,
                             tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep });
   render();
   globalThis.__probe[globalThis.__probe.length - 1].commHtml =
@@ -149,6 +184,12 @@ markPreset();
   }
   if (b.altConc !== f.maxConc || f.altConc !== b.maxConc)
     fail.push(`反事实不对称:bf16.alt=${b.altConc} vs fp8.max=${f.maxConc};fp8.alt=${f.altConc} vs bf16.max=${b.maxConc}`);
+  // kvDtypeFixed 的模型(ADR-0009 §3):dtype 写死在架构里,切它必须完全无效。
+  // 若哪天有人给这种模型加了第二档 dtype,这条会当场喊出来。
+  if (c.kvFixed && (b.bytesPerToken !== f.bytesPerToken || b.maxConc !== f.maxConc))
+    fail.push(`kvFixed 的模型切 dtype 竟然有效:${b.bytesPerToken}B/${b.maxConc}路 vs ${f.bytesPerToken}B/${f.maxConc}路`);
+  if (c.expectLookupGiB !== undefined && b.lookupGiB.toFixed(2) !== c.expectLookupGiB.toFixed(2))
+    fail.push(`按 TP 切的查表单卡应为 ${c.expectLookupGiB.toFixed(2)} GiB,实为 ${b.lookupGiB.toFixed(2)} GiB`);
   for (const p of [b, f])
     if (Math.abs(p.totalDeltaBytes) > 1)
       fail.push(`${p.kv}:逐卡显存求和与集群合计相差 ${p.totalDeltaBytes} B`);
