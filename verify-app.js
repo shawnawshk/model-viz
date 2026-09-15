@@ -1,8 +1,11 @@
-// app.html 的脚本执行验证。CLAUDE.local.md 硬约束 #2:改完 app.html 必须在 DOM stub 下 eval 一遍,
+// 两个页面的脚本执行验证。CLAUDE.local.md 硬约束 #2:改完 app.html 必须在 DOM stub 下 eval 一遍,
 // 并断言各容器非空 —— render() 中途抛异常时页面上半部分看着完全正常。
 //
 // 每个模型至少一个用例,且必须有一个 PP>1 的用例 —— PP 分支只在那时才渲染,
 // 曾因为探针从不设 PP 而漏掉通信表里的一个 NaN。
+//
+// index.html 的渲染检查见 runIndex():它没有用例表,只断言两个 innerHTML 非空、
+// 机型表 th/td 列数自洽、卡片数与挂载的模型数一致。
 const fs = require("fs"), path = require("path");
 const ROOT = process.argv[2] || __dirname;
 
@@ -216,6 +219,56 @@ markPreset();
   return { fail, probe: globalThis.__probe, presets: globalThis.__presets };
 }
 
+// ---- index.html ----
+// 上面的用例只覆盖 app.html。index.html 那两个 innerHTML 一直没人管,而它同样会
+// 半途出错而不露相:机型表的 <th> 与 <td> 数一旦对不上,整张表往后错一列,页面其余
+// 部分照样正常。行数与卡片数分别与 data 对账,顺带钉住 split("<tr>") 的切法。
+function runIndex() {
+  const idxHtml = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
+  const idxInline = [...idxHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  if (idxInline.length !== 2)
+    throw new Error(`index.html 的 inline script 结构变了:${idxInline.length} 个,期望 2 个`);
+
+  const els = new Map();
+  global.document = {
+    getElementById(id) { if (!els.has(id)) els.set(id, mkEl(id)); return els.get(id); },
+    querySelectorAll: () => [], addEventListener() {}, body: mkEl("body"),
+    documentElement: { dataset: {} },
+  };
+  global.location = { search: "" };
+  global.localStorage = { getItem: () => null, setItem() {} };
+  global.matchMedia = () => ({ matches: false });
+  global.window = global;
+
+  // 与 app.html 同一个顺序:inline[0] 建 REG → data 文件填充 → inline[1] 渲染
+  eval(idxInline[0]);
+  for (const s of idxSrcs) eval(fs.readFileSync(path.join(ROOT, s), "utf8"));
+  eval(idxInline[1]);
+
+  const fail = [];
+  const txt = id => String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "");
+  const IDX_REQUIRED = ["models", "insts", "foot"];
+  for (const id of IDX_REQUIRED) {
+    if (!txt(id).trim()) fail.push(`空容器:${id}`);
+    for (const b of ["undefined", "NaN"]) if (txt(id).includes(b)) fail.push(`${id} 里出现了 ${b}`);
+  }
+
+  const tbl = String(els.get("insts")?.innerHTML ?? "");
+  const nTh = (tbl.match(/<th[\s>]/g) || []).length;
+  const rows = tbl.split("<tr>").slice(2);        // [0] 是 thead 之前的片段,[1] 是表头行
+  const tdCounts = [...new Set(rows.map(r => (r.match(/<td[\s>]/g) || []).length))];
+  if (tdCounts.length !== 1) fail.push(`机型表各行 td 数不一致:${tdCounts.join(", ")}`);
+  else if (tdCounts[0] !== nTh) fail.push(`机型表 th=${nTh} 与 td=${tdCounts[0]} 不匹配,表格会错一列`);
+  if (rows.length !== Object.keys(REG.instances).length)
+    fail.push(`机型表 ${rows.length} 行,但 data 里有 ${Object.keys(REG.instances).length} 个机型`);
+
+  const nCards = (String(els.get("models")?.innerHTML ?? "").match(/class="card"/g) || []).length;
+  if (nCards !== modelSrcs.length)
+    fail.push(`模型卡 ${nCards} 张,但挂了 ${modelSrcs.length} 个模型`);
+
+  return { fail, nCards, nRows: rows.length, nTh };
+}
+
 let bad = 0;
 for (const c of CASES) {
   const { fail, probe, presets } = run(c);
@@ -231,6 +284,19 @@ for (const c of CASES) {
       + (c.expectPresets ? `,预设 [${presets}]` : ""));
   }
 }
-if (bad) { console.error(`\n✗ ${bad}/${CASES.length} 个用例失败`); process.exit(1); }
-console.log(`\n✓ ${CASES.length} 个用例全过 · ${REQUIRED.length} 个容器非空 · `
+// 放在用例之后:runIndex 会重建 global.document,此时已经没人用了
+const idx = runIndex();
+if (idx.fail.length) {
+  console.error("✗ index.html");
+  for (const m of idx.fail) console.error(`    ${m}`);
+} else {
+  console.log(`✓ index.html — ${idx.nCards} 张模型卡 · 机型表 ${idx.nRows} 行 × ${idx.nTh} 列,th/td 自洽`);
+}
+
+if (bad || idx.fail.length) {
+  if (bad) console.error(`\n✗ ${bad}/${CASES.length} 个用例失败`);
+  if (idx.fail.length) console.error("✗ index.html 渲染检查失败");
+  process.exit(1);
+}
+console.log(`\n✓ ${CASES.length} 个用例全过 · ${REQUIRED.length} 个容器非空 · index.html 渲染自洽 · `
   + `${modelSrcs.length} 个模型(${modelSrcs.map(s => path.basename(s, ".js")).join(", ")})`);
