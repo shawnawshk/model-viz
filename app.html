@@ -159,6 +159,25 @@
   /* PV_LABEL 里一直有 m:「实测」,但在 DSv4.1 的 KV 之前没有任何一项用得上它,
      所以这条字形是补齐的,不是新增的一级。 */
   .pv-m::before { content: "■ "; }
+  .pv-p::before { content: "▲ "; }
+
+  /* ---- roofline 面板(ADR-0010)---- */
+  .roofsum { display: flex; flex-wrap: wrap; gap: 22px; margin: 0 0 12px; }
+  .roofsum .rs .tl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; margin-bottom: 3px; }
+  .roofsum .rs .tv { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; font-variant-numeric: tabular-nums; }
+  .roofsum .rs .tu { font-size: 12px; font-weight: 400; color: var(--text-secondary); margin-left: 4px; }
+  .roofsum .rs .td { font-size: 12px; color: var(--text-secondary); margin-top: 3px; }
+  .roofverdict { font-size: 13.5px; line-height: 1.6; margin: 0 0 14px; }
+  .roofverdict b { font-weight: 600; }
+  .roofnote { font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; }
+  td.sub { padding-left: 22px; color: var(--text-secondary); }
+  .roofintro { font-size: 12.5px; color: var(--text-secondary); margin: -6px 0 12px; }
+  #rooftbl tr.grp td { background: var(--page); font-weight: 600; padding-top: 8px; }
+  #rooftbl td.how { text-align: left; color: var(--text-secondary); font-size: 11.5px; font-variant-numeric: normal; line-height: 1.45; }
+  #rooftbl th.how { text-align: left; }
+  #rooftbl details { margin-top: 8px; }
+  #rooftbl details summary { cursor: pointer; font-size: 12px; color: var(--text-secondary); }
+  #rooftbl details table { margin-top: 6px; }
 
   /* ---- banners ---- */
   .banners { display: flex; flex-direction: column; gap: 6px; margin: 14px 0 18px; }
@@ -305,9 +324,9 @@
 
   <!-- 边界声明:此页可能被外部读者看到,数字的适用范围必须在页面上,不能只写在设计文档里 -->
   <div class="scope">
-    <div class="sc-t">这张图只算显存。读数字前请先看这四条。</div>
+    <div class="sc-t">这张图算显存,外加 decode 的 roofline 下界。读数字前请先看这几条。</div>
     <ul>
-      <li><b>不回答吞吐、延迟、TTFT/ITL。</b> 完全不涉及 FLOPS 与通信耗时 —— 「装得下」不等于「跑得快」。</li>
+      <li><b>吞吐与延迟只给理论下界,不是预测。</b> 下方「decode 每步耗时下界」按厂商 spec 峰值算,没有效率系数,不含每步固定开销、attention FLOPs 与通信延迟 —— 实测只会更慢,低并发下慢一个量级以上是正常的。不算 prefill / TTFT。</li>
       <li><b>不回答价格与可得性。</b> 不含 $/小时、region 覆盖、Capacity Blocks 约束。因此本页<b>不能</b>用于回答「哪个实例更值」。</li>
       <li><b>头号数字建立在一个猜测值上。</b> 每卡 12 GiB 的「激活 + 通信 buffer」是拍的,无实测依据,而它直接决定最大并发。凡带 <span class="pv pv-g">猜测</span> 标记的数字都不可作为承诺。</li>
       <li id="scope-params"></li>
@@ -337,6 +356,18 @@
     </div>
   </div>
 
+  <!-- ADR-0010:decode 每步耗时的 roofline 下界。与显存图共用同一组输入(切分、并发、上下文、dtype),
+       但「上下文长度」在这里读作「每请求当前长度」,不是容量规划里的「最大长度」。 -->
+  <div class="panel" style="margin-top:22px">
+    <h3 id="roofhead"></h3>
+    <p class="roofintro">每张卡每生成 1 个 token,要把自己持有的权重<b>全读一遍</b>、读这批请求的 <b>KV</b>、把中间结果在卡之间<b>传一遍</b>。
+      三件事按 spec 峰值各自最少要多久,取最大,就是这一步的下界。下表每个数字都带算式。</p>
+    <p class="roofverdict" id="roofverdict"></p>
+    <div class="roofsum" id="roofsum"></div>
+    <p class="roofnote" id="roofwarn"></p>
+    <div id="rooftbl"></div>
+  </div>
+
   <details class="assump">
     <summary>计算口径与假设(点开)</summary>
     <ul id="assumplist"></ul>
@@ -351,7 +382,7 @@
 
 // ---------------- 模型常量(来自 Kimi-K3 config.json) ----------------
 const GIB = 1024 ** 3;
-const PV_LABEL = { s: "推导", e: "估算", g: "猜测", m: "实测" };
+const PV_LABEL = { s: "推导", e: "估算", g: "猜测", m: "实测", p: "spec" };
 
 // ---------------- 注册表 → 当前模型 ----------------
 const MODEL_ID = new URLSearchParams(location.search).get("model") || "kimi-k3";
@@ -376,6 +407,9 @@ const FAMILY = {
   // MLA:压缩 latent 被所有 head 共享 → TP 组内每卡各存一份完整副本(即不除以 TP)
   mla:    { perTokenElems: g => g.kvLoraRank + g.qkRopeDim,
             perReqBytes:   () => 0,
+            // decode 每步读多少 cache(ADR-0010):full attention → 整段上下文的 latent 都要读
+            decodeReadPerReq: (g, ctx, kvB) => ctx * (g.kvLoraRank + g.qkRopeDim) * kvB,
+            decodeReadDesc: (g, ctx, kvB) => `${g.count} 层 × (${g.kvLoraRank} + ${g.qkRopeDim}) × ${kvB} B = ${fint(g.count * (g.kvLoraRank + g.qkRopeDim) * kvB)} B/token × ${fctx(ctx)} 上下文,full attention 全读`,
             kvDesc: g => `${g.count} 层 × (kv_lora_rank ${g.kvLoraRank} + qk_rope ${g.qkRopeDim})`,
             stateShardableByTp: false },
   // DSA(DeepSeek Sparse Attention)= 同样的 MLA latent + lightning indexer 自己的一份 key cache。
@@ -387,6 +421,10 @@ const FAMILY = {
   dsa:    { perTokenElems:      g => g.kvLoraRank + g.qkRopeDim,
             perTokenFixedBytes: g => g.indexerElems * g.indexerBytes,
             perReqBytes:        () => 0,
+            // 稀疏省的就是这里:indexer 扫全部 key,latent 只读 top-k 个(indexTopk 来自 config.json)
+            decodeReadPerReq: (g, ctx, kvB) => ctx * g.indexerElems * g.indexerBytes
+                                             + Math.min(ctx, g.indexTopk) * (g.kvLoraRank + g.qkRopeDim) * kvB,
+            decodeReadDesc: (g, ctx, kvB) => `${g.count} 层 × [indexer key ${g.indexerElems * g.indexerBytes} B × 扫全部 ${fctx(ctx)} + 只读 top-${fint(g.indexTopk)} 个 latent × ${(g.kvLoraRank + g.qkRopeDim) * kvB} B],稀疏省的就是这里`,
             kvDesc: g => `${g.count} 层 × (kv_lora_rank ${g.kvLoraRank} + qk_rope ${g.qkRopeDim})`,
             stateShardableByTp: false },
   // CSA2(Compressed Sparse Attention 2)。与 MLA / DSA 的三点不同,合起来使
@@ -402,6 +440,11 @@ const FAMILY = {
                                     + g.indexerElems * g.indexerBytesPerElem + g.indexerScaleBytes)
                                     / g.compressRatio,
             perReqBytes: g => g.windowSlots * g.windowElems * g.windowBytesPerElem,
+            // 同 DSA:indexer 扫全部 latent(已按 compress_ratio 池化),主 latent 只读 top-k 个
+            decodeReadPerReq: (g, ctx) => { const n = ctx / g.compressRatio;
+              return n * (g.indexerElems * g.indexerBytesPerElem + g.indexerScaleBytes)
+                   + Math.min(n, g.indexTopk) * (g.latentElems * g.latentBytesPerElem + g.latentScaleBytes); },
+            decodeReadDesc: (g, ctx) => `${g.count} 层 × [池化后 ${fint(Math.round(ctx / g.compressRatio))} 个 latent × indexer ${g.indexerElems * g.indexerBytesPerElem + g.indexerScaleBytes} B 扫全部 + 只读 top-${fint(g.indexTopk)} 个 × latent ${g.latentElems * g.latentBytesPerElem + g.latentScaleBytes} B]`,
             kvDesc: g => `${g.count} 层 × (latent ${g.latentElems}×${g.latentBytesPerElem}B`
                        + `+scale ${g.latentScaleBytes}B + indexer ${g.indexerElems}×${g.indexerBytesPerElem}B`
                        + `+scale ${g.indexerScaleBytes}B) ÷ compress_ratio ${g.compressRatio}`,
@@ -489,6 +532,18 @@ const HW = {
   get gpuMem()      { return this.spec.gpuMemMiB * 1024 * 1024; },
   overheadPerGpu: 12 * GIB,
 };
+
+// ADR-0010 需要的数据字段,缺了就当场失败,不让页面静默少一块:
+//   稀疏 family 要有 indexTopk(否则 KV 读取会按全量算,长上下文下高估 20 倍以上);
+//   候选机型要有 hbmGBs 与 denseTflops.bf16(带宽 / 算力两条线的 spec)。
+for (const g of MD.layers) if ((g.family === "dsa" || g.family === "csa2") && !(g.indexTopk > 0))
+  throw new Error(`${g.family} 层组缺 indexTopk(config.json 的 index_topk)`);
+for (const id of MD.candidateInstances) {
+  const sp = REG.instances[id];
+  if (!sp) throw new Error(`candidateInstances 引用了不存在的机型 ${id}`);
+  if (!(sp.hbmGBs > 0) || !(sp.denseTflops && sp.denseTflops.bf16 > 0))
+    throw new Error(`机型 ${id} 缺 hbmGBs / denseTflops.bf16,roofline 无法计算`);
+}
 
 const CONC_STEPS = [1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1536,2048,3072,4096];
 const CTX_STEPS  = [1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576];
@@ -1044,6 +1099,8 @@ function render() {
           <td style="color:var(--muted)">—</td><td style="color:var(--muted)">${fgib((HW.gpuMem - C.budget) * C.W)}</td></tr>
     </tbody>`;
 
+  const roofAsm = renderRoof(C);   // 返回 roofline 的口径条目,并入下面的假设区
+
   epClamp = null;   // 只提示触发它的那一次
 
   document.getElementById("assumplist").innerHTML = `
@@ -1070,6 +1127,7 @@ function render() {
       <b>存储 dtype 是假设</b>:参考实现分配的是默认 dtype(BF16),但注释说数值上是 FP8;若引擎直接存 FP8 则本项减半。</li>` : ""}
     <li><b>12 GiB/卡的激活 + 通信 buffer 是粗估</b>,实际随 batch、CUDA graph、DeepEP buffer 大小变化。</li>
     <li>PP 的层切分按均分算,<b>忽略了</b> embedding(stage 0)、LM head(末 stage)和 ${kvFamilyName} 层分布不均带来的 stage 失衡。</li>
+    ${roofAsm}
   `;
 }
 
@@ -1086,6 +1144,250 @@ function crossNodeDesc() {
   if (S.ep > HW.domain) p.push(`EP all-to-all ${M.moeLayers * 2}`);
   if (S.pp > 1) p.push(`PP send ${S.pp - 1}`);
   return p.length ? p.join(" + ") : "全部通信留在 NVLink 域内";
+}
+
+// ---------------- roofline(ADR-0010)----------------
+// decode 一个 micro-step 在最忙那张卡上的耗时下界 = max(HBM 读取, 算力, 通信)。
+// 三条线都按厂商 spec 峰值算:没有效率系数,没有每步固定开销,没有 attention FLOPs —— 所以是下界,不是预测。
+// 并发滑块在这里读作「这一步的 token 数」(每请求 1 token,不含投机解码),
+// 上下文滑块读作「每请求当前上下文长度」(显存那边读作「最大长度」,同一个滑块,两种口径)。
+// smooth=true 时不取整,给拐点 / 临界上下文的二分用。
+function computeDtype(fmtId) {
+  // 算力那一行按权重格式选:机型有原生就用原生;MXFP4/NVFP4 无原生 → dequant 到 FP8,没有 FP8 就 BF16。
+  // 与 banner 里「无原生 FP4 的两条出路」的 (a) 路一致。假设激活与权重同精度。
+  const sp = HW.spec, R = sp.denseTflops;
+  const want = (fmtId === "mxfp4" || fmtId === "nvfp4") ? "fp4" : fmtId === "fp8" ? "fp8" : "bf16";
+  const has = d => d === "bf16" ? R.bf16 > 0
+            : d === "fp8"  ? sp.nativeDtypes.includes("fp8") && R.fp8 > 0
+            : (sp.nativeDtypes.includes("mxfp4") || sp.nativeDtypes.includes("nvfp4")) && R.fp4 > 0;
+  return has(want) ? want : has("fp8") ? "fp8" : "bf16";
+}
+function roofTerms(C, conc, ctx, smooth = false) {
+  const sp = HW.spec, R = sp.denseTflops, hbm = sp.hbmGBs * 1e9;
+  const up = smooth ? (x => x) : Math.ceil;
+  const stageTok = up(conc / S.pp);              // 一个 micro-batch 落在一个 stage 的 token 数
+  const rankTok  = up(stageTok / S.dp);          // 最忙的那个 DP rank 上的 token 数
+  const groupTok = stageTok * S.ep / C.stage;    // 到达本 expert 复制组的 token 数(EP = stage 时就是 stageTok)
+
+  // (1) HBM 读取:非 expert 权重整读;routed expert 只读这一步命中的那些(均匀路由的期望);
+  //     KV / state 按 family 的 decode 读法,÷TP / ÷PP 规则与显存侧完全相同。
+  const coverage = 1 - Math.pow(1 - M.topk / M.nExperts, groupTok);
+  const neRead   = C.attn;
+  const expRead  = C.expert * (M.moeLayers / M.expertWeightLayers) * coverage;   // 只算主干层,投机层不参与 decode
+  let kvPerReq = 0, stateRW = 0, winRead = 0;
+  for (const g of MD.layers) {
+    const f = FAMILY[g.family];
+    kvPerReq += g.count * (f.decodeReadPerReq ? f.decodeReadPerReq(g, ctx, C.kvDt.bytes) : 0);
+    const per = g.count * f.perReqBytes(g);
+    if (f.stateShardableByTp) stateRW += 2 * per; else winRead += per;   // recurrent state 读+写,滑窗环只读
+  }
+  const kvRead   = rankTok * (kvPerReq / S.pp + stateRW / S.tp / S.pp + winRead / S.pp);
+  const memBytes = neRead + expRead + kvRead, tMem = memBytes / hbm;
+
+  // (2) 算力:2 × 参数 × token。expert 按 stage 均摊;非 expert 拆成 BF16 部分与固定(FP8/F32)部分,各按自己的 dtype 行。
+  const perExpertParams = 3 * M.moeLatent * M.moeInter;
+  const expFlops   = 2 * perExpertParams * (M.moeLayers / S.pp) * stageTok * M.topk / C.stage;
+  const bf16P = MD.weights.nonExpertBf16Params, fixP = M.nonExpertParams - bf16P;
+  const neBf16Flops = 2 * bf16P / S.tp / S.pp * rankTok, neFixFlops = 2 * fixP / S.tp / S.pp * rankTok;
+  const expD = computeDtype(C.expFmt.id), neD = computeDtype(C.neFmt.bf16Bytes === 1 ? "fp8" : "bf16"), fixD = computeDtype("fp8");
+  const tComp = expFlops / (R[expD] * 1e12) + neBf16Flops / (R[neD] * 1e12) + neFixFlops / (R[fixD] * 1e12);
+
+  // (3) 通信:TP all-reduce(ring,每层 2 次)+ EP all-to-all(dispatch + combine),按字节 ÷ 链路带宽,不含延迟。
+  //     NVSwitch 带宽按双向合计;跨域按每卡的 EFA 线速份额;PCIe 机型没有带宽数据,不算。
+  const ACT = 2;
+  const nvl = sp.p2p.type === "nvswitch" ? sp.p2p.gbs * 1e9 : null;
+  const efa = sp.interDomainGbps * 1e9 / 8 / sp.gpusPerInstance;
+  const arTraffic  = S.tp > 1 ? (M.layers / S.pp) * 2 * 4 * (S.tp - 1) / S.tp * rankTok * M.hidden * ACT : 0;
+  const a2aTraffic = S.ep > 1 ? (M.moeLayers / S.pp) * 4 * stageTok * M.topk * M.moeLatent * ACT * (S.ep - 1) / S.ep / C.stage : 0;
+  const cross = S.ep > HW.domain ? (S.ep - HW.domain) / (S.ep - 1) : 0;   // 非本卡流量里跨域的份额(均匀)
+  const arLink = S.tp <= HW.domain ? nvl : (nvl ? efa : null);
+  const tAR  = arLink ? arTraffic / arLink : 0;
+  const tA2A = S.ep <= HW.domain ? (nvl ? a2aTraffic / nvl : 0)
+             : Math.max(nvl ? a2aTraffic * (1 - cross) / nvl : 0, a2aTraffic * cross / efa);
+  const commUnmodeled = !nvl && (S.tp > 1 || S.ep > 1);
+  const tComm = tAR + tA2A;
+
+  const step = Math.max(tMem, tComp, tComm);
+  const regime = step === tMem ? "mem" : step === tComp ? "comp" : "comm";
+  return { stageTok, rankTok, groupTok, coverage, neRead, expRead, kvRead, kvPerReq, stateRW, winRead, memBytes, tMem,
+           perExpertParams, expFlops, neBf16Flops, neFixFlops, expD, neD, fixD, tComp,
+           arTraffic, a2aTraffic, tAR, tA2A, tComm, arLink, cross, commUnmodeled,
+           step, regime, itl: step * S.pp, tokPerSec: stageTok / step, userTokPerSec: 1 / (step * S.pp) };
+}
+// 拐点:算力项追上 HBM 项的并发。f(B) = tComp − tMem 是凸的(coverage 是凹的),从负到正最多穿一次,二分即可。
+function roofRidge(C, ctx) {
+  const f = b => { const r = roofTerms(C, b, ctx, true); return r.tComp - r.tMem; };
+  const MAXB = CONC_STEPS[CONC_STEPS.length - 1];
+  if (f(1) >= 0) return { kind: "always" };
+  if (f(MAXB) < 0) return { kind: "never", max: MAXB };
+  let lo = 1, hi = MAXB;
+  for (let i = 0; i < 48; i++) { const mid = (lo + hi) / 2; if (f(mid) >= 0) hi = mid; else lo = mid; }
+  return { kind: "at", at: hi };
+}
+// 临界上下文:KV / state 读取追上权重读取的上下文长度(当前并发下)。kvRead 对 ctx 单调不减,二分。
+function roofKvCross(C, conc) {
+  const f = L => { const r = roofTerms(C, conc, L, false); return r.kvRead - (r.neRead + r.expRead); };
+  const MAXL = 1 << 24;
+  if (f(1) >= 0) return { kind: "always" };
+  if (f(MAXL) < 0) return { kind: "never", max: MAXL };
+  let lo = 1, hi = MAXL;
+  for (let i = 0; i < 48; i++) { const mid = (lo + hi) / 2; if (f(mid) >= 0) hi = mid; else lo = mid; }
+  return { kind: "at", at: Math.round(hi) };
+}
+
+const REGIME_LABEL = { mem: "HBM 带宽受限", comp: "算力受限", comm: "通信受限" };
+const fms = t => { const v = t * 1000; return v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toFixed(3); };
+const fsig = (v, d = 3) => v >= 1000 ? fint(Math.round(v)) : Number(v.toPrecision(d)).toString();
+// 任意 token 数的短写(临界上下文不是 2 的幂,fctx 会吐出 3.56640625M 这种东西)
+const ftokc = n => n >= 1048576 ? (n / 1048576).toFixed(1) + "M" : n >= 1024 ? Math.round(n / 1024) + "K" : String(n);
+
+// 结论句按数据生成:regime + 哪个分项占大头 + 它意味着什么。措辞是「这个数取决于什么」,不是「你应该」——
+// 校验器不是求解器(ADR-0005),这里只说清当前配置的瓶颈在哪条线上。
+function roofVerdict(C, R, ridge) {
+  const sp = HW.spec, hbm = sp.hbmGBs * 1e9;
+  const pct = t => `${(t / R.step * 100).toFixed(0)}%`;
+  const MAXB = CONC_STEPS[CONC_STEPS.length - 1];
+  const ridgeTxt = ridge.kind === "at"
+    ? (R.regime === "comp" ? `低于约 ${fint(Math.round(ridge.at))} 路会回到 HBM 带宽受限。` : `到约 ${fint(Math.round(ridge.at))} 路转成算力受限。`)
+    : ridge.kind === "never" ? `${fint(MAXB)} 路内不会转成算力受限。` : "";
+  if (R.regime === "mem") {
+    const parts = [["权重读取", R.neRead + R.expRead],
+                   ["KV 读取", R.rankTok * R.kvPerReq / S.pp],
+                   ["recurrent state 读写", R.rankTok * R.stateRW / S.tp / S.pp],
+                   ["滑窗 buffer 读取", R.rankTok * R.winRead / S.pp]];
+    const [name, v] = parts.reduce((a, b) => (b[1] > a[1] ? b : a));
+    // 权重占大头时,加并发的代价取决于拐点在不在范围内:在,就是「到拐点前几乎免费」;
+    // 不在,说明 KV/state 每 token 的读取斜率比算力还大 —— ITL 会涨,但涨的不是算力
+    const how = name === "权重读取" ? (ridge.kind === "at" ? "拐点之前加并发几乎不加 ITL;" : "加并发时 ITL 的增量来自 KV/state 读取,不是算力;")
+              : name === "KV 读取" ? "并发和上下文都直接推高 ITL;"
+              : "并发直接推高 ITL,与上下文无关;";
+    return `<b>HBM 带宽受限。</b>瓶颈是${/^[A-Za-z]/.test(name) ? " " : ""}${name}(占 step ${pct(v / hbm)}),${how}${ridgeTxt}`
+         + ` 换机器动得了这个数的是 HBM 带宽,不是 TFLOPS。`;
+  }
+  if (R.regime === "comp")
+    return `<b>算力受限。</b>ITL 随并发线性涨(算力占 step ${pct(R.tComp)});${ridgeTxt}`
+         + ` 换机器动得了这个数的是 dense TFLOPS,不是 HBM 带宽。`;
+  const ar = R.tAR >= R.tA2A, xdom = ar ? S.tp > HW.domain : S.ep > HW.domain;
+  return `<b>通信受限。</b>瓶颈是 ${ar ? "TP all-reduce" : "EP all-to-all"}(占 step ${pct(R.tComm)}${xdom ? ",且走了 EFA 跨域" : ""});`
+       + `动得了这个数的是${ar ? " TP 度数" : " EP 是否出 NVLink 域"},不是 HBM 也不是 TFLOPS。`;
+}
+
+function renderRoof(C) {
+  const R = roofTerms(C, C.conc, C.ctx), sp = HW.spec, T = sp.denseTflops, hbm = sp.hbmGBs * 1e9;
+  const ridge = roofRidge(C, C.ctx), cross = roofKvCross(C, C.conc);
+  const pct = t => R.step > 0 ? `${(t / R.step * 100).toFixed(0)}%` : "—";
+  const dt = d => d.toUpperCase();
+  const cls = k => R.regime === k ? "xnode" : "";
+
+  document.getElementById("roofhead").textContent = `decode 每步耗时下界 · roofline(${sp.gpu} spec 峰值,未校准)`;
+  document.getElementById("roofverdict").innerHTML = roofVerdict(C, R, ridge);
+
+  const ridgeV = ridge.kind === "at" ? `${fint(Math.round(ridge.at))}<span class="tu">路</span>` : ridge.kind === "never" ? `范围内无` : `&lt; 1 路`;
+  const crossV = cross.kind === "at" ? ftokc(cross.at) : cross.kind === "never" ? `范围内无` : `&lt; 1 token`;
+  document.getElementById("roofsum").innerHTML = `
+    <div class="rs"><div class="tl">每 micro-step</div><div class="tv">≥ ${fms(R.step)}<span class="tu">ms</span></div><div class="td">最忙的一张卡,${fint(R.rankTok)} 个 token</div></div>
+    <div class="rs"><div class="tl">ITL</div><div class="tv">≥ ${fms(R.itl)}<span class="tu">ms</span></div><div class="td">${S.pp > 1 ? `${S.pp} 段流水 × step · ` : ""}单用户 ≤ ${fsig(R.userTokPerSec)} tok/s</div></div>
+    <div class="rs"><div class="tl">集群吞吐</div><div class="tv">≤ ${fint(Math.round(R.tokPerSec))}<span class="tu">tok/s</span></div><div class="td">${fint(C.conc)} 路 × 1 token/step</div></div>
+    <div class="rs"><div class="tl">拐点(转算力受限)</div><div class="tv">${ridgeV}</div><div class="td">${fctx(C.ctx)} 上下文下</div></div>
+    <div class="rs"><div class="tl">临界上下文(KV 压过权重)</div><div class="tv">${crossV}</div><div class="td">${fint(C.conc)} 路下</div></div>`;
+  document.getElementById("roofwarn").innerHTML =
+    `<b>下界,不是预测。</b>不含每步固定开销与 attention FLOPs,低并发下实测慢 10 倍以上是正常的。`
+    + (R.commUnmodeled ? ` <b>${HW.id} 卡间只有 PCIe,没有带宽数据,通信按 0 计。</b>` : "");
+
+  const fb = b => b >= GIB ? `${fgib(b)} GiB` : `${(b / 1048576).toFixed(1)} MiB`;
+  const ppTxt = S.pp > 1 ? ` ÷ PP ${S.pp}` : "";
+  const efaGBs = sp.interDomainGbps / 8 / sp.gpusPerInstance;
+  const arLinkDesc = S.tp <= HW.domain ? `NVSwitch ${sp.p2p.gbs} GB/s` : `EFA 每卡份额 ${sp.interDomainGbps} Gbps ÷ 8 ÷ ${sp.gpusPerInstance} 卡 = ${efaGBs} GB/s`;
+  const a2aLinkDesc = S.ep <= HW.domain ? `NVSwitch ${sp.p2p.gbs} GB/s`
+                    : `${(R.cross * 100).toFixed(0)}% 出 NVLink 域走 EFA(每卡 ${efaGBs} GB/s),其余走 NVSwitch,两路并行取慢的`;
+  const unst = sp.tflopsSparsityUnstated ? ` <span class="pv pv-e" title="datasheet 没写 sparse 还是 dense,按原文照录;若实为 sparse,这一行松 2 倍">TFLOPS 未标注 sparse/dense</span>` : "";
+  const main = [], rows = [];
+  const grp = (title, total, t, k) => {
+    main.push(`<tr><td>${title}</td><td>${total}</td><td class="${cls(k)}">${fms(t)} ms</td><td>${pct(t)}</td></tr>`);
+    rows.push(`<tr class="grp"><td colspan="2">${title}</td><td>${total}</td><td class="${cls(k)}">${fms(t)} ms · ${pct(t)}</td></tr>`);
+  };
+  const row = (name, how, qty, t) =>
+    rows.push(`<tr><td class="sub">${name}</td><td class="how">${how}</td><td>${qty}</td><td>${t}</td></tr>`);
+
+  // (1) HBM
+  grp(`HBM 读取 <span class="pv pv-p">spec</span> ${fint(sp.hbmGBs)} GB/s`, fb(R.memBytes), R.tMem, "mem");
+  row("非 expert 权重,每步全读",
+    `这张卡持有 ${(C.nonExpertBytes / GIB).toFixed(1)} GiB ÷ TP ${S.tp}${ppTxt};${M.layers} 层过一遍,每层的矩阵都要从显存读一次`,
+    fb(R.neRead), fms(R.neRead / hbm));
+  const perExpB = C.expertBytesTotal / (M.expertWeightLayers * M.nExperts);
+  row("这一步命中的 routed expert",
+    `每层这张卡存 ${fint(C.expertsPerGpuPerLayer)} 个专家,${fint(R.stageTok)} 个 token 每个选 ${M.topk}/${fint(M.nExperts)},期望命中 <b>${fsig(C.expertsPerGpuPerLayer * R.coverage)}</b> 个`
+    + `(均匀路由,<span class="pv pv-e">估算</span>)× ${(perExpB / 1048576).toFixed(1)} MiB/专家 × ${M.moeLayers / S.pp} 层`,
+    fb(R.expRead), fms(R.expRead / hbm));
+  let stateDesc = [], stateBytes = 0, winDesc = [], winBytes = 0;
+  for (const g of MD.layers) {
+    const f = FAMILY[g.family];
+    if (f.decodeReadPerReq) {
+      const v = R.rankTok * g.count * f.decodeReadPerReq(g, C.ctx, C.kvDt.bytes) / S.pp;
+      row(`这 ${fint(R.rankTok)} 路请求的 ${g.family.toUpperCase()} KV`,
+        `${f.decodeReadDesc(g, C.ctx, C.kvDt.bytes)};× ${fint(R.rankTok)} 路${ppTxt}。latent 是所有 head 共享的,TP 内每卡读一份完整副本`
+        + (MD.kvDtypeFixed ? "" : `(KV dtype 当前按 ${C.kvDt.label},<span class="pv pv-e">估算</span>)`),
+        fb(v), fms(v / hbm));
+    }
+    const per = g.count * f.perReqBytes(g);
+    if (per > 0 && f.stateShardableByTp) { stateBytes += per; stateDesc.push(`${g.count} 层 × ${g.heads} head × ${g.headDim}² × ${g.stateDtypeBytes} B`); }
+    else if (per > 0) { winBytes += per;
+      const k = `${g.windowSlots} 槽 × ${g.windowElems} × ${g.windowBytesPerElem} B`, hit = winDesc.find(d => d.k === k);
+      if (hit) hit.n += g.count; else winDesc.push({ k, n: g.count }); }
+  }
+  winDesc = winDesc.map(d => `${d.n} 层 × ${d.k}`);
+  if (stateBytes) { const v = R.rankTok * 2 * stateBytes / S.tp / S.pp;
+    row("recurrent state,读一次写一次",
+      `${stateDesc.join(" + ")} = ${fb(stateBytes)}/路,与上下文无关;÷ TP ${S.tp}${ppTxt}(按 head 切)× 2(读 + 写)× ${fint(R.rankTok)} 路。dtype 按 FP32 <span class="pv pv-e">估算</span>`,
+      fb(v), fms(v / hbm)); }
+  if (winBytes) { const v = R.rankTok * winBytes / S.pp;
+    row("滑窗环形 buffer,整读",
+      `${winDesc.join(" + ")} = ${fb(winBytes)}/路,与上下文无关;TP 切不掉,× ${fint(R.rankTok)} 路${ppTxt}`,
+      fb(v), fms(v / hbm)); }
+
+  // (2) 算力
+  const gf = R.expFlops + R.neBf16Flops + R.neFixFlops;
+  grp(`算力:每个参数每 token 2 次浮点运算 <span class="pv pv-p">spec</span> dense TFLOPS${unst}`, `${fsig(gf / 1e9)} GFLOP`, R.tComp, "comp");
+  row("非 expert 矩阵乘",
+    `2 × ${ftok(M.nonExpertParams)} 参数 ÷ TP ${S.tp}${ppTxt} × ${fint(R.rankTok)} token;其中 BF16 的 ${ftok(MD.weights.nonExpertBf16Params)} ÷ ${dt(R.neD)} ${T[R.neD]} T,原生 FP8/F32 的 ÷ ${dt(R.fixD)} ${T[R.fixD]} T`,
+    `${fsig((R.neBf16Flops + R.neFixFlops) / 1e9)} GFLOP`, fms(R.neBf16Flops / (T[R.neD] * 1e12) + R.neFixFlops / (T[R.fixD] * 1e12)));
+  row("命中专家的矩阵乘",
+    `2 × ${ftok(R.perExpertParams)} 参数/专家 × top-${M.topk} × ${M.moeLayers / S.pp} 层 × ${fint(R.stageTok)} token ÷ ${C.stage} 卡(stage 内均摊)÷ ${dt(R.expD)} ${T[R.expD]} T`
+    + (R.expD !== (C.expFmt.id === "mxfp4" || C.expFmt.id === "nvfp4" ? "fp4" : C.expFmt.id) ? `(${sp.gpu} 无原生 ${C.expFmt.id.toUpperCase()},按 dequant 到 ${dt(R.expD)} 算)` : ""),
+    `${fsig(R.expFlops / 1e9)} GFLOP`, fms(R.expFlops / (T[R.expD] * 1e12)));
+
+  // (3) 通信
+  grp(`通信:字节 ÷ 链路带宽,不含延迟`, fb(R.arTraffic + R.a2aTraffic), R.tComm, "comm");
+  row("TP all-reduce",
+    S.tp > 1 ? `${M.layers / S.pp} 层 × 2 次 × ${fint(R.rankTok)} token × hidden ${fint(M.hidden)} × 2 B,ring 每卡收 + 发 = 4(TP−1)/TP 倍;÷ ${R.arLink ? arLinkDesc : "PCIe,无带宽数据,按 0 计"}`
+             : "TP = 1,没有 all-reduce",
+    fb(R.arTraffic), fms(R.tAR));
+  row("EP all-to-all",
+    S.ep > 1 ? `${M.moeLayers / S.pp} 层 × 2 次(dispatch + combine)× ${fint(R.stageTok)} token × top-${M.topk} × latent ${fint(M.moeLatent)} × 2 B × ${((S.ep - 1) / S.ep * 100).toFixed(0)}% 出卡 ÷ ${C.stage} 卡,收 + 发 × 2;÷ ${sp.p2p.type === "nvswitch" ? a2aLinkDesc : "PCIe,无带宽数据,按 0 计"}(均匀路由、BF16,<span class="pv pv-e">估算</span>)`
+             : "EP = 1,没有 all-to-all",
+    fb(R.a2aTraffic), fms(R.tA2A));
+
+  document.getElementById("rooftbl").innerHTML = `
+    <table>
+      <thead><tr><th>三条线(最忙的一张卡,每 micro-step)</th><th>量</th><th>时间</th><th>占 step</th></tr></thead>
+      <tbody>${main.join("")}</tbody>
+    </table>
+    <details><summary>怎么算 ▸ 每个数字的算式(点开)</summary>
+    <table>
+      <thead><tr><th>项</th><th class="how">怎么算</th><th>量</th><th>时间 ms</th></tr></thead>
+      <tbody>${rows.join("")}</tbody>
+    </table></details>`;
+
+  // 口径与假设 → 并入页底的「计算口径与假设」折叠区,不占面板
+  return `
+    <li><b>roofline(decode 每步耗时下界,ADR-0010)</b>:<code>step ≥ max(HBM 读取 ÷ 带宽, FLOPs ÷ dense 算力, 通信字节 ÷ 链路)</code>,三条线取 spec 峰值、假设完美重叠;ITL = PP × step,吞吐 = ⌈并发 ÷ PP⌉ ÷ step。
+      <ul>
+        <li><b>三条线的来源</b>:HBM <code>${fint(sp.hbmGBs)} GB/s</code>、dense 算力 <code>BF16 ${T.bf16} / FP8 ${T.fp8 || "—"} / FP4 ${T.fp4 || "—"} TFLOPS</code>,厂商 datasheet 的 dense 行(不是 sparsity 行)${sp.tflopsSparsityUnstated ? ";<b>但 ${sp.gpu} 的 datasheet 没写 sparse 还是 dense,按原文照录,若实为 sparse 则算力一行松 2 倍</b>" : ""},出处在 <code>data/instances.js</code> 注释里。NVSwitch 按双向合计,EFA 按 <code>${sp.interDomainGbps} Gbps ÷ ${sp.gpusPerInstance} 卡</code> 的线速份额。带宽 / 算力是十进制,字节显示 GiB,时间 = 字节 ÷ (GB/s × 10⁹)。</li>
+        <li><b>并发 = 这一步的 token 数</b>(每请求 1 token,不含 MTP / 投机解码);<b>上下文 = 每请求当前长度</b>(显存那边读作最大长度,同一个滑块)。${S.pp > 1 ? `PP=${S.pp}:按 ${S.pp} 个 micro-batch 填满流水,每段 step 用 ⌈并发 ÷ PP⌉ 个 token,不含 send/recv 与气泡。` : ""}</li>
+        <li><b>expert 读取按均匀路由的期望</b>:一个专家至少被一个 token 命中的概率 = <code>1 − (1 − ${M.topk}/${fint(M.nExperts)})^${fint(Math.ceil(R.groupTok))}</code> = ${(R.coverage * 100).toFixed(1)}%。真实路由有热点,读得更少,这一项作为下界偏松。recurrent state 每步读 + 写各一次(FP32),滑窗环只读。</li>
+        <li><b>算力那一行按权重格式选 dtype</b>(有原生就用原生;MXFP4 / NVFP4 无原生 → FP8,没有 FP8 → BF16),假设激活同精度。参数量含 embedding 与 vision 塔,高估不到 3%。</li>
+        <li><b>没算的</b>:attention 本身的 FLOPs(full attention 层在 128K 以上与矩阵乘同量级,算力行在长上下文下偏松);kernel launch / 调度 / 集合通信延迟;PP 的 send/recv 与气泡;${M.tpShardedBytes ? `${MD.tpShardedShort || "查表"}的读取(每 token 查几十行,KB 量级);` : ""}prefill 与 TTFT;chunked prefill 混进 decode step;效率系数 —— 实测 ÷ 下界要在目标机型上测一次才有,本页不猜。</li>
+      </ul></li>`;
 }
 
 // ---------------- tooltip(hover 层,默认就有;键盘 focus 等价) ----------------

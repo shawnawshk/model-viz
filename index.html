@@ -91,9 +91,9 @@
   </p>
 
   <div class="scope">
-    <b>这套工具只算显存。</b>
+    <b>这套工具算显存,外加 decode 的 roofline 下界。</b>
     <ul>
-      <li>不回答吞吐、延迟、TTFT/ITL —— 「装得下」不等于「跑得快」。</li>
+      <li>吞吐与延迟只给<b>理论下界</b>,不是预测:按 spec 峰值算,不含每步固定开销、attention FLOPs、通信延迟,不算 prefill / TTFT。低并发下实测慢一个量级以上是正常的。</li>
       <li>不回答价格与可得性,因此<b>不能</b>用于判断「哪个机型更值」。</li>
       <li>是<b>校验器不是求解器</b>:你给配置,它判定;它不会替你搜索最优解。</li>
       <li>结果含一个纯猜测的 overhead 常量,<b>不可作为容量规划或采购承诺</b>。</li>
@@ -115,7 +115,7 @@
       <!-- 指向 GitHub 而不是本地 docs/*.md:Pages 上 .md 会被浏览器当附件下载,GitHub 帮我们渲染。 -->
       <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/glossary.md">glossary.md</a> — 领域词汇:NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、单位口径</li>
       <li><a href="https://github.com/shawnawshk/model-viz/blob/main/docs/instance-specs.md">instance-specs.md</a> — G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)</li>
-      <li><a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr">adr/0001–0009</a> — 已锁定的设计决策</li>
+      <li><a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr">adr/0001–0010</a> — 已锁定的设计决策(0010:decode roofline 下界,部分取代 0003 的「只算显存」)</li>
     </ul>
   </div>
 
@@ -159,11 +159,14 @@ const rows = Object.entries(REG.instances).map(([id, s]) => {
     <td${nvl ? "" : ' class="no"'}>${nvl ? s.p2p.gbs + " GB/s" : "PCIe"}</td>
     <td>${s.interDomainGbps} ${s.efaGen}</td>
     <td${s.nativeDtypes.includes("mxfp4") ? "" : ' class="no"'}>${s.nativeDtypes.includes("mxfp4") ? "✓" : "✗"}</td>
+    <td>${s.hbmGBs ? s.hbmGBs.toLocaleString("en-US") : "—"}</td>
+    <td>${s.denseTflops ? [s.denseTflops.bf16, s.denseTflops.fp8, s.denseTflops.fp4].map(v => v || "—").join(" / ") : "—"}</td>
   </tr>`;
 }).join("");
 document.getElementById("insts").innerHTML =
   `<thead><tr><th>实例</th><th>GPU</th><th>卡</th><th>GiB/卡</th><th>GiB/实例</th>
-   <th>NVLink 域</th><th>域内 P2P</th><th>跨域</th><th>原生 FP4</th></tr></thead><tbody>${rows}</tbody>`;
+   <th>NVLink 域</th><th>域内 P2P</th><th>跨域</th><th>原生 FP4</th>
+   <th title="厂商 datasheet,十进制 GB/s">HBM GB/s</th><th title="dense(非 sparsity)张量核算力,BF16 / FP8 / FP4">dense TFLOPS</th></tr></thead><tbody>${rows}</tbody>`;
 
 // 主题:?theme= > localStorage(与 app.html 共用同一个键,跳转不丢) > 系统偏好
 const qsTheme = new URLSearchParams(location.search).get("theme");
@@ -175,7 +178,7 @@ document.documentElement.dataset.theme =
 
 document.getElementById("foot").textContent =
   `${Object.keys(REG.models).length} 个模型 · ${Object.keys(REG.instances).length} 个机型 · `
-  + `显存真值取 describe-instance-types 的 MiB,界面一律 GiB`;
+  + `显存真值取 describe-instance-types 的 MiB,界面一律 GiB · 带宽 / 算力取厂商 datasheet 的 dense 行,十进制`;
 </script>
 </body>
 </html>

@@ -1,6 +1,6 @@
 # ADR-0005：保持校验器语义；instance 列表 per-model；dtype 不匹配提示
 
-- 状态：**Accepted**
+- 状态：**Accepted**；§4 里「不算 FLOPS、不算吞吐、不算延迟」于 2026-09-15 被 [ADR-0010](0010-decode-roofline-lower-bound.md) 取代，其余各条（校验器语义、per-model 候选、dtype 提示）不变
 - 日期：2026-08-31
 
 ## 1. 校验器，不是求解器

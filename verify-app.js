@@ -6,6 +6,8 @@
 //
 // index.html 的渲染检查见 runIndex():它没有用例表,只断言两个 innerHTML 非空、
 // 机型表 th/td 列数自洽、卡片数与挂载的模型数一致。
+//
+// roofline(ADR-0010)的用例见 CASES 里的 roof 字段:期望值来自独立手算,不是引擎回填。
 const fs = require("fs"), path = require("path");
 const ROOT = process.argv[2] || __dirname;
 
@@ -26,23 +28,36 @@ if (idxSrcs.join(",") !== srcs.join(","))
 // 默认口径 util 0.90、ctxIdx 7(128K)、并发滑块在 1 路;用例可用 util / ctxIdx 覆盖。
 // expectPresets:预设按钮第三行现算出来的路数(BF16 KV)。它必须随 util / ctxIdx 变 ——
 // 最后两条用例就是同一个模型的两个口径,用来证明这一点,别把它们合并掉。
+//
+// roof(ADR-0010):decode roofline 的期望值。conc 是探针用的并发(没有 expectLoad 时才生效);
+// stepMs 取 3 位有效数字;ridge / kvCross 是 "never" / "always" 或一个数(±1%)。
+// 期望值全部由独立于引擎的手算脚本按 ADR-0010 §2 的式子算出(输入抄自 data/ 与 datasheet),
+// 再与引擎对账 —— 不是先跑引擎再抄回来。
 const CASES = [
   { model: "kimi-k3", label: "推荐 4×p5en TP8/DP4/EP32",
     state: { instId: "p5en.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32, neFmt: "bf16", expFmt: "mxfp4" },
     expect: { bf16: [27648, 68], fp8: [13824, 136] },
     // 第 3 个(推荐)的 68 与第 6 个(b200 四台)的 108 与 ADR-0007 / 数据文件注释里
     // 独立记下的数一致;第 4 个(反例 纯 DP32)本来就该是 0 —— 单卡 160.6 GiB 超 126.9 预算
-    expectPresets: [20, 81, 68, 0, 76, 108] },
+    expectPresets: [20, 81, 68, 0, 76, 108],
+    // 64 路 × 128K:每步读 97.7 GiB(MLA 全量 KV 59.7 GiB 是大头)→ 21.9 ms,HBM 受限;
+    // 权重读取与 KV 读取相等的临界上下文约 98K。4096 路内到不了算力受限。
+    roof: { conc: 64, stepMs: "21.9", regime: "mem", ridge: "never", kvCross: 98332 } },
   { model: "glm-5.3-flash", label: "1×p5en TP8/DP1/EP8(KV ×8)",
     state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
     expect: { bf16: [11616, 53], fp8: [5984, 102] },
     expectPresets: [53, 320, 188, 364, 832, 912] },
   { model: "glm-5.3-flash", label: "1×p5en TP1/DP8/EP8(KV ×1)",
     state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 320], fp8: [5984, 584] } },
+    expect: { bf16: [11616, 320], fp8: [5984, 584] },
+    // 1 路:整读非 expert 15.5 GiB + 命中 1 个专家/层 + 一路的 KDA state 读写 → 3.75 ms。
+    // KDA state 每 token 读写 285 MB(FP32,34 层)随并发线性涨,斜率比算力项大,所以永远到不了拐点。
+    roof: { conc: 1, stepMs: "3.75", regime: "mem", ridge: "never", kvCross: "never" } },
   { model: "glm-5.3-flash", label: "PP2 1×p5en TP1/DP4/PP2/EP4",
     state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 4, pp: 2, ep: 4, neFmt: "native", expFmt: "fp8" },
-    expect: { bf16: [11616, 364], fp8: [5984, 656] } },
+    expect: { bf16: [11616, 364], fp8: [5984, 656] },
+    // PP 路径:16 路 → 每段 micro-batch 8 个 token、最忙 rank 2 个;ITL = 2 × step。
+    roof: { conc: 16, stepMs: "3.40", regime: "mem", ridge: "never", kvCross: "never" } },
   { model: "glm-5.3-flash", label: "两台 2×p5en TP1/DP16/EP16",
     state: { instId: "p5en.48xlarge", n: 2, tp: 1, dp: 16, pp: 1, ep: 16, neFmt: "native", expFmt: "fp8" },
     expect: { bf16: [11616, 832], fp8: [5984, 1504] } },
@@ -78,7 +93,9 @@ const CASES = [
     expect: { bf16: [890, 488], fp8: [890, 488] }, kvFixed: true,
     // 第 3、4 个预设(TP2/DP4 与 TP1×DP8)在 p5en 上是 0 —— engram 只能按 TP 切,
     // TP<4 时单卡就背不动它。这两个 0 是本模型最该被钉住的东西,别当成写错了删掉。
-    expectPresets: [488, 538, 0, 0, 3364, 1680] },
+    expectPresets: [488, 538, 0, 0, 3364, 1680],
+    // CSA2 的 decode 读取走 indexer 全扫 + top-512 latent,不是全量 KV:32 路 × 128K 一共只读 15.5 GiB。
+    roof: { conc: 32, stepMs: "3.46", regime: "mem", ridge: "never", kvCross: 2850132 } },
   // p5en 上 TP4/DP2 反超官方的 TP8/DP1:engram ÷4 比 ÷8 贵,但 KV 少复制一半。
   { model: "deepseek-v4.1-flash", label: "1×p5en TP4/DP2/EP8(engram ÷4)",
     state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
@@ -89,7 +106,15 @@ const CASES = [
   { model: "deepseek-v4.1-flash", label: "1K 上下文:滑窗环 buffer 是主导项", ctxIdx: 0,
     state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
     expect: { bf16: [890, 9682], fp8: [890, 9682] }, kvFixed: true,
-    expectPresets: [9682, 10658, 0, 0, 66640, 33340] },
+    expectPresets: [9682, 10658, 0, 0, 66640, 33340],
+    roof: { conc: 256, stepMs: "8.00", regime: "mem", ridge: "never", kvCross: 812625 } },
+  // roofline 专用(ADR-0010):三个模型在 p5en / b300 上的所有常规切分,4096 路之内都到不了算力受限 ——
+  // 扫描下来只有这一个配置的拐点落在滑块范围内(约 4,022 路),所以用它钉住「算力受限」regime 与拐点二分。
+  // 显存上它装不下(engram ÷2 = 94.6 GiB),roofline 不管装不装得下,两个结论并排出现是刻意的。
+  { model: "deepseek-v4.1-flash", label: "roofline:TP2/DP4/EP8 · 1K · 4096 路 → 算力受限", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 0], fp8: [890, 0] }, kvFixed: true,
+    roof: { conc: 4096, stepMs: "10.1", regime: "comp", ridge: 4022, kvCross: 205264 } },
   // PP>1(每个模型必须有一条)。这里同时钉住 ADR-0009 §8:engram 不按 PP 切,
   // 所以 lookup 在 PP=2 下与 PP=1 相同(都是 189.13 ÷ TP 4 = 47.28 GiB)。
   { model: "deepseek-v4.1-flash", label: "PP2 1×p5en TP4/DP1/PP2/EP4",
@@ -106,9 +131,10 @@ const CASES = [
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
                   "commhead", "commtbl", "tbl", "assumplist", "presets", "eq",
-                  "expFmtLab", "precLab", "kvDtLab"];
+                  "expFmtLab", "precLab", "kvDtLab",
+                  "roofhead", "roofverdict", "roofsum", "roofwarn", "rooftbl"];   // ADR-0010
 // 这几个容器里出现 undefined / NaN 就是有字段没接上 —— 页面上看起来只是少了个数字
-const CLEAN = ["tiles", "tbl", "commtbl", "assumplist", "banners"];
+const CLEAN = ["tiles", "tbl", "commtbl", "assumplist", "banners", "roofverdict", "roofsum", "rooftbl"];
 
 // ---- DOM stub ----
 const mkEl = id => ({
@@ -136,7 +162,7 @@ function run(c) {
   const PROBE = `
 globalThis.__probe = [];
 for (const kv of ["bf16", "fp8"]) {
-  Object.assign(S, ${JSON.stringify(c.state)}, { concIdx: ${c.expectLoad ? `CONC_STEPS.indexOf(${c.expectLoad.conc})` : "0"}, ctxIdx: ${c.ctxIdx ?? 7}, util: ${c.util ?? 90}, kvDt: kv });
+  Object.assign(S, ${JSON.stringify(c.state)}, { concIdx: ${c.expectLoad ? `CONC_STEPS.indexOf(${c.expectLoad.conc})` : c.roof ? `CONC_STEPS.indexOf(${c.roof.conc})` : "0"}, ctxIdx: ${c.ctxIdx ?? 7}, util: ${c.util ?? 90}, kvDt: kv });
   syncOptions("probe");
   const C = compute();
   const gpuTotal = Array.from({ length: C.W }, (_, g) => gpuMemory(C, ranks(g)).used)
@@ -152,6 +178,11 @@ for (const kv of ["bf16", "fp8"]) {
   render();
   globalThis.__probe[globalThis.__probe.length - 1].commHtml =
     document.getElementById("commtbl").innerHTML;
+  // roofline(ADR-0010):最忙那张卡的每步下界、regime、拐点、临界上下文
+  { const R = roofTerms(C, C.conc, C.ctx), rg = roofRidge(C, C.ctx), kc = roofKvCross(C, C.conc);
+    globalThis.__probe[globalThis.__probe.length - 1].roof =
+      { stepMs: R.step * 1e3, regime: R.regime, memGiB: R.memBytes / GIB,
+        ridge: rg.kind === "at" ? rg.at : rg.kind, kvCross: kc.kind === "at" ? kc.at : kc.kind }; }
 }
 globalThis.__packExamples = [1, 8, 9].map(n => distributeRequests(n, 8));
 // 预设按钮第三行的路数走 presetCompute(),必须跟当前口径(util / ctxIdx / kvDt)一起变。
@@ -215,6 +246,22 @@ markPreset();
   // 预设按钮上的路数(BF16 KV,该用例的 util / ctxIdx 口径下)
   if (c.expectPresets && String(globalThis.__presets) !== String(c.expectPresets))
     fail.push(`预设路数应为 [${c.expectPresets}],实为 [${globalThis.__presets}]`);
+
+  // roofline(ADR-0010)。每个用例都要:step 有限且 > 0、regime 合法 —— 这两条抓的是 NaN 与字段没接上。
+  for (const p of [b, f]) {
+    if (!(p.roof.stepMs > 0 && Number.isFinite(p.roof.stepMs))) fail.push(`${p.kv}:roofline step 不是正数:${p.roof.stepMs}`);
+    if (!["mem", "comp", "comm"].includes(p.roof.regime)) fail.push(`${p.kv}:roofline regime 非法:${p.roof.regime}`);
+  }
+  // 有手算期望的用例:3 位有效数字对账;拐点 / 临界上下文允许 ±1%(两边都是二分,收敛点会差最后一位)
+  if (c.roof) {
+    const r = b.roof, near = (got, want) => typeof want === "string" ? got === want
+      : (typeof got === "number" && Math.abs(got - want) <= Math.max(1, 0.01 * want));
+    if (Number(r.stepMs).toPrecision(3) !== c.roof.stepMs)
+      fail.push(`roofline step 应为 ${c.roof.stepMs} ms,实为 ${Number(r.stepMs).toPrecision(3)} ms`);
+    if (r.regime !== c.roof.regime) fail.push(`roofline regime 应为 ${c.roof.regime},实为 ${r.regime}`);
+    if (!near(r.ridge, c.roof.ridge)) fail.push(`拐点应为 ${c.roof.ridge},实为 ${typeof r.ridge === "number" ? r.ridge.toFixed(1) : r.ridge}`);
+    if (!near(r.kvCross, c.roof.kvCross)) fail.push(`临界上下文应为 ${c.roof.kvCross},实为 ${r.kvCross}`);
+  }
 
   return { fail, probe: globalThis.__probe, presets: globalThis.__presets };
 }
@@ -281,7 +328,8 @@ for (const c of CASES) {
   } else {
     console.log(`✓ ${tag} — BF16 ${probe[0].maxConc} 路 / FP8 ${probe[1].maxConc} 路,`
       + `${probe[0].bytesPerToken} / ${probe[1].bytesPerToken} B/token,反事实对称`
-      + (c.expectPresets ? `,预设 [${presets}]` : ""));
+      + (c.expectPresets ? `,预设 [${presets}]` : "")
+      + (c.roof ? ` · roofline ${Number(probe[0].roof.stepMs).toPrecision(3)} ms ${probe[0].roof.regime}` : ""));
   }
 }
 // 放在用例之后:runIndex 会重建 global.document,此时已经没人用了

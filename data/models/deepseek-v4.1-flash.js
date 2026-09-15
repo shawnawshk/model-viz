@@ -30,12 +30,12 @@ REG.models["deepseek-v4.1-flash"] = {
   // indexer key 128 维 FP4,每 32 元素一个 E8M0 scale → 128×0.5 + 4 = 68 B
   // 合计每 latent 356 B × 2.5 = 890 B/token,与 model card 的头号数字精确吻合。
   layers: [
-    { count: 3, family: "csa2", compressRatio: 2,
+    { count: 3, family: "csa2", compressRatio: 2, indexTopk: 512,   // index_topk;只影响 decode 读取量(ADR-0010)
       latentElems: 512, latentBytesPerElem: 0.5, latentScaleBytes: 32,
       indexerElems: 128, indexerBytesPerElem: 0.5, indexerScaleBytes: 4,
       windowSlots: 128, windowElems: 512, windowBytesPerElem: 2,
       note: "encoder 里的 3 个 KV source。ratio 2 = 两个 token 由一个学习到的 softmax gate 池化成一个 latent。" },
-    { count: 1, family: "csa2", compressRatio: 1,
+    { count: 1, family: "csa2", compressRatio: 1, indexTopk: 512,
       latentElems: 512, latentBytesPerElem: 0.5, latentScaleBytes: 32,
       indexerElems: 128, indexerBytesPerElem: 0.5, indexerScaleBytes: 4,
       windowSlots: 128, windowElems: 512, windowBytesPerElem: 2,

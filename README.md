@@ -1,14 +1,14 @@
 # model-viz
 
-**LLM 并行切分与显存分布可视化。** 给定模型、机型、台数和 `TP/DP/PP/EP`,算出每张卡的显存构成、装不装得下、能收多少并发。
+**LLM 并行切分与显存分布可视化。** 给定模型、机型、台数和 `TP/DP/PP/EP`,算出每张卡的显存构成、装不装得下、能收多少并发;再按同一组输入给出 decode 每步耗时的 **roofline 下界**(HBM 带宽 / 算力 / 通信三条线)、拐点并发与临界上下文。
 
 零构建、零依赖、无需服务器 —— 克隆下来**双击 `index.html`** 就能用,整个目录打包发给别人也一样能开。
 
 ## 范围(先读这个)
 
-**这套工具只算显存。**
+**这套工具算显存,外加 decode 的 roofline 下界。**
 
-- 不回答吞吐、延迟、TTFT/ITL —— 「装得下」不等于「跑得快」。
+- 吞吐与延迟只给**理论下界**,不是预测(ADR-0010)。按厂商 spec 峰值算,没有效率系数,不含每步固定开销、attention 本身的 FLOPs、通信延迟;不算 prefill / TTFT。低并发下实测比下界慢一个量级以上是正常的。它的用途是**定方向**:当前配置在哪个 regime、加并发 / 换机器动的是哪条线、benchmark 该在哪几个并发点采样 —— 不是替代 benchmark。
 - 不回答价格与可得性,因此**不能**用于判断「哪个机型更值」。
 - 是**校验器不是求解器**:你给配置,它判定;它不会替你搜索最优解。
 - 头号数字(最大并发)建立在若干软数字上 —— 每卡 12 GiB 的「激活 + 通信 buffer」是**猜测**(±12 GiB 使并发变动约 20%),KV cache 的 dtype 是**假设**(BF16↔FP8 使并发变动约 100%);GLM-5.3-Flash 还多一项 DSA indexer key cache 的池化与 dtype(±10%);DeepSeek-V4.1-Flash 的 KV dtype 由架构固定、不再是假设,但它多出**至今最大的一项** —— 189 GiB 的 engram 是否整张常驻 HBM(约 40%,且短期内**无法**用实测消除,还没有生产引擎支持这个结构)。**不可作为容量规划或采购承诺。** 每个页面顶部都会按当前模型逐项列出,并明说清单不保证已穷举。
@@ -19,7 +19,7 @@
 |---|---|
 | `index.html` | 入口:模型索引 + 机型目录 |
 | `app.html?model=<id>` | 唯一引擎,所有公式只有一份实现 |
-| `data/instances.js` | 机型规格:显存、NVLink 域、跨域带宽、原生 dtype |
+| `data/instances.js` | 机型规格:显存、NVLink 域、跨域带宽、原生 dtype、HBM 带宽、dense TFLOPS(后两项附 datasheet 出处) |
 | `data/models/<id>.js` | 模型定义:层结构、MoE、权重、候选机型 |
 | `verify-app.js` | `node verify-app.js` —— 改完 `app.html` 必须跑 |
 | `docs/` | 领域词汇、实例规格总目录、ADR |
@@ -34,7 +34,7 @@
 
 - [`docs/glossary.md`](docs/glossary.md) — 领域词汇。NVLink 域 ≠ 实例、推理 DP ≠ 训练 DP、KV 复制因子按 attention family 而异、provenance 五级
 - [`docs/instance-specs.md`](docs/instance-specs.md) — G5–G7 / P4d–P6 共 57 个实例的规格总目录,以 `describe-instance-types` 的 MiB 为真值
-- [`docs/adr/`](docs/adr/) — ADR-0001 至 0009:TP 上限由 NVLink 域决定(不是「节点」)、只算显存、单位一律 GiB、KV cache 的 dtype 是引擎参数而非模型属性(ADR-0009 承认有例外)、权重按三桶实测字节记账(第三桶按 TP 切、不按 PP 切)
+- [`docs/adr/`](docs/adr/) — ADR-0001 至 0010:TP 上限由 NVLink 域决定(不是「节点」)、单位一律 GiB、KV cache 的 dtype 是引擎参数而非模型属性(ADR-0009 承认有例外)、权重按三桶实测字节记账(第三桶按 TP 切、不按 PP 切)、decode roofline 下界与稀疏 attention 的读取口径(ADR-0010,部分取代 ADR-0003 的「只算显存」)
 
 ## 当前收录
 

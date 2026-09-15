@@ -105,14 +105,37 @@ DSA 这类稀疏注意力的 `index_topk` 决定的是每个 query 去**看**多
 ### util 预算（gpu_memory_utilization）
 引擎允许动用的显存 = 物理显存 × util。权重 + overhead + KV + state 必须全部挤进这个预算，预算外的物理显存引擎不会碰。vLLM 默认 0.90。`util = 1.00` 是理论上界，不是可规划值。
 
+## roofline(decode 每步耗时下界)
+
+### 三条线
+一个 decode step 至少要花的时间是三项里最大的那个：**HBM 读取字节 ÷ HBM 带宽**、**矩阵乘 FLOPs ÷ dense 算力**、**通信字节 ÷ 链路带宽**。三条线都取厂商 spec 峰值，所以算出来的是**下界**，实测只会更慢。取 `max` 假设三者完美重叠。详见 [[adr-0010]]。
+
+### 下界 ≠ 预测
+下界不含每步固定开销（kernel launch、调度、集合通信的延迟项）、不含 attention 本身的 FLOPs、没有效率系数。低并发下实测比下界慢一个量级以上是正常的；拐点附近差距最大。把它读成「能跑到」是这套工具最容易被误读的第二件事（第一件是「稀疏省显存」）。
+
+### micro-step
+PP > 1 时一个 stage 处理一个 micro-batch 所花的时间。ITL = PP × micro-step（token 要走完所有 stage），吞吐 = 每 micro-step 完成一个 micro-batch。PP = 1 时 micro-step 就是 step。
+
+### regime
+当前配置下三条线里哪条是 max：HBM 带宽受限 / 算力受限 / 通信受限。它决定「换机器换的是什么」——带宽受限区比 HBM 带宽，算力受限区比 TFLOPS，spec 表上的总数在另一个 regime 里没用。
+
+### 拐点(B\*)
+算力项追上 HBM 项的并发。左侧加并发几乎不加 ITL（在等搬权重），右侧 ITL 随并发线性涨。它随上下文长度移动：上下文越长，KV 读取越重，拐点越往右，直到在页面范围内不再出现。
+
+### 临界上下文(L\*)
+KV / state 读取追上权重读取的上下文长度（当前并发下）。短于它 ITL 基本不随上下文变，长于它线性涨。稀疏 / 线性 / 滑窗 attention 让这个点大幅右移甚至不出现——**这才是稀疏省下的东西**：读带宽，不是显存。
+
+### 并发与上下文在 roofline 里的读法
+同一个滑块，两种口径：显存侧把并发读作「同时在飞的请求数」、上下文读作「容量规划的最大长度」；roofline 把并发读作「这一步的 token 数」（每请求 1 token，不含投机解码）、上下文读作「每请求此刻的长度」。
+
 ## 数据可信度分级
 
 这个工具的每个数字都必须能归到以下之一。混用而不标注是它最大的失效模式。
 
 | 级别 | 含义 | 例 |
 |---|---|---|
-| `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB |
+| `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB；各机型的 HBM 带宽与 dense TFLOPS（[[adr-0010]]，出处 URL 在 `data/instances.js` 注释里，**只取 dense 行，不取 sparsity 行**） |
 | `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账 |
-| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数 |
+| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
 | `guessed` | 拍的，无依据 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，且它直接决定最大并发**） |
-| `measured` | 目标硬件实测 | （暂无） |
+| `measured` | 目标硬件实测 | （暂无。第一批候选是 roofline 的效率比 `实测 ÷ 下界`，见 [[adr-0010]] §6，以及 ADR-0004 里 overhead 的反解路径） |

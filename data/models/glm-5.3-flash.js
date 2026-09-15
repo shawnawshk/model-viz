@@ -23,6 +23,7 @@ REG.models["glm-5.3-flash"] = {
   layers: [
     { count: 11, family: "dsa", kvLoraRank: 512, qkRopeDim: 0,
       indexerElems: 32, indexerBytes: 1,
+      indexTopk: 2048,          // config.json index_topk;只影响 decode 读取量(ADR-0010),不影响显存
       note: "DSA = MLA latent + lightning indexer。latent 被所有 head 共享 → TP 内每卡各存一份完整副本。"
           + "qk_rope_head_dim=0(mla_use_nope)→ 每 token 只有 512 个元素,不是 DeepSeek 系的 576。"
           + "indexer 的 key cache 另算,走自己的 dtype" },
