@@ -86,8 +86,8 @@ Kimi K3 有 896 = 2⁷ × 7 个 routed expert，而 stage 规模总是 2 的幂�
 
 - **MLA**（Kimi K3 的 24 个 full-attn 层）：压缩 latent 被所有 head 共享 → TP 组内每张卡各存一份完整副本 → **复制 TP 份**
 - **DSA**（DeepSeek Sparse Attention，GLM-5.3-Flash 的 11 个 full-attn 层）：与 MLA 完全相同的 latent 复制行为，**外加** lightning indexer 自己的一份 per-token key cache（同样是单头共享 → 同样复制 TP 份，但走自己的 dtype，不受 `--kv-cache-dtype` 影响）
-- **GQA**：KV 按 kv head 切分 → `n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时开始复制 `TP / n_kv_heads` 份
-- **线性注意力 / SSM 的 recurrent state**：per-head，可按 head 切 → 不复制
+- **GQA**（Qwen3.8-27B 的 16 个 full-attn 层）：KV 按 kv head 切分 → `n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时开始复制 `TP / n_kv_heads` 份。复制因子是**并行配置的函数**，引擎用 `kvShards(g, tp) = min(TP, n_kv_heads)` 钩子表达，见 [[adr-0012]]。后果是 TP 的甜点落在 n_kv_heads 上：TP ≤ 4 既切权重又不复制 KV，TP=8 开始复制
+- **线性注意力 / SSM 的 recurrent state**（KDA：K3 / GLM；Gated DeltaNet：Qwen3.8-27B）：per-head，可按 head 切 → 不复制
 
 DP 和 PP 在任何 family 下都不复制 KV。
 
@@ -135,7 +135,7 @@ KV / state 读取追上权重读取的上下文长度（当前并发下）。短
 | 级别 | 含义 | 例 |
 |---|---|---|
 | `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB；各机型的 HBM 带宽与 dense TFLOPS（[[adr-0010]]，出处 URL 在 `data/instances.js` 注释里，**只取 dense 行，不取 sparsity 行**） |
-| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账 |
-| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
+| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账。Qwen3.8-27B：全部 BF16 51.75 GiB，以及官方 FP8 checkpoint 28.75 GiB —— 第一个「非 expert → FP8」档也是实测的模型（[[adr-0012]] §3） |
+| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；Gated DeltaNet state 的 dtype（config 写 float32，vLLM 默认落到 BF16，两个官方答案）；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
 | `guessed` | 拍的，无依据 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，且它直接决定最大并发**） |
 | `measured` | 目标硬件实测 | （暂无。第一批候选是 roofline 的效率比 `实测 ÷ 下界`，见 [[adr-0010]] §6，以及 ADR-0004 里 overhead 的反解路径） |

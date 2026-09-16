@@ -13,6 +13,7 @@
 <script src="data/models/kimi-k3.js"></script>
 <script src="data/models/glm-5.3-flash.js"></script>
 <script src="data/models/deepseek-v4.1-flash.js"></script>
+<script src="data/models/qwen3.8-27b.js"></script>
 <style>
   /* 冷灰色板(与 index.html 同一份)。浅色是基准,深色是同一组色相按深色底重新取阶,不是自动反色。
      五个 series 色沿用原色板(两种底色上都过了 CVD / 对比度校验),overhead 是刻意的中性灰。
@@ -373,7 +374,7 @@
         <div class="ctl"><label for="tp">TP</label><select id="tp"></select></div>
         <div class="ctl"><label for="dp">DP</label><select id="dp"></select></div>
         <div class="ctl"><label for="pp">PP</label><select id="pp"></select></div>
-        <div class="ctl"><label for="ep" id="epLabel">EP <span id="epLab"></span></label><select id="ep"></select></div>
+        <div class="ctl" id="epCtl"><label for="ep" id="epLabel">EP <span id="epLab"></span></label><select id="ep"></select></div>
         <div class="eq" id="eq"></div>
       </div>
     </section>
@@ -389,8 +390,9 @@
       <div class="gl">口径</div>
       <div class="grow">
         <div class="ctl"><label for="util">gpu_mem_utilization <span id="utillab"></span></label><input type="range" id="util" min="70" max="100" step="1"></div>
-        <div class="ctl"><label for="expFmt">expert 权重 <span id="expFmtLab"></span></label><select id="expFmt"></select></div>
-        <div class="ctl"><label for="prec">非 expert 权重 <span id="precLab"></span></label><select id="prec"></select></div>
+        <!-- dense 模型(ADR-0012)没有 expert 桶:EP 与 expert 权重两个控件整个隐藏,「非 expert 权重」改叫「权重」 -->
+        <div class="ctl" id="expFmtCtl"><label for="expFmt">expert 权重 <span id="expFmtLab"></span></label><select id="expFmt"></select></div>
+        <div class="ctl"><label for="prec"><span id="precName">非 expert 权重</span> <span id="precLab"></span></label><select id="prec"></select></div>
         <!-- KV dtype 通常是引擎启动参数(ADR-0007),但也有模型把它写死在架构里(ADR-0009 §3)
              —— 那种情况下整个控件隐藏,因为它不是用户能选的东西。 -->
         <div class="ctl" id="kvDtCtl"><label for="kvDt">KV cache dtype <span id="kvDtLab"></span></label><select id="kvDt"></select></div>
@@ -488,6 +490,8 @@ if (!MD) {
 //   false —— DSv4.1 的 SWA 环形 buffer,存的是所有 head 共享的 latent,每卡一份完整副本
 // kvDesc 是该 family 在假设区 / 表格里怎么描述自己的每 token KV —— 各 family 的字段不同,
 // 引擎不能假设所有 family 都有 kvLoraRank。
+// kvShards(g, tp)(ADR-0012)是该 family 的每 token KV 在 TP 组内被切成几份:latent 系没有这个钩子(= 1,每卡一份完整副本),
+// GQA 是 min(TP, n_kv_heads)—— 复制因子 TP ÷ kvShards 因此是并行配置的函数,不是常数。
 const FAMILY = {
   // MLA:压缩 latent 被所有 head 共享 → TP 组内每卡各存一份完整副本(即不除以 TP)
   mla:    { perTokenElems: g => g.kvLoraRank + g.qkRopeDim,
@@ -541,16 +545,33 @@ const FAMILY = {
             perTokenFixedBytes: () => 0,
             perReqBytes: g => g.windowSlots * g.windowElems * g.windowBytesPerElem,
             stateShardableByTp: false },
+  // GQA(ADR-0012):KV 按 kv head 切,不是共享 latent。TP ≤ n_kv_heads 时每卡只存自己那 n_kv/TP 个 head,
+  // TP 组合起来恰好一份;TP 超过 n_kv_heads 后每卡至少 1 个 head,于是开始复制 TP/n_kv_heads 份。
+  // 这就是 kvShards 钩子存在的原因 —— 复制因子随 TP 变,perTokenElems(g) 的签名不够用。
+  gqa:    { perTokenElems: g => 2 * g.kvHeads * g.headDim,            // K + V,所有 kv head 合计 = 「一份」
+            perReqBytes:   () => 0,
+            kvShards:      (g, tp) => Math.min(tp, g.kvHeads),
+            // full attention 全读自己持有的那些 head;÷ kvShards 由调用方做(与显存侧同一个规则)
+            decodeReadPerReq: (g, ctx, kvB) => ctx * 2 * g.kvHeads * g.headDim * kvB,
+            decodeReadDesc: (g, ctx, kvB) => `${g.count} 层 × 2 (K+V) × ${g.kvHeads} kv head × ${g.headDim} × ${kvB} B = ${fint(g.count * 2 * g.kvHeads * g.headDim * kvB)} B/token × ${fctx(ctx)} 上下文,full attention 全读`,
+            kvTpDesc: (g, tp) => tp <= g.kvHeads
+              ? `KV 按 kv head 切,TP ${tp} 内每卡只读自己那 ${g.kvHeads / tp} 个 head 的份额(÷${tp})`
+              : `TP ${tp} 已超过 n_kv_heads ${g.kvHeads},每卡 1 个 head,读到的是 ÷${g.kvHeads} 的份额(TP 组内复制 ${tp / g.kvHeads} 份)`,
+            kvDesc: g => `${g.count} 层 × 2 (K+V) × ${g.kvHeads} kv head × head_dim ${g.headDim}`,
+            stateShardableByTp: false },
   // 线性注意力:recurrent state 与序列长度无关,per-head 可按 TP 真正切开
   linear: { perTokenElems: () => 0,
             perReqBytes:   g => g.heads * g.headDim * g.headDim * g.stateDtypeBytes,
             stateShardableByTp: true },
 };
 
+// dense 模型(ADR-0012)没有 moe 块:EP 恒为 1,expert 桶恒为 0,页面上所有 MoE 专属的行、徽章、告警与算式走 dense 分支。
+const MOE = MD.moe || { layers: 0, experts: 0, topk: 0, sharedExperts: 0, latent: 0, inter: 0 };
 const M = {
-  layers: MD.totalLayers, moeLayers: MD.moe.layers, hidden: MD.hidden,
-  nExperts: MD.moe.experts, topk: MD.moe.topk, sharedExperts: MD.moe.sharedExperts,
-  moeLatent: MD.moe.latent, moeInter: MD.moe.inter,
+  layers: MD.totalLayers, moeLayers: MOE.layers, hidden: MD.hidden,
+  nExperts: MOE.experts, topk: MOE.topk, sharedExperts: MOE.sharedExperts,
+  moeLatent: MOE.latent, moeInter: MOE.inter,
+  dense: !MD.moe,
 };
 // 权重是实测字节(逐张量 safetensors header 求和,与 index.json 的 total_size 对账),
 // 不做残差估算 —— 非 expert 部分可以是混合 dtype(GLM 就是)。见 ADR-0008 / ADR-0009 §1。
@@ -568,13 +589,16 @@ M.nonExpertParams = MD.weights.nonExpertParams;
 M.totalParams     = M.expertParams + M.nonExpertParams + M.tpShardedParams;
 // 每参数字节数是存储格式的指纹:K3 的 mxfp4 恰为 0.53125(4bit + 每 32 元素一个 8bit scale),
 // GLM 的 fp8 恰为 1.000244140625(1B + 每 128×128 块一个 F32 scale)。对不上就说明口径错了。
-M.expertBytesPerParam = M.expertBytesNative / M.expertParams;
+M.expertBytesPerParam = M.dense ? 0 : M.expertBytesNative / M.expertParams;
 // 带 routed expert 权重的层数。可能大于 moe.layers —— GLM 的 MTP 层也带一整套 288 个专家,
 // 它占显存(算在 expert 桶里),但不参与主干那 45 层的 all-to-all 计数。
-M.expertWeightLayers = M.expertParams / (M.nExperts * 3 * M.moeLatent * M.moeInter);
+M.expertWeightLayers = M.dense ? 0 : M.expertParams / (M.nExperts * 3 * M.moeLatent * M.moeInter);
 
 // 数据文件的内部一致性检查。写错一位数字在页面上完全看不出来,所以在这里硬失败。
-if (!Number.isInteger(M.expertWeightLayers))
+if (M.dense) {
+  if (M.expertBytesNative !== 0 || M.expertParams !== 0 || MD.expertFormats)
+    throw new Error("dense 模型(没有 moe 块)的 expertBytes / expertParams 必须为 0,且不能有 expertFormats");
+} else if (!Number.isInteger(M.expertWeightLayers))
   throw new Error(`expertParams 与 moe 结构不吻合:${M.expertParams} ÷ (${M.nExperts}×3×${M.moeLatent}×${M.moeInter})`
     + ` = ${M.expertWeightLayers},应为整数层数`);
 if (MD.weights.nonExpertBf16Params * MD.nonExpertFormats[0].bf16Bytes + MD.weights.nonExpertFixedBytes
@@ -623,6 +647,35 @@ const HW = {
 //   候选机型要有 hbmGBs 与 denseTflops.bf16(带宽 / 算力两条线的 spec)。
 for (const g of MD.layers) if ((g.family === "dsa" || g.family === "csa2") && !(g.indexTopk > 0))
   throw new Error(`${g.family} 层组缺 indexTopk(config.json 的 index_topk)`);
+for (const g of MD.layers) if (g.family === "gqa" && !(g.qHeads > 0 && g.kvHeads > 0 && g.headDim > 0))
+  throw new Error("gqa 层组必须有 qHeads / kvHeads / headDim(config.json 的 num_attention_heads / num_key_value_heads / head_dim)");
+
+// 单卡上每 token 的 KV 字节(ADR-0012):latent 系 family 每卡一份完整副本(÷1),GQA 按 kv head 切(÷ min(TP, n_kv_heads))。
+// M.kvElemsPerToken × dtype + kvFixedBytesPerToken 仍是「一份」的字节数,给 B/token/份 与集群存量用。
+const kvBytesPerTokenOnGpu = (kvB, tp) => MD.layers.reduce((s, g) => {
+  const f = FAMILY[g.family];
+  return s + g.count * (f.perTokenElems(g) * kvB + (f.perTokenFixedBytes ? f.perTokenFixedBytes(g) : 0))
+             / (f.kvShards ? f.kvShards(g, tp) : 1);
+}, 0);
+M.gqa = MD.layers.some(g => g.family === "gqa");
+// TP 与 head 数的整除关系。只对声明了 head 数的层组检查(gqa 的 qHeads / kvHeads,linear 的 kHeads),
+// 没声明的模型这里永远为空,输出不变。不整除的切分引擎会拒绝启动,页面上按机械除法算出的数不代表可部署。
+function headSplitIssues(tp) {
+  const out = [];
+  for (const g of MD.layers) {
+    if (g.family === "gqa") {
+      if (g.qHeads % tp !== 0) out.push(`${g.qHeads} 个 q head`);
+      if (g.kvHeads % tp !== 0 && tp % g.kvHeads !== 0) out.push(`${g.kvHeads} 个 kv head`);
+    }
+    if (g.family === "linear" && g.kHeads !== undefined) {
+      if (g.heads % tp !== 0) out.push(`${g.heads} 个线性注意力 v head`);
+      if (g.kHeads % tp !== 0) out.push(`${g.kHeads} 个线性注意力 k head`);
+    }
+  }
+  return out;
+}
+// dense 模型只有一桶权重,「非 expert」这个限定词没有意义
+const NE_LABEL = M.dense ? "权重" : "非 expert 权重";
 for (const id of MD.candidateInstances) {
   const sp = REG.instances[id];
   if (!sp) throw new Error(`candidateInstances 引用了不存在的机型 ${id}`);
@@ -662,6 +715,8 @@ const S = { instId: MD.candidateInstances.includes(qsInst) ? qsInst : MD.default
             kvDt: MD.kvDtypes[0].id };                 // 默认引擎默认值(不加参数就是这一档)
 
 const divisors = n => { const r = []; for (let i = 1; i <= n; i++) if (n % i === 0) r.push(i); return r; };
+// EP 的候选:整除 stage 且整除 routed expert 数;dense 模型没有专家,EP 恒为 1
+const epOptions = stage => M.dense ? [1] : divisors(stage).filter(d => M.nExperts % d === 0);
 const world = () => S.n * HW.gpusPerNode;
 let epClamp = null;   // 记录 EP 被自动夹取的那一次,渲染后清空
 const stageGpus = () => S.tp * S.dp;
@@ -676,7 +731,8 @@ function compute() {
   const neFmt = MD.nonExpertFormats.find(f => f.id === S.neFmt) || MD.nonExpertFormats[0];
   const nonExpertBytes = MD.weights.nonExpertBf16Params * neFmt.bf16Bytes + MD.weights.nonExpertFixedBytes;
   // expert:原生格式用实测字节数;其余是重量化后的推算值
-  const expFmt = MD.expertFormats.find(f => f.id === S.expFmt) || MD.expertFormats[0];
+  const expFmt = M.dense ? { id: MD.quantFormat, label: "—", bytesPerParam: null }
+               : (MD.expertFormats.find(f => f.id === S.expFmt) || MD.expertFormats[0]);
   const expertNative = expFmt.bytesPerParam === null;
   const expertBytesTotal = expertNative ? M.expertBytesNative
                                         : M.expertParams * expFmt.bytesPerParam;
@@ -697,10 +753,14 @@ function compute() {
   // KV dtype:引擎运行时选项(--kv-cache-dtype),不是模型属性 —— 由 UI 选,见 ADR-0007
   const kvDt = MD.kvDtypes.find(f => f.id === S.kvDt) || MD.kvDtypes[0];
   const kvBytesPerToken = M.kvElemsPerToken * kvDt.bytes + M.kvFixedBytesPerToken;
+  // 单卡份额(ADR-0012):latent 系不 ÷TP(每卡一份完整副本),GQA ÷ min(TP, n_kv_heads)
+  const kvBytesPerTokenGpu = kvBytesPerTokenOnGpu(kvDt.bytes, S.tp);
+  // 同一个 token 的 KV 在 TP 组内存了几遍:MLA 系 = TP;GQA = TP ÷ min(TP, n_kv_heads)
+  const kvCopies = kvBytesPerToken > 0 ? kvBytesPerTokenGpu * S.tp / kvBytesPerToken : S.tp;
 
   // 一个请求完整落在一个 DP rank 上,不能把它的 cache 除以 DP 均摊成分数请求。
-  // KV 随上下文长度涨;MLA latent 被所有 head 共享 → TP 内复制,故不除 TP。
-  const kvPerReq = ctx * kvBytesPerToken / S.pp;
+  // KV 随上下文长度涨;÷TP 的规则按 family(见 kvBytesPerTokenOnGpu),MLA 系等价于不除。
+  const kvPerReq = ctx * kvBytesPerTokenGpu / S.pp;
   // 两项都与上下文长度无关、只随并发涨,但 ÷TP 行为相反:
   //   recurrent state(KDA)是 per-head 的,TP 能真正切开;
   //   SWA 环形 buffer 存的是所有 head 共享的 latent,每张卡一份完整副本 —— 不能除 TP。
@@ -734,7 +794,7 @@ function compute() {
   // 敏感度:换成另一档 KV dtype 后的并发。ADR-0004 要求能翻转结论的假设必须把反事实一起显示,
   // 不许只给一个干净数字。(kvDtypes 是两档列表,故「另一档」= 第一个 id 不同的项。)
   const kvAlt = MD.kvDtypes.find(f => f.id !== kvDt.id) || kvDt;
-  const perReqAlt = ctx * (M.kvElemsPerToken * kvAlt.bytes + M.kvFixedBytesPerToken) / S.pp + statePerReq;
+  const perReqAlt = ctx * kvBytesPerTokenOnGpu(kvAlt.bytes, S.tp) / S.pp + statePerReq;
   const perDpCapacityAlt = freeForState > 0 ? Math.floor(freeForState / perReqAlt) : 0;
   const maxConcAlt = perDpCapacityAlt * S.dp;
 
@@ -760,7 +820,7 @@ function compute() {
 
   return { W, stage, attn, expert, lookup, oh, kv, state, used, minUsed, free, budget, kvTokens, kvCapacity,
            expFmt, neFmt, expertNative, expertBytesTotal, nonExpertBytes,
-           kvDt, kvBytesPerToken, kvAlt, maxConcAlt, perDpCapacityAlt,
+           kvDt, kvBytesPerToken, kvBytesPerTokenGpu, kvCopies, kvAlt, maxConcAlt, perDpCapacityAlt,
            conc, ctx, kvPerReq, statePerReq, perReq, maxConc, continuousMaxConc, perDpCapacity,
            requestsByDp, peakRequests, minRequests, minKv, minState, totalBySeries, totalUsed,
            totalAttnStored, totalExpertStored, totalLookupStored, expertsPerGpuPerLayer, expertBankCopies,
@@ -818,7 +878,7 @@ function syncOptions(changed) {
 
   // EP:在一个 pipeline stage 内切专家 → 必须整除 stage 规模,且整除 896
   const stage = stageGpus();
-  const epOpts = divisors(stage).filter(d => M.nExperts % d === 0);
+  const epOpts = epOptions(stage);
   if (!epOpts.includes(S.ep)) {
     const from = S.ep;
     S.ep = epOpts.reduce((a, b) => (Math.abs(b - S.ep) < Math.abs(a - S.ep) ? b : a), epOpts[0]);
@@ -832,7 +892,7 @@ function syncOptions(changed) {
   fillSelect(document.getElementById("pp"), divisors(W), S.pp);
   fillSelect(document.getElementById("ep"), epOpts, S.ep);
   const eSel = document.getElementById("expFmt");
-  eSel.innerHTML = MD.expertFormats.map(f =>
+  eSel.innerHTML = (MD.expertFormats || []).map(f =>
     `<option value="${f.id}"${f.id === S.expFmt ? " selected" : ""}>${f.label}</option>`).join("");
   const nSel = document.getElementById("prec");
   nSel.innerHTML = MD.nonExpertFormats.map(f =>
@@ -843,6 +903,10 @@ function syncOptions(changed) {
   // 架构固定 dtype 的模型:整个控件隐藏。留一个只有一项的下拉框会暗示「这里有得选」,
   // 而事实是没有 —— 结论写在 banner 与假设区里(ADR-0009 §3)。
   document.getElementById("kvDtCtl").style.display = MD.kvDtypeFixed ? "none" : "";
+  // dense 模型(ADR-0012):没有专家,EP 与 expert 权重两个控件整个隐藏 —— 留着会暗示「这里有得选」
+  document.getElementById("epCtl").style.display = M.dense ? "none" : "";
+  document.getElementById("expFmtCtl").style.display = M.dense ? "none" : "";
+  document.getElementById("precName").textContent = NE_LABEL;
 
   const cEl = document.getElementById("conc"), xEl = document.getElementById("ctx");
   cEl.max = String(CONC_STEPS.length - 1); cEl.value = String(S.concIdx);
@@ -881,7 +945,8 @@ function banners(C) {
     `单卡需要 ${fgib(C.used)} GiB,超出${bud} ${fgib(C.used - C.budget)} GiB` +
     (C.used > HW.gpuMem ? `,连 ${fgib(HW.gpuMem)} GiB 物理显存都超了 ${fgib(C.used - HW.gpuMem)} GiB` : `(物理显存还剩 ${fgib(HW.gpuMem - C.used)} GiB,但引擎不会去碰)`) + "。" +
     (C.lookup > 40 * GIB ? ` 主因是${MD.tpShardedShort || "查表"}只能按 TP 切,TP=${S.tp} 时单卡要背 ${fgib(C.lookup)} GiB —— 提高 TP 是唯一的出路。`
-     : C.attn > 40 * GIB ? ` 主因是非 expert 权重被复制了 ${S.dp} 份而 TP 只切 ${S.tp} 份 —— 单卡就要背 ${fgib(C.attn)} GiB。` : "")]);
+     : C.attn > 40 * GIB ? ` 主因是${NE_LABEL}被复制了 ${S.dp} 份而 TP 只切 ${S.tp} 份 —— 单卡就要背 ${fgib(C.attn)} GiB。`
+       + (HW.spec.p2p.type === "pcie" && S.tp === 1 ? ` 而 ${HW.id} 卡间没有 NVLink,TP 上限是 1,权重切不开 —— 出路只有更小的权重格式或更大显存的卡。` : "") : "")]);
   else out.push(["good", "✓", "装得下", `单卡峰值 ${fgib(C.used)} GiB / ${bud},余量 ${fgib(C.free)} GiB。`]);
 
   if (S.tp > HW.domain) {
@@ -892,9 +957,27 @@ function banners(C) {
         : `TP 组横跨 ${S.tp / HW.domain} 个 NVLink 域,${M.layers * 2} 次 all-reduce 走 EFA(${HW.spec.interDomainGbps} Gbps),而不是 NVSwitch(${HW.spec.p2p.gbs} GB/s)。这是这类硬件上最贵的一个决定。`]);
   }
   else if (S.tp === 1) out.push(["good", "✓", "TP=1,attention 无 all-reduce",
-    `没有张量并行就没有 all-reduce。代价在显存:非 expert 权重一张卡背满 ${fgib(C.attn)} GiB。`]);
+    `没有张量并行就没有 all-reduce。代价在显存:${NE_LABEL}一张卡背满 ${fgib(C.attn)} GiB。`]);
   else out.push(["good", "✓", `TP=${S.tp} 在 NVLink 域内(域 ${HW.domain})`,
     `${M.layers * 2} 次 all-reduce 全部走 NVSwitch(${HW.spec.p2p.gbs} GB/s),不出域。`]);
+
+  // TP 与 head 数不整除(ADR-0012):引擎会拒绝启动,页面上的数字不代表可部署
+  const hs = headSplitIssues(S.tp);
+  if (hs.length) out.push(["critical", "✕", `TP=${S.tp} 不整除 head 数`,
+    `${hs.join("、")}都无法平均分到 ${S.tp} 张卡上,vLLM / SGLang 会拒绝启动。`
+    + `当前卡数下合法的 TP 只有 <b>${divisors(C.W).filter(t => !headSplitIssues(t).length).join(" / ")}</b>。下面的数字按机械除法算出,不代表可部署。`]);
+
+  // GQA 的 KV 复制因子随 TP 变(ADR-0012):越过 n_kv_heads 才开始复制,两个方向都要说出来
+  if (M.gqa) {
+    const g = MD.layers.find(x => x.family === "gqa");
+    if (C.kvCopies > 1) out.push(["warning", "!", `TP=${S.tp} 超过 n_kv_heads=${g.kvHeads},KV 每 token 复制 ${fsig(C.kvCopies)} 份`,
+      `GQA 的 KV 按 kv head 切,只有 ${g.kvHeads} 个 head 可分;TP 到 ${g.kvHeads} 之后每卡至少要拿 1 个 head,于是 TP 组里同一份 KV 存了 ${fsig(C.kvCopies)} 遍。`
+      + `${fctx(C.ctx)} 下每路请求在每张卡上吃 ${(C.kvPerReq / GIB).toFixed(2)} GiB —— 与 TP=${g.kvHeads} 时相同,但 DP 少了 ${fsig(C.kvCopies)} 倍。`
+      + `<b>这个模型 TP 的甜点在 n_kv_heads 上</b>:再往上加 TP 只切权重,不切 KV。`]);
+    else if (S.tp > 1) out.push(["good", "✓", `TP=${S.tp} ≤ n_kv_heads=${g.kvHeads},KV 不复制`,
+      `每卡只存自己那 ${g.kvHeads / S.tp} 个 kv head,TP 组合起来恰好一份 —— 与 MLA 系「latent 每卡一份完整副本」相反。`
+      + `每路请求每卡 ${(C.kvPerReq / GIB).toFixed(2)} GiB(${fctx(C.ctx)}),是 TP=1 的 1/${S.tp};TP 同时还切了权重,所以这一段 TP 越大越好。`]);
+  }
 
   // 量化格式 × 机型原生 dtype:三种情况后果完全不同(ADR-0005 §3 的明确破例)
   const instHasNative = HW.spec.nativeDtypes.includes(MD.quantFormat);
@@ -955,7 +1038,7 @@ function banners(C) {
       + `(当前 ${C.maxConc} 路)${kvRatio} —— 这个量级超过每卡 12 GiB 的 overhead 猜测值。`]);
   }
 
-  if (S.ep > HW.domain) out.push(["info", "→", `EP=${S.ep} 跨 NVLink 域`,
+  if (!M.dense && S.ep > HW.domain) out.push(["info", "→", `EP=${S.ep} 跨 NVLink 域`,
     `MoE 的 ${M.moeLayers} 层 × 2 次 all-to-all 走 EFA。这是必要且正常的 —— 专家总量 ${fgib(C.expertBytesTotal)} GiB 本来就放不进一台机器。DeepEP 的 node-limited routing 会把每 token 的跨节点副本数从 top-${M.topk} 压到 ≤ 域数。`]);
 
   if (epClamp) out.push(["info", "→", `EP 已自动从 ${epClamp.from} 调到 ${epClamp.to}`,
@@ -963,13 +1046,16 @@ function banners(C) {
     + `不是总卡数 ${C.W}。PP 按层切分,每个 stage 只持有自己那几层,这些层的专家只能摊在本 stage 的卡上 —— `
     + `摊不到别的 stage 去,因为那些卡装的是别的层。EP 还须整除 routed expert 数 ${M.nExperts}。`]);
 
-  if (C.expertBankCopies > 1) out.push(["warning", "!", `expert bank 被复制了 ${C.expertBankCopies} 份`,
+  if (!M.dense && C.expertBankCopies > 1) out.push(["warning", "!", `expert bank 被复制了 ${C.expertBankCopies} 份`,
     `EP=${S.ep} 只把专家切成 ${S.ep} 份,而一个 stage 有 ${C.stage} 张卡,于是同一批专家存了 ${C.expertBankCopies} 遍,白占 ${fgib(C.expertBytesTotal * (C.expertBankCopies - 1))} GiB。把 EP 提到 ${C.stage} 就能消掉。`]);
 
   if (S.pp > 1) out.push(["warning", "!", `PP=${S.pp} 的代价不在显存里`,
-    `按层切分省显存(非 expert 权重只存 1 份),但引入流水线气泡:需要同时有 ≥${S.pp} 个 micro-batch 在飞才能填满 ${S.pp} 级流水。${M.layers} 层切 ${S.pp} 段每段 ${(M.layers / S.pp).toFixed(1)} 层,且 ${kvLayerDesc} 层与 embedding / LM head 分布不均,要手工配平。低并发单流场景会亏。`]);
+    `按层切分省显存(${NE_LABEL}只存 1 份),但引入流水线气泡:需要同时有 ≥${S.pp} 个 micro-batch 在飞才能填满 ${S.pp} 级流水。${M.layers} 层切 ${S.pp} 段每段 ${(M.layers / S.pp).toFixed(1)} 层,且 ${kvLayerDesc} 层与 embedding / LM head 分布不均,要手工配平。低并发单流场景会亏。`]);
 
-  if (S.dp > 1) out.push(["info", "→", `DP=${S.dp}:复制 ${(100 * (M.nonExpertParams + M.tpShardedParams) / M.totalParams).toFixed(1)}% 的参数,共用 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%`,
+  if (S.dp > 1 && M.dense) out.push(["info", "→", `DP=${S.dp}:dense 模型,全部参数复制 ${S.dp} 份`,
+    `权重存 ${S.dp} 份 = ${fgib(C.totalAttnStored)} GiB(每份 ${fgib(C.attn * S.tp * S.pp)} GiB,按 TP${S.tp} × PP${S.pp} 切开)。`
+    + `没有专家可共用,DP 的账只有一项:多存一份权重,换一组独立的 KV 池 —— 值不值取决于 KV 复制因子,见上面 GQA 那条。`]);
+  else if (S.dp > 1) out.push(["info", "→", `DP=${S.dp}:复制 ${(100 * (M.nonExpertParams + M.tpShardedParams) / M.totalParams).toFixed(1)}% 的参数,共用 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%`,
     `非 expert 权重存 ${S.dp} 份 = ${fgib(C.totalAttnStored)} GiB`
     + (M.tpShardedBytes ? `,${MD.tpShardedShort || "查表"}也存 ${S.dp} 份 = ${fgib(C.totalLookupStored)} GiB(它按 TP 切、按 DP 复制,所以 DP 越大越贵)` : "")
     + `;expert bank 全集群只有 ${C.expertBankCopies} 份。没有任何一台机器持有完整模型 —— 每过一层 MoE,token 必须离开本 NVLink 域去找专家。`]);
@@ -983,10 +1069,12 @@ function banners(C) {
 const STATE_LABEL = M.stateBytesPerReq && M.windowBytesPerReq ? "recurrent state + 滑窗 buffer"
                   : M.windowBytesPerReq ? "滑窗环形 buffer" : "recurrent state";
 const SERIES = [
-  { key: "attn",   cls: "s-attn",   varName: "--series-attn",   label: "非 expert 权重(attention / shared expert / dense / embed)", pv: "s",
-    pvNote: `实测:总字节 − routed expert 字节${M.tpShardedBytes ? " − 查表字节" : ""} = ${fint(M.nonExpertBytesNative)} B;其中 BF16 ${fint(MD.weights.nonExpertBf16Params)} 参数可切 dtype,余下 ${fint(MD.weights.nonExpertFixedBytes)} B(F32 norms + 原生 FP8 模块)固定` },
-  { key: "expert", cls: "s-expert", varName: "--series-expert", label: "routed expert 权重", pv: "s",
-    pvNote: `实测:${fint(M.expertBytesNative)} B ÷ 逻辑参数量 ${fint(M.expertParams)} = ${M.expertBytesPerParam} B/参数,与 ${MD.quantFormat.toUpperCase()}+block scale 的理论值吻合` },
+  { key: "attn",   cls: "s-attn",   varName: "--series-attn",
+    label: M.dense ? "权重(dense:attention / MLP / embed / lm_head / vision / MTP)" : "非 expert 权重(attention / shared expert / dense / embed)", pv: "s",
+    pvNote: `实测:${M.dense ? "全部张量" : `总字节 − routed expert 字节${M.tpShardedBytes ? " − 查表字节" : ""}`} = ${fint(M.nonExpertBytesNative)} B;其中 BF16 ${fint(MD.weights.nonExpertBf16Params)} 参数可切 dtype,余下 ${fint(MD.weights.nonExpertFixedBytes)} B(${MD.nonExpertFixedDesc || "F32 norms + 原生 FP8 模块"})固定` },
+  // dense 模型(ADR-0012)没有这一桶:整条 series 不出现,图例 / 表格 / 色块都不留一个 0 行
+  ...(M.dense ? [] : [{ key: "expert", cls: "s-expert", varName: "--series-expert", label: "routed expert 权重", pv: "s",
+    pvNote: `实测:${fint(M.expertBytesNative)} B ÷ 逻辑参数量 ${fint(M.expertParams)} = ${M.expertBytesPerParam} B/参数,与 ${MD.quantFormat.toUpperCase()}+block scale 的理论值吻合` }]),
   // 第三桶只在有它的模型上出现。pv 是 g 而不是 s:字节数本身是实测的,但「整张表常驻 HBM」
   // 这个前提是猜测,而它能翻转整页结论 —— 标 e 会低估它的分量。见 ADR-0009 §2。
   ...(M.tpShardedBytes ? [{ key: "lookup", cls: "s-lookup", varName: "--series-lookup",
@@ -1002,14 +1090,18 @@ const SERIES = [
     pvNote: MD.stateNote || "结构由 config 推导,但 state dtype 假设为 FP32(若引擎用 BF16 则减半)" },
   { key: "oh",     cls: "s-oh",     varName: "--overhead",      label: "激活 + 通信 buffer(估 12 GiB)", short: "激活 + buffer", pv: "g", pvNote: "纯猜测,无实测依据;实际随 batch、CUDA graph、DeepEP buffer 变化" },
 ];
-SERIES[0].short = "非 expert 权重"; SERIES[1].short = "routed expert 权重";
+SERIES.find(s => s.key === "attn").short = NE_LABEL;
+{ const e = SERIES.find(s => s.key === "expert"); if (e) e.short = "routed expert 权重"; }
+
+// state 减半对最大并发的影响:1 ÷ (1 − state/2 ÷ perReq) − 1。短上下文下它是主导项,能到几十个百分点;长上下文下不到 1%
+const stateHalfPct = C => { const p = (C.perReq / (C.perReq - C.statePerReq / 2) - 1) * 100; return p < 1 ? "不到 1%" : `约 ${Math.round(p)}%`; };
 
 function render() {
   const C = compute();
 
   // 副标题:模型描述 + 当前机型规格
   const sp = HW.spec, p2p = sp.p2p.type === "nvswitch" ? `NVSwitch ${sp.p2p.gbs} GB/s` : "无 NVLink,仅 PCIe";
-  document.getElementById("sub").innerHTML = `${MD.blurb} · expert 权重 ${C.expFmt.label}${C.expertNative ? "" : "(已重量化,非原生)"}<br>`
+  document.getElementById("sub").innerHTML = `${MD.blurb}${M.dense ? "" : ` · expert 权重 ${C.expFmt.label}${C.expertNative ? "" : "(已重量化,非原生)"}`}<br>`
     + `<b>${HW.id}</b> — ${sp.gpu} × ${sp.gpusPerInstance} · 每卡 <code>${fgib(HW.gpuMem)} GiB</code>(${sp.gpuMemMiB} MiB)`
     + ` · NVLink 域 <code>${sp.nvlinkDomainGpus}</code> · 域内 <code>${p2p}</code> · 跨域 <code>${sp.interDomainGbps} Gbps ${sp.efaGen}</code>`;
   document.getElementById("barnote").innerHTML = `底槽 = ${fgib(HW.gpuMem)} GiB(${sp.gpuMemMiB} MiB)物理显存 · 竖线 = util 预算(真正的天花板)· 悬停或聚焦任一色块看精确值 · 徽章标出该卡在各并行维度中的 rank`;
@@ -1029,7 +1121,7 @@ function render() {
     + `本页按 <b>${C.kvDt.label}</b> 计 —— 换成 ${C.kvAlt.label},上面的最大并发就是 `
     + `<b>${C.maxConcAlt} 路</b>而不是 ${C.maxConc} 路`);
   if (M.stateBytesPerReq) asm.push(
-    `recurrent state 按 FP32 计,若引擎用 BF16 则减半(对并发影响不到 2%)`);
+    `recurrent state 按 FP32 计,若引擎用 BF16 则减半(${fctx(C.ctx)} 下对最大并发影响${stateHalfPct(C)})`);
   if (M.windowBytesPerReq) asm.push(
     `滑窗环形 buffer 按 <b>${(M.windowBytesPerReq / 1048576).toFixed(3)} MiB/请求</b> 计,`
     + `其存储 dtype 是假设(参考实现分配 BF16,但注释说数值上是 FP8;若引擎直接存 FP8 则减半)。`
@@ -1069,7 +1161,8 @@ function render() {
         每路请求在所属 DP 组的每张卡吃 ${(C.perReq / 1e6).toFixed(1)} MB
         (KV ${(C.kvPerReq / 1e6).toFixed(1)} + ${STATE_LABEL} ${(C.statePerReq / 1e6).toFixed(1)})<br>
         当前设的 <b>${fint(C.conc)}</b> 路 ${fctx(C.ctx)} ${fits ? "装得下" : "<b style=\"color:var(--st-critical)\">装不下</b>"},
-        KV 每 token 被复制 <b>${S.tp}</b> 份(TP 组内),${M.windowBytesPerReq ? `滑窗 buffer 同样复制 <b>${S.tp}</b> 份` : "state 不复制"}</div>
+        ${M.gqa ? (C.kvCopies > 1 ? `KV 每 token 被复制 <b>${fsig(C.kvCopies)}</b> 份(TP ${S.tp} ÷ n_kv_heads)` : `KV 按 kv head 切开,TP 组内<b>不复制</b>`)
+                : `KV 每 token 被复制 <b>${S.tp}</b> 份(TP 组内)`},${M.windowBytesPerReq ? `滑窗 buffer 同样复制 <b>${S.tp}</b> 份` : "state 不复制"}</div>
     </div>
     <div class="tile">
       <div class="tl">单卡峰值占用</div>
@@ -1080,7 +1173,7 @@ function render() {
     <div class="tile">
       <div class="tl">集群权重总存量</div>
       <div class="tv">${(gib(C.totalAttnStored + C.totalExpertStored + C.totalLookupStored) / 1024).toFixed(2)}<span class="tu">TiB</span></div>
-      <div class="td">非 expert ${fgib(C.totalAttnStored)} GiB(${S.dp} 份) + expert ${fgib(C.totalExpertStored)} GiB${M.tpShardedBytes ? ` + ${MD.tpShardedShort || "查表"} ${fgib(C.totalLookupStored)} GiB(${S.dp} 份)` : ""}</div>
+      <div class="td">${NE_LABEL} ${fgib(C.totalAttnStored)} GiB(${S.dp} 份)${M.dense ? "" : ` + expert ${fgib(C.totalExpertStored)} GiB`}${M.tpShardedBytes ? ` + ${MD.tpShardedShort || "查表"} ${fgib(C.totalLookupStored)} GiB(${S.dp} 份)` : ""}</div>
     </div>
     <div class="tile">
       <div class="tl">每 step 跨域集合操作</div>
@@ -1121,7 +1214,7 @@ function render() {
         `<span class="badge hl">TP ${r.tp}/${S.tp}</span>`,
         S.dp > 1 ? `<span class="badge hl">DP 组 ${r.dp} · ${G.requests} 路</span>` : "",
         S.pp > 1 ? `<span class="badge hl">PP 段 ${r.pp} (层 ${Math.round(r.pp * M.layers / S.pp)}–${Math.round((r.pp + 1) * M.layers / S.pp) - 1})</span>` : "",
-        `<span class="badge">EP ${r.ep}/${S.ep} · 专家 #${fint(expStart)}–${fint(expStart + C.expertsPerGpuPerLayer - 1)}(每层 ${fint(C.expertsPerGpuPerLayer)} 个)</span>`,
+        M.dense ? "" : `<span class="badge">EP ${r.ep}/${S.ep} · 专家 #${fint(expStart)}–${fint(expStart + C.expertsPerGpuPerLayer - 1)}(每层 ${fint(C.expertsPerGpuPerLayer)} 个)</span>`,
       ].join("");
 
       rows += `<div class="gpu${overflow ? " over" : ""}">
@@ -1145,8 +1238,10 @@ function render() {
     <tbody>
       <tr><td>attention all-reduce</td><td>${S.tp === 1 ? 0 : M.layers * 2}</td><td>TP ${S.tp}</td>
           <td class="${tpX ? "xnode" : "innode"}">${S.tp === 1 ? "无需通信" : tpX ? "EFA 跨域" : "NVLink 域内"}</td></tr>
-      <tr><td>MoE all-to-all(dispatch+combine)</td><td>${M.moeLayers * 2}</td><td>EP ${S.ep}</td>
-          <td class="${epX ? "xnode" : "innode"}">${S.ep === 1 ? "无需通信" : epX ? "EFA 跨域" : "NVLink 域内"}</td></tr>
+      ${M.dense
+        ? `<tr><td>MoE all-to-all</td><td>0</td><td>—</td><td class="innode">dense 模型,没有 MoE 层</td></tr>`
+        : `<tr><td>MoE all-to-all(dispatch+combine)</td><td>${M.moeLayers * 2}</td><td>EP ${S.ep}</td>
+          <td class="${epX ? "xnode" : "innode"}">${S.ep === 1 ? "无需通信" : epX ? "EFA 跨域" : "NVLink 域内"}</td></tr>`}
       <tr><td>PP 激活 send/recv</td><td>${S.pp - 1}</td><td>点对点</td>
           <td class="${S.pp > 1 ? "xnode" : ""}">${S.pp > 1 ? `EFA 跨域(每 token 仅 ${(M.hidden / 1024).toFixed(0)} KB)` : "—"}</td></tr>
       <tr><td>DP attention 之间</td><td>0</td><td>—</td><td class="innode">零通信</td></tr>
@@ -1192,20 +1287,22 @@ function render() {
     <li><b>单位:全部是 GiB(2³⁰ 字节),不是十进制 GB。</b> 真值取 <code>describe-instance-types</code> 的 <code>MemoryInfo.SizeInMiB</code>(当前机型 <code>${HW.spec.gpuMemMiB} MiB/卡</code>),内部按字节计算。<br>
       厂商标称的「GB」在不同 GPU 上含义不一致(A100/H100/H200/RTX PRO 按 GiB 标,A10G/L4/L40S 与 B300 按十进制标),所以不能拿标称数字直接当某一种单位用。此处曾把 H200 的 141 GiB 当成 141×10⁹ 字节,导致容量低估 7.4%(每卡 10.4 GB、32 卡 333 GB),最大并发被低估约 18%。已修正 —— <b>不要改回 <code>141e9</code></b>。</li>
     <li><b>gpu_memory_utilization</b>:引擎能动用的预算 = <code>${fgib(HW.gpuMem)} GiB × util</code>,权重 + overhead + KV + state 都必须挤在这个预算里,剩下的物理显存引擎不会碰。vLLM 默认 0.90,这里也默认 0.90。util=1.00 是理论上界,不是可规划值。</li>
-    <li><b>routed expert 逻辑参数量</b>由 config 推出:<code>${MD.expertLayerDesc || `${M.expertWeightLayers} 层`} × ${fint(M.nExperts)} experts × 3 × ${M.moeLatent} × ${M.moeInter} = ${fint(M.expertParams)}</code>(${(M.expertParams / 1e12).toFixed(4)}T),占总参数 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%。存储字节数实测 <code>${fint(M.expertBytesNative)} B</code>,合每参数 <code>${M.expertBytesPerParam}</code> B。<br>
-      参数量口径<b>不含</b>量化用的 block scale 张量(<code>*_scale_inv</code>),字节数<b>含</b> —— 这样「每参数字节数」才是存储格式的指纹,能与理论值对账。</li>
+    ${M.dense ? "" : `<li><b>routed expert 逻辑参数量</b>由 config 推出:<code>${MD.expertLayerDesc || `${M.expertWeightLayers} 层`} × ${fint(M.nExperts)} experts × 3 × ${M.moeLatent} × ${M.moeInter} = ${fint(M.expertParams)}</code>(${(M.expertParams / 1e12).toFixed(4)}T),占总参数 ${(100 * M.expertParams / M.totalParams).toFixed(1)}%。存储字节数实测 <code>${fint(M.expertBytesNative)} B</code>,合每参数 <code>${M.expertBytesPerParam}</code> B。<br>
+      参数量口径<b>不含</b>量化用的 block scale 张量(<code>*_scale_inv</code>),字节数<b>含</b> —— 这样「每参数字节数」才是存储格式的指纹,能与理论值对账。</li>`}
     ${M.tpShardedBytes ? `<li><b>${MD.tpShardedShort || "查表"}是独立的第三桶权重</b>,实测 <code>${fint(M.tpShardedBytes)} B</code> = ${fgib(M.tpShardedBytes)} GiB(${fint(M.tpShardedParams)} 参数,占总参数 ${(100 * M.tpShardedParams / M.totalParams).toFixed(1)}%)。
       它<b>既不按 EP 切也不按 PP 切</b>:参考实现按行切在 <code>world_size</code> 上、查完做 <code>all_reduce</code>,所以 shard 组就是 <b>TP 组</b> —— 摊不到 DP 上去(那个 all_reduce 会把 DP replica 耦合起来,DP 就白做了)。单卡 = <code>${fint(M.tpShardedBytes)} ÷ TP ${S.tp}</code> = <b>${fgib(C.lookup)} GiB</b>。<br>
       <b>「整张表常驻 HBM」是本页量级最大的猜测(约 40%)</b>,标记为 <span class="pv pv-g">猜测</span>。字节数本身是实测的,可疑的是放置方式。见 <code>docs/adr/0009</code> §2。</li>` : ""}
     ${(MD.notes || []).map(n => `<li>${n}</li>`).join("\n    ")}
-    <li><b>KV cache</b> = ${KVLAYERS.map(g => FAMILY[g.family].kvDesc(g)).join(" + ")}${M.kvElemsPerToken ? ` = <b>${fint(M.kvElemsPerToken)} 元素/token/份</b>,× ${C.kvDt.bytes} B(当前选的 ${C.kvDt.label})${M.kvFixedBytesPerToken ? ` + indexer key cache <b>${fint(M.kvFixedBytesPerToken)} B</b>` : ""}` : ""} = <b>${fint(C.kvBytesPerToken)} B/token/份</b>。latent 是所有 head 共享的,所以 <b>TP 组内每张卡都要存一份完整副本</b>——这就是它被复制 TP 份的原因。DP 和 PP 都不复制同一个请求的 KV。<br>每个请求完整落在一个 DP rank,不能拆成分数请求均摊到所有 DP rank。峰值单卡占用 = <code>ceil(并发 ÷ DP) × 上下文 × ${fint(C.kvBytesPerToken)} ÷ PP</code>(注意没有 ÷TP)。<br>
+    <li><b>KV cache</b> = ${KVLAYERS.map(g => FAMILY[g.family].kvDesc(g)).join(" + ")}${M.kvElemsPerToken ? ` = <b>${fint(M.kvElemsPerToken)} 元素/token/份</b>,× ${C.kvDt.bytes} B(当前选的 ${C.kvDt.label})${M.kvFixedBytesPerToken ? ` + indexer key cache <b>${fint(M.kvFixedBytesPerToken)} B</b>` : ""}` : ""} = <b>${fint(C.kvBytesPerToken)} B/token/份</b>。${M.gqa
+        ? `KV 按 kv head 切:TP ≤ n_kv_heads 时每卡只存自己那几个 head,TP 组合起来恰好一份;TP 超过 n_kv_heads 后每卡至少 1 个 head,开始复制 TP ÷ n_kv_heads 份(当前 TP=${S.tp} → 复制 <b>${fsig(C.kvCopies)}</b> 份)。DP 和 PP 都不复制同一个请求的 KV。<br>每个请求完整落在一个 DP rank,不能拆成分数请求均摊到所有 DP rank。峰值单卡占用 = <code>ceil(并发 ÷ DP) × 上下文 × ${fint(C.kvBytesPerToken)} ÷ min(TP, n_kv_heads) ÷ PP</code>(当前单卡 ${fint(C.kvBytesPerTokenGpu)} B/token)。见 <code>docs/adr/0012</code>。<br>`
+        : `latent 是所有 head 共享的,所以 <b>TP 组内每张卡都要存一份完整副本</b>——这就是它被复制 TP 份的原因。DP 和 PP 都不复制同一个请求的 KV。<br>每个请求完整落在一个 DP rank,不能拆成分数请求均摊到所有 DP rank。峰值单卡占用 = <code>ceil(并发 ÷ DP) × 上下文 × ${fint(C.kvBytesPerToken)} ÷ PP</code>(注意没有 ÷TP)。<br>`}
       ${MD.kvDtypeFixed
         ? `<b>本模型的 dtype 也是推导值,不是假设。</b>参考实现 <code>inference/model.py</code> 里,主 KV 走 <code>fp4_act_quant(latent, 16, scale_dtype=float8_e4m3fn)</code>、indexer key 走 <code>fp4_act_quant(k, 32)</code>(E8M0)—— 两处的 block 大小与 scale 格式都是<b>写死的字面量,而且故意不同</b>。换 dtype 不是改启动参数,是改架构。所以本页在这一项上<b>比 K3 / GLM 两页少一个假设</b>,反事实也就不该编一个出来。ADR-0007 的「dtype 是引擎选项」在这个模型上不成立,见 <code>docs/adr/0009</code> §3。`
-        : `<b>元素数是推导值,dtype 不是。</b>元素数来自 <code>config.json</code> 的 <code>kv_lora_rank</code> 与 <code>qk_rope_head_dim</code>;而 KV 用什么 dtype 存<b>既不在 config.json 里也不在 checkpoint 里</b> —— 它是引擎启动参数(SGLang / vLLM 的 <code>--kv-cache-dtype</code>,默认 <code>auto</code> = 模型 dtype = BF16;FP8 要显式开)。所以它被提成了上方的可切输入,而不是数据文件里的常数:同一配置下 ${fctx(C.ctx)} 的最大并发,BF16 与 FP8 相差约一倍(当前 ${C.maxConc} 路,换成 ${C.kvAlt.label} 是 ${C.maxConcAlt} 路)。见 <code>docs/adr/0007</code>。`}</li>
-    ${M.stateBytesPerReq ? `<li><b>recurrent state</b>(本模型为 KDA 线性注意力)= ${MD.layers.filter(g => g.family === "linear").map(g => `${g.count} 层 × ${g.heads} head × ${g.headDim} × ${g.headDim} × ${g.stateDtypeBytes} B`).join(" + ")} = <b>${(M.stateBytesPerReq / 1e6).toFixed(0)} MB / 并发请求</b>,<b>与上下文长度无关</b>。state 是 per-head 的,所以 TP 能真正按 head 切开,<b>不复制</b>。<br>
+        : `<b>元素数是推导值,dtype 不是。</b>元素数来自 <code>config.json</code> 的 ${M.gqa ? "<code>num_key_value_heads</code> 与 <code>head_dim</code>" : "<code>kv_lora_rank</code> 与 <code>qk_rope_head_dim</code>"};而 KV 用什么 dtype 存<b>既不在 config.json 里也不在 checkpoint 里</b> —— 它是引擎启动参数(SGLang / vLLM 的 <code>--kv-cache-dtype</code>,默认 <code>auto</code> = 模型 dtype = BF16;FP8 要显式开)。所以它被提成了上方的可切输入,而不是数据文件里的常数:同一配置下 ${fctx(C.ctx)} 的最大并发,BF16 与 FP8 相差约一倍(当前 ${C.maxConc} 路,换成 ${C.kvAlt.label} 是 ${C.maxConcAlt} 路)。见 <code>docs/adr/0007</code>。`}</li>
+    ${M.stateBytesPerReq ? `<li><b>recurrent state</b>(本模型为 ${MD.layers.find(g => g.family === "linear").label || "KDA 线性注意力"})= ${MD.layers.filter(g => g.family === "linear").map(g => `${g.count} 层 × ${g.heads} head × ${g.headDim} × ${g.headDim} × ${g.stateDtypeBytes} B`).join(" + ")} = <b>${(M.stateBytesPerReq / 1e6).toFixed(0)} MB / 并发请求</b>,<b>与上下文长度无关</b>。state 是 per-head 的,所以 TP 能真正按 head 切开,<b>不复制</b>。<br>
       峰值单卡占用 = <code>ceil(并发 ÷ DP) × ${(M.stateBytesPerReq / 1e6).toFixed(0)} MB ÷ TP ÷ PP</code>。<br>
-      <b>dtype 按 FP32 假设</b>(线性注意力的 state 通常为数值稳定性保留 fp32),若引擎用 BF16 则减半 —— 但它只随并发涨、不随长度涨,对最大并发的影响不到 2%,敏感度远低于上一条的 KV dtype。<br>
-      高并发短上下文场景下它会<b>反超</b> KV cache —— 两者相等的临界上下文长度 = <code>${Math.round(M.stateBytesPerReq / C.kvBytesPerToken)} ÷ TP</code> tokens(当前 TP=${S.tp} → 约 ${Math.round(M.stateBytesPerReq / C.kvBytesPerToken / S.tp)} tokens)。拖到 4096 路 × 1K 看得最清楚。</li>` : ""}
+      <b>dtype 按 FP32 假设</b>(线性注意力的 state 通常为数值稳定性保留 fp32),若引擎用 BF16 则减半 —— 但它只随并发涨、不随长度涨,${fctx(C.ctx)} 下对最大并发的影响${stateHalfPct(C)}${C.statePerReq / 2 < C.perReq * 0.02 ? ",敏感度远低于上一条的 KV dtype" : ";上下文越短这一项越重"}。<br>
+      高并发短上下文场景下它会<b>反超</b> KV cache —— 两者相等的临界上下文长度 = <code>${Math.round(M.stateBytesPerReq / C.kvBytesPerToken)} ÷ TP${M.gqa ? " × min(TP, n_kv_heads)" : ""}</code> tokens(当前 TP=${S.tp} → 约 ${fint(Math.round(M.stateBytesPerReq / S.tp / C.kvBytesPerTokenGpu))} tokens)。拖到 4096 路 × 1K 看得最清楚。</li>` : ""}
     ${M.windowBytesPerReq ? `<li><b>滑窗环形 buffer</b> = ${MD.layers.filter(g => FAMILY[g.family].perReqBytes(g) > 0).reduce((s, g) => s + g.count, 0)} 层 × ${MD.layers.find(g => FAMILY[g.family].perReqBytes(g) > 0).windowSlots} 槽 × ${MD.layers.find(g => FAMILY[g.family].perReqBytes(g) > 0).windowElems} 维 × ${MD.layers.find(g => FAMILY[g.family].perReqBytes(g) > 0).windowBytesPerElem} B = <b>${(M.windowBytesPerReq / 1048576).toFixed(3)} MiB / 并发请求</b>,<b>与上下文长度无关</b>(它是个定长环,不是随长度增长的 cache)。<br>
       <b>它与 recurrent state 的关键差别:TP 切不掉。</b>环里存的是所有 head 共享的 ${MD.layers.find(g => FAMILY[g.family].perReqBytes(g) > 0).windowElems} 维 latent,所以每张卡一份完整副本 —— 行为与 KV cache 相同,与 per-head 的 recurrent state 相反。峰值单卡占用 = <code>ceil(并发 ÷ DP) × ${(M.windowBytesPerReq / 1048576).toFixed(3)} MiB ÷ PP</code>(<b>没有 ÷TP</b>)。<br>
       与 KV 相等的临界上下文 = <code>${fint(M.windowBytesPerReq)} ÷ ${fint(C.kvBytesPerToken)}</code> ≈ <b>${fint(Math.round(M.windowBytesPerReq / C.kvBytesPerToken))} tokens</b> —— 短于这个长度,这个定长 buffer 就比真正的 KV 还大。拖到 1K 上下文看得最清楚。<br>
@@ -1256,13 +1353,14 @@ function roofTerms(C, conc, ctx, smooth = false, sp = HW.spec) {
 
   // (1) HBM 读取:非 expert 权重整读;routed expert 只读这一步命中的那些(均匀路由的期望);
   //     KV / state 按 family 的 decode 读法,÷TP / ÷PP 规则与显存侧完全相同。
-  const coverage = 1 - Math.pow(1 - M.topk / M.nExperts, groupTok);
+  const coverage = M.dense ? 0 : 1 - Math.pow(1 - M.topk / M.nExperts, groupTok);
   const neRead   = C.attn;
-  const expRead  = C.expert * (M.moeLayers / M.expertWeightLayers) * coverage;   // 只算主干层,投机层不参与 decode
+  const expRead  = M.dense ? 0 : C.expert * (M.moeLayers / M.expertWeightLayers) * coverage;   // 只算主干层,投机层不参与 decode
   let kvPerReq = 0, stateRW = 0, winRead = 0;
   for (const g of MD.layers) {
     const f = FAMILY[g.family];
-    kvPerReq += g.count * (f.decodeReadPerReq ? f.decodeReadPerReq(g, ctx, C.kvDt.bytes) : 0);
+    // GQA 每卡只读自己持有的 head(÷ kvShards),与显存侧同一个规则;latent 系 ÷1
+    kvPerReq += g.count * (f.decodeReadPerReq ? f.decodeReadPerReq(g, ctx, C.kvDt.bytes) / (f.kvShards ? f.kvShards(g, S.tp) : 1) : 0);
     const per = g.count * f.perReqBytes(g);
     if (f.stateShardableByTp) stateRW += 2 * per; else winRead += per;   // recurrent state 读+写,滑窗环只读
   }
@@ -1274,7 +1372,9 @@ function roofTerms(C, conc, ctx, smooth = false, sp = HW.spec) {
   const expFlops   = 2 * perExpertParams * (M.moeLayers / S.pp) * stageTok * M.topk / C.stage;
   const bf16P = MD.weights.nonExpertBf16Params, fixP = M.nonExpertParams - bf16P;
   const neBf16Flops = 2 * bf16P / S.tp / S.pp * rankTok, neFixFlops = 2 * fixP / S.tp / S.pp * rankTok;
-  const expD = computeDtype(C.expFmt.id, sp), neD = computeDtype(C.neFmt.bf16Bytes === 1 ? "fp8" : "bf16", sp), fixD = computeDtype("fp8", sp);
+  // 非 expert 的两部分各按自己的 dtype 行:可切的那部分按当前格式(格式可用 dtype 字段显式声明,实测 FP8 checkpoint 的每参数字节数不是整 1);
+  // 固定的那部分缺省按 FP8(K3 / GLM / DSv4.1 的原生 FP8 模块),模型可声明 nonExpertFixedDtype(Qwen 保留的是 BF16)。
+  const expD = computeDtype(C.expFmt.id, sp), neD = computeDtype(C.neFmt.dtype || (C.neFmt.bf16Bytes === 1 ? "fp8" : "bf16"), sp), fixD = computeDtype(MD.nonExpertFixedDtype || "fp8", sp);
   const tComp = expFlops / (R[expD] * 1e12) + neBf16Flops / (R[neD] * 1e12) + neFixFlops / (R[fixD] * 1e12);
 
   // (3) 通信:TP all-reduce(ring,每层 2 次)+ EP all-to-all(dispatch + combine),按字节 ÷ 链路带宽,不含延迟。
@@ -1339,7 +1439,7 @@ roofMathSummary.style.display = "";
 function capacityAt(C, ctx = C.ctx, kvDt = C.kvDt, sp = HW.spec) {
   const budget = sp.gpuMemMiB * 1024 * 1024 * (S.util / 100);
   const fixed = C.attn + C.expert + C.lookup + C.oh;
-  const perReq = ctx * (M.kvElemsPerToken * kvDt.bytes + M.kvFixedBytesPerToken) / S.pp + C.statePerReq;
+  const perReq = ctx * kvBytesPerTokenOnGpu(kvDt.bytes, S.tp) / S.pp + C.statePerReq;
   return budget > fixed ? Math.floor((budget - fixed) / perReq) * S.dp : 0;
 }
 function concStepAtOrBelow(n) {
@@ -1378,7 +1478,7 @@ function parallelAlternatives(C, R, goal) {
   const pp = S.pp, stage = W / pp;
   for (const tp of divisors(stage).filter(x => x <= HW.domain)) {
     const dp = stage / tp;
-    for (const ep of divisors(stage).filter(x => M.nExperts % x === 0)) {
+    for (const ep of epOptions(stage)) {
       if (tp === S.tp && dp === S.dp && ep === S.ep) continue;
       const state = { tp, dp, pp, ep };
       const candidate = withParallelState(state, () => {
@@ -1437,8 +1537,9 @@ function parallelCard(x, goal, C, R) {
   if (s.pp > 1) topology.push(`PP${s.pp} 流水`);
   if (!topology.length) topology.push("集合通信留在 NVLink 域内");
   const mechanism = [];
-  if (s.tp < S.tp && s.dp > S.dp)
-    mechanism.push(`每路 KV 的跨卡副本从 ×${S.tp} 降到 ×${s.tp},同时 DP${S.dp} → DP${s.dp}`);
+  // 副本数按 family 算(ADR-0012):MLA 系 = TP,GQA = TP ÷ min(TP, n_kv_heads);GQA 上 TP4 → TP2 副本不变,这句就不出现
+  if (x.C.kvCopies < C.kvCopies)
+    mechanism.push(`每路 KV 的跨卡副本从 ×${fsig(C.kvCopies)} 降到 ×${fsig(x.C.kvCopies)},同时 DP${S.dp} → DP${s.dp}`);
   if (x.C.lookup > C.lookup + 1024 * 1024)
     mechanism.push(`代价是每卡${MD.tpShardedShort || "按 TP 切的查表"} ${fgib(C.lookup)} → ${fgib(x.C.lookup)} GiB`);
   else if (x.C.lookup + 1024 * 1024 < C.lookup)
@@ -1655,21 +1756,23 @@ function renderRoof(C) {
 
   // (1) HBM
   grp(`HBM 读取 <span class="pv pv-p">spec</span> ${fint(sp.hbmGBs)} GB/s`, fb(R.memBytes), R.tMem, "mem");
-  row("非 expert 权重,每步全读",
+  row(`${NE_LABEL},每步全读`,
     `这张卡持有 ${(C.nonExpertBytes / GIB).toFixed(1)} GiB ÷ TP ${S.tp}${ppTxt};${M.layers} 层过一遍,每层的矩阵都要从显存读一次`,
     fb(R.neRead), fms(R.neRead / hbm));
-  const perExpB = C.expertBytesTotal / (M.expertWeightLayers * M.nExperts);
-  row("这一步命中的 routed expert",
-    `每层这张卡存 ${fint(C.expertsPerGpuPerLayer)} 个专家,${fint(R.stageTok)} 个 token 每个选 ${M.topk}/${fint(M.nExperts)},期望命中 <b>${fsig(C.expertsPerGpuPerLayer * R.coverage)}</b> 个`
-    + `(均匀路由,<span class="pv pv-e">估算</span>)× ${(perExpB / 1048576).toFixed(1)} MiB/专家 × ${M.moeLayers / S.pp} 层`,
-    fb(R.expRead), fms(R.expRead / hbm));
+  if (!M.dense) {
+    const perExpB = C.expertBytesTotal / (M.expertWeightLayers * M.nExperts);
+    row("这一步命中的 routed expert",
+      `每层这张卡存 ${fint(C.expertsPerGpuPerLayer)} 个专家,${fint(R.stageTok)} 个 token 每个选 ${M.topk}/${fint(M.nExperts)},期望命中 <b>${fsig(C.expertsPerGpuPerLayer * R.coverage)}</b> 个`
+      + `(均匀路由,<span class="pv pv-e">估算</span>)× ${(perExpB / 1048576).toFixed(1)} MiB/专家 × ${M.moeLayers / S.pp} 层`,
+      fb(R.expRead), fms(R.expRead / hbm));
+  }
   let stateDesc = [], stateBytes = 0, winDesc = [], winBytes = 0;
   for (const g of MD.layers) {
     const f = FAMILY[g.family];
     if (f.decodeReadPerReq) {
-      const v = R.rankTok * g.count * f.decodeReadPerReq(g, C.ctx, C.kvDt.bytes) / S.pp;
+      const v = R.rankTok * g.count * f.decodeReadPerReq(g, C.ctx, C.kvDt.bytes) / (f.kvShards ? f.kvShards(g, S.tp) : 1) / S.pp;
       row(`这 ${fint(R.rankTok)} 路请求的 ${g.family.toUpperCase()} KV`,
-        `${f.decodeReadDesc(g, C.ctx, C.kvDt.bytes)};× ${fint(R.rankTok)} 路${ppTxt}。latent 是所有 head 共享的,TP 内每卡读一份完整副本`
+        `${f.decodeReadDesc(g, C.ctx, C.kvDt.bytes)};× ${fint(R.rankTok)} 路${ppTxt}。${f.kvTpDesc ? f.kvTpDesc(g, S.tp) : "latent 是所有 head 共享的,TP 内每卡读一份完整副本"}`
         + (MD.kvDtypeFixed ? "" : `(KV dtype 当前按 ${C.kvDt.label},<span class="pv pv-e">估算</span>)`),
         fb(v), fms(v / hbm));
     }
@@ -1692,10 +1795,10 @@ function renderRoof(C) {
   // (2) 算力
   const gf = R.expFlops + R.neBf16Flops + R.neFixFlops;
   grp(`算力:每个参数每 token 2 次浮点运算 <span class="pv pv-p">spec</span> dense TFLOPS${unst}`, `${fsig(gf / 1e9)} GFLOP`, R.tComp, "comp");
-  row("非 expert 矩阵乘",
-    `2 × ${ftok(M.nonExpertParams)} 参数 ÷ TP ${S.tp}${ppTxt} × ${fint(R.rankTok)} token;其中 BF16 的 ${ftok(MD.weights.nonExpertBf16Params)} ÷ ${dt(R.neD)} ${T[R.neD]} T,原生 FP8/F32 的 ÷ ${dt(R.fixD)} ${T[R.fixD]} T`,
+  row(`${NE_LABEL}矩阵乘`,
+    `2 × ${ftok(M.nonExpertParams)} 参数 ÷ TP ${S.tp}${ppTxt} × ${fint(R.rankTok)} token;其中可切 dtype 的 ${ftok(MD.weights.nonExpertBf16Params)} ÷ ${dt(R.neD)} ${T[R.neD]} T,${MD.nonExpertFixedDesc ? `余下(${MD.nonExpertFixedDesc})` : "原生 FP8/F32 的"} ÷ ${dt(R.fixD)} ${T[R.fixD]} T`,
     `${fsig((R.neBf16Flops + R.neFixFlops) / 1e9)} GFLOP`, fms(R.neBf16Flops / (T[R.neD] * 1e12) + R.neFixFlops / (T[R.fixD] * 1e12)));
-  row("命中专家的矩阵乘",
+  if (!M.dense) row("命中专家的矩阵乘",
     `2 × ${ftok(R.perExpertParams)} 参数/专家 × top-${M.topk} × ${M.moeLayers / S.pp} 层 × ${fint(R.stageTok)} token ÷ ${C.stage} 卡(stage 内均摊)÷ ${dt(R.expD)} ${T[R.expD]} T`
     + (R.expD !== (C.expFmt.id === "mxfp4" || C.expFmt.id === "nvfp4" ? "fp4" : C.expFmt.id) ? `(${sp.gpu} 无原生 ${C.expFmt.id.toUpperCase()},按 dequant 到 ${dt(R.expD)} 算)` : ""),
     `${fsig(R.expFlops / 1e9)} GFLOP`, fms(R.expFlops / (T[R.expD] * 1e12)));
@@ -1708,7 +1811,7 @@ function renderRoof(C) {
     fb(R.arTraffic), fms(R.tAR));
   row("EP all-to-all",
     S.ep > 1 ? `${M.moeLayers / S.pp} 层 × 2 次(dispatch + combine)× ${fint(R.stageTok)} token × top-${M.topk} × latent ${fint(M.moeLatent)} × 2 B × ${((S.ep - 1) / S.ep * 100).toFixed(0)}% 出卡 ÷ ${C.stage} 卡,收 + 发 × 2;÷ ${sp.p2p.type === "nvswitch" ? a2aLinkDesc : "PCIe,无带宽数据,按 0 计"}(均匀路由、BF16,<span class="pv pv-e">估算</span>)`
-             : "EP = 1,没有 all-to-all",
+             : M.dense ? "dense 模型,没有 MoE 层" : "EP = 1,没有 all-to-all",
     fb(R.a2aTraffic), fms(R.tA2A));
 
   document.getElementById("rooftbl").innerHTML = `
@@ -1728,8 +1831,8 @@ function renderRoof(C) {
       <ul>
         <li><b>三条线的来源</b>:HBM <code>${fint(sp.hbmGBs)} GB/s</code>、dense 算力 <code>BF16 ${T.bf16} / FP8 ${T.fp8 || "—"} / FP4 ${T.fp4 || "—"} TFLOPS</code>,厂商 datasheet 的 dense 行(不是 sparsity 行)${sp.tflopsSparsityUnstated ? ";<b>但 ${sp.gpu} 的 datasheet 没写 sparse 还是 dense,按原文照录,若实为 sparse 则算力一行松 2 倍</b>" : ""},出处在 <code>data/instances.js</code> 注释里。NVSwitch 按双向合计,EFA 按 <code>${sp.interDomainGbps} Gbps ÷ ${sp.gpusPerInstance} 卡</code> 的线速份额。带宽 / 算力是十进制,字节显示 GiB,时间 = 字节 ÷ (GB/s × 10⁹)。</li>
         <li><b>并发 = 这一步的 token 数</b>(每请求 1 token,不含 MTP / 投机解码);<b>上下文 = 每请求当前长度</b>(显存那边读作最大长度,同一个滑块)。${S.pp > 1 ? `PP=${S.pp}:按 ${S.pp} 个 micro-batch 填满流水,每段 step 用 ⌈并发 ÷ PP⌉ 个 token,不含 send/recv 与气泡。` : ""}</li>
-        <li><b>expert 读取按均匀路由的期望</b>:一个专家至少被一个 token 命中的概率 = <code>1 − (1 − ${M.topk}/${fint(M.nExperts)})^${fint(Math.ceil(R.groupTok))}</code> = ${(R.coverage * 100).toFixed(1)}%。真实路由有热点,读得更少,这一项作为下界偏松。recurrent state 每步读 + 写各一次(FP32),滑窗环只读。</li>
-        <li><b>算力那一行按权重格式选 dtype</b>(有原生就用原生;MXFP4 / NVFP4 无原生 → FP8,没有 FP8 → BF16),假设激活同精度。参数量含 embedding 与 vision 塔,高估不到 3%。</li>
+        <li>${M.dense ? "" : `<b>expert 读取按均匀路由的期望</b>:一个专家至少被一个 token 命中的概率 = <code>1 − (1 − ${M.topk}/${fint(M.nExperts)})^${fint(Math.ceil(R.groupTok))}</code> = ${(R.coverage * 100).toFixed(1)}%。真实路由有热点,读得更少,这一项作为下界偏松。`}recurrent state 每步读 + 写各一次(FP32),滑窗环只读。</li>
+        <li><b>算力那一行按权重格式选 dtype</b>(有原生就用原生;MXFP4 / NVFP4 无原生 → FP8,没有 FP8 → BF16),假设激活同精度。${MD.weights.nonMatmulParams ? `参数量含 embedding 与 vision 塔(${(100 * MD.weights.nonMatmulParams / M.totalParams).toFixed(1)}%),它们不参与 decode 的矩阵乘,算力行偏松这么多` : "参数量含 embedding 与 vision 塔,高估不到 3%"}。</li>
         <li><b>没算的</b>:attention 本身的 FLOPs(full attention 层在 128K 以上与矩阵乘同量级,算力行在长上下文下偏松);kernel launch / 调度 / 集合通信延迟;PP 的 send/recv 与气泡;${M.tpShardedBytes ? `${MD.tpShardedShort || "查表"}的读取(每 token 查几十行,KB 量级);` : ""}prefill 与 TTFT;chunked prefill 混进 decode step;效率系数 —— 实测 ÷ 下界要在目标机型上测一次才有,本页不猜。</li>
       </ul></li>`;
 }
@@ -1851,7 +1954,7 @@ function markPreset() {
       `${p.name}\n${p.inst} ×${p.n} = ${p.n * REG.instances[p.inst].gpusPerInstance} 卡 · `
       + `TP${p.tp}/DP${p.dp}/PP${p.pp}/EP${p.ep}\n`
       + `—— 以下按当前口径算,口径一改这些数就变 ——\n`
-      + `util ${utilLab} · 上下文 ${ctxLab} · KV ${C.kvDt.label} · expert ${C.expFmt.label} · 非 expert ${C.neFmt.label}\n`
+      + `util ${utilLab} · 上下文 ${ctxLab} · KV ${C.kvDt.label}${M.dense ? "" : ` · expert ${C.expFmt.label}`} · ${NE_LABEL} ${C.neFmt.label}\n`
       + `最大并发 ${mc >= 1 ? fint(mc) + " 路" : "不足 1 路(装不下)"}`
       + (MD.kvDtypeFixed ? "" : `(换成 ${C.kvAlt.label} 是 ${fint(C.maxConcAlt)} 路)`) + `\n`
       + `单卡权重 + overhead ${fgib(C.attn + C.expert + C.lookup + C.oh)} GiB / 预算 ${fgib(C.budget)} GiB`
