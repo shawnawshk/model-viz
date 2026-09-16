@@ -56,7 +56,9 @@ REG.models["qwen3.8-27b"] = {
     //   24,699,207,680 × 2 + 6,164,440,544 = 55,562,855,904 = totalBytes ✓
     //   expertBytes = expertParams = 0(dense)✓
     // 第三条(FP8 档)见 nonExpertFormats:24,699,207,680 × 1.0001220703125 + 6,164,440,544 = 30,866,663,264 = FP8 checkpoint 逐张量求和 ✓
-    nonMatmulParams: 1_732_128_496,        // embedding 1,271,398,400 + vision 塔 460,730,096:不参与 decode 矩阵乘,roofline 算力行按此扣(6.2%)
+    nonMatmulParams: 1_732_128_496,        // embedding 1,271,398,400 + vision 塔 460,730,096:不参与 decode 矩阵乘。
+                                           // **只用于在 roofline 口径里标注算力行的高估比例(6.2%),不从 FLOPs 里扣** ——
+                                           // 扣了就与另三个模型(没有这个字段、一律含 embedding)口径不一致,ADR-0010 当时选的是「含,高估不到 3%」
   },
   nonExpertFixedDesc: "embed / lm_head / vision / norms,官方 FP8 也保留 BF16",
   nonExpertFixedDtype: "bf16",             // 上面那部分是 BF16,roofline 算力行按 BF16 算(缺省会按 FP8/F32 算)

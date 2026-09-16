@@ -180,6 +180,13 @@ const CASES = [
   { model: "qwen3.8-27b", label: "1×g6e TP1/DP8 · FP8 权重 · 1K/util 0.95", ctxIdx: 0, util: 95,
     state: { instId: "g6e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "fp8", expFmt: "bf16" },
     expect: { bf16: [65536, 64], fp8: [32768, 80] } },
+  // 3 台 = 24 卡:stage 的约数里有 3 / 6 / 12 / 24,都不整除 4 个 kv head 或 16 个 GDN k head。
+  // PR #4 review 抓到建议器曾把 TP6/DP4 当成候选(告警说起不来,卡片却让你「应用到页面」)。
+  // 这条用例钉住:建议里出现的 TP 必须都在合法集合 {1, 2, 4, 8} 里(检查在下面 qwen 专属块)。
+  { model: "qwen3.8-27b", label: "3×p5en TP4/DP6:建议器不得推荐 TP3/6/12/24",
+    state: { instId: "p5en.48xlarge", n: 3, tp: 4, dp: 6, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 300], fp8: [32768, 588] },
+    roof: { conc: 48, stepMs: "6.60", regime: "mem", ridge: "never", kvCross: 101370 } },
 ];
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
@@ -227,10 +234,12 @@ for (const kv of ["bf16", "fp8"]) {
                             totalDeltaBytes: gpuTotal - C.totalUsed,
                             peakUsedGiB: C.used / GIB, minUsedGiB: C.minUsed / GIB,
                             lookupGiB: C.lookup / GIB,
-                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep,
-                            insightHtml: document.getElementById("roofactions").innerHTML,
-                            insightDisplay: document.getElementById("roofactions").style.display });
+                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep });
   render();
+  // 决策层(延迟目标)与通信表都要在 render() 之后读:此前 insightHtml 在 render() 之前取,
+  // 拿到的是上一次渲染的内容(首轮是页面默认状态),延迟目标那一栏的断言其实没对着用例状态查
+  globalThis.__probe[globalThis.__probe.length - 1].insightHtml = document.getElementById("roofactions").innerHTML;
+  globalThis.__probe[globalThis.__probe.length - 1].insightDisplay = document.getElementById("roofactions").style.display;
   globalThis.__probe[globalThis.__probe.length - 1].commHtml =
     document.getElementById("commtbl").innerHTML;
   // roofline(ADR-0010):最忙那张卡的每步下界、regime、拐点、临界上下文
@@ -401,6 +410,12 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
     if (!b.commHtml.includes("dense 模型,没有 MoE 层")) fail.push("dense 模型的通信表应写明没有 MoE 层");
     if (b.ep !== 1 || f.ep !== 1) fail.push(`dense 模型的 EP 应恒为 1,实为 ${b.ep}`);
     if (/data-ep="(?!1")/.test(capacityInsight)) fail.push("dense 模型的同机型建议不应出现 EP≠1 的候选");
+    // 建议器只能给出引擎起得来的 TP:24 q head / 4 kv head / 16 GDN k head → 合法 TP 只有 1 / 2 / 4 / 8
+    for (const [name, html] of [["延迟目标", insight], ["容量目标", capacityInsight]])
+      for (const m of html.matchAll(/data-tp="(\d+)"/g))
+        if (![1, 2, 4, 8].includes(Number(m[1]))) fail.push(`${name}的同机型建议推荐了不合法的 TP${m[1]}(不整除 head 数,引擎会拒绝启动)`);
+    if (c.state.n === 3 && !capacityInsight.includes("data-roof-parallel") && !insight.includes("data-roof-parallel"))
+      fail.push("3×p5en 上过滤掉非法 TP 后,合法候选(如 TP8/DP3、TP2/DP12)仍应存在,不应一个建议都没有");
     // GQA:复制因子随 TP 变,两个方向的告警都要在;KV 单卡份额 = ÷ min(TP, 4)
     if (c.state.tp > 4 && !bannersHtml.includes("超过 n_kv_heads=4")) fail.push("TP>4 时应有「KV 复制」告警");
     if (c.state.tp > 1 && c.state.tp <= 4 && !bannersHtml.includes("KV 不复制")) fail.push("1<TP≤4 时应有「KV 不复制」的 good banner");

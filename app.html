@@ -1476,7 +1476,9 @@ function parallelAlternatives(C, R, goal) {
   // v1 刻意固定 PP,并且不新引入跨 NVLink 域的 TP:
   // roofline 尚未计 PP send/recv、pipeline bubble 与集合通信延迟,让搜索器利用这些缺项会给出假优化。
   const pp = S.pp, stage = W / pp;
-  for (const tp of divisors(stage).filter(x => x <= HW.domain)) {
+  // 不整除 head 数的 TP(ADR-0012 §6)引擎会拒绝启动,不能进候选 —— 否则 3 台上会推荐 TP6、5 台上会推荐 TP5,
+  // 而页面自己的红字告警同时在说这个切分起不来。告警与枚举器必须用同一条约束。
+  for (const tp of divisors(stage).filter(x => x <= HW.domain && !headSplitIssues(x).length)) {
     const dp = stage / tp;
     for (const ep of epOptions(stage)) {
       if (tp === S.tp && dp === S.dp && ep === S.ep) continue;
@@ -1832,7 +1834,7 @@ function renderRoof(C) {
         <li><b>三条线的来源</b>:HBM <code>${fint(sp.hbmGBs)} GB/s</code>、dense 算力 <code>BF16 ${T.bf16} / FP8 ${T.fp8 || "—"} / FP4 ${T.fp4 || "—"} TFLOPS</code>,厂商 datasheet 的 dense 行(不是 sparsity 行)${sp.tflopsSparsityUnstated ? ";<b>但 ${sp.gpu} 的 datasheet 没写 sparse 还是 dense,按原文照录,若实为 sparse 则算力一行松 2 倍</b>" : ""},出处在 <code>data/instances.js</code> 注释里。NVSwitch 按双向合计,EFA 按 <code>${sp.interDomainGbps} Gbps ÷ ${sp.gpusPerInstance} 卡</code> 的线速份额。带宽 / 算力是十进制,字节显示 GiB,时间 = 字节 ÷ (GB/s × 10⁹)。</li>
         <li><b>并发 = 这一步的 token 数</b>(每请求 1 token,不含 MTP / 投机解码);<b>上下文 = 每请求当前长度</b>(显存那边读作最大长度,同一个滑块)。${S.pp > 1 ? `PP=${S.pp}:按 ${S.pp} 个 micro-batch 填满流水,每段 step 用 ⌈并发 ÷ PP⌉ 个 token,不含 send/recv 与气泡。` : ""}</li>
         <li>${M.dense ? "" : `<b>expert 读取按均匀路由的期望</b>:一个专家至少被一个 token 命中的概率 = <code>1 − (1 − ${M.topk}/${fint(M.nExperts)})^${fint(Math.ceil(R.groupTok))}</code> = ${(R.coverage * 100).toFixed(1)}%。真实路由有热点,读得更少,这一项作为下界偏松。`}recurrent state 每步读 + 写各一次(FP32),滑窗环只读。</li>
-        <li><b>算力那一行按权重格式选 dtype</b>(有原生就用原生;MXFP4 / NVFP4 无原生 → FP8,没有 FP8 → BF16),假设激活同精度。${MD.weights.nonMatmulParams ? `参数量含 embedding 与 vision 塔(${(100 * MD.weights.nonMatmulParams / M.totalParams).toFixed(1)}%),它们不参与 decode 的矩阵乘,算力行偏松这么多` : "参数量含 embedding 与 vision 塔,高估不到 3%"}。</li>
+        <li><b>算力那一行按权重格式选 dtype</b>(有原生就用原生;MXFP4 / NVFP4 无原生 → FP8,没有 FP8 → BF16),假设激活同精度。${MD.weights.nonMatmulParams ? `参数量含 embedding 与 vision 塔(${(100 * MD.weights.nonMatmulParams / M.totalParams).toFixed(1)}%),它们不参与 decode 的矩阵乘,算力行把它们也算进去了,因此高估这么多(未扣除,与另三个模型同口径)` : "参数量含 embedding 与 vision 塔,高估不到 3%"}。</li>
         <li><b>没算的</b>:attention 本身的 FLOPs(full attention 层在 128K 以上与矩阵乘同量级,算力行在长上下文下偏松);kernel launch / 调度 / 集合通信延迟;PP 的 send/recv 与气泡;${M.tpShardedBytes ? `${MD.tpShardedShort || "查表"}的读取(每 token 查几十行,KB 量级);` : ""}prefill 与 TTFT;chunked prefill 混进 decode step;效率系数 —— 实测 ÷ 下界要在目标机型上测一次才有,本页不猜。</li>
       </ul></li>`;
 }

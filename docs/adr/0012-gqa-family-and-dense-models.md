@@ -130,7 +130,7 @@ g6e 也是整页里唯一由 12 GiB overhead 猜测直接决定生死的机型�
 
 24 个 q head、4 个 kv head、GDN 的 16 个 k head / 48 个 v head → 合法 TP 只有 `1 / 2 / 4 / 8`。TP=16（两台）被 `24 % 16 ≠ 0` 挡住，vLLM / SGLang 会拒绝启动。
 
-新增 `headSplitIssues(tp)`，不整除时出 `critical` banner，并列出当前卡数下合法的 TP。**只对声明了 `qHeads / kvHeads`（gqa）或 `kHeads`（linear）的层组检查** —— K3 / GLM 的 linear 层组没有 `kHeads`，这条对它们永远为空，输出不变（否则 GLM 在 3 台 / TP=3 下会多出一条正确但此前没有的告警，那属于另一个改动）。
+新增 `headSplitIssues(tp)`，不整除时出 `critical` banner，并列出当前卡数下合法的 TP。**同一条约束也进 ADR-0011 的枚举器**：`parallelAlternatives()` 过滤掉不整除的 TP，否则 3 台（stage 24）上会推荐 TP6/DP4、5 台上 TP5 会进候选 —— 告警说起不来，卡片却让你「应用到页面」。这一条是 PR review 抓出来的：第一版只把检查接进了 banner。顺带修了 `verify-app.js` 探针里的一个旧问题：`insightHtml` 原来在 `render()` 之前读，拿到的是上一次渲染（首轮是页面默认状态）的内容，延迟目标那一栏的断言此前并没有对着用例状态查。**只对声明了 `qHeads / kvHeads`（gqa）或 `kHeads`（linear）的层组检查** —— K3 / GLM 的 linear 层组没有 `kHeads`，这条对它们永远为空，输出不变（否则 GLM 在 3 台 / TP=3 下会多出一条正确但此前没有的告警，那属于另一个改动）。
 
 ### 7. 预设：第四种方向 —— TP 的甜点在 n_kv_heads 上
 
@@ -153,7 +153,7 @@ TP4×DP2 在三个口径下都是 p5en 上最高的一档，b300 / b200 / p5 上
 都是被本模型第一次触发、或本模型让它明显错了的：
 
 - `SERIES[1].short = "routed expert 权重"` 按下标赋值，expert 条目可能不存在后改为按 `key` 查找。
-- roofline 口径里「参数量含 embedding 与 vision 塔，高估不到 3%」写死；Qwen 的 embed（1.27B，查表）+ vision（0.46B，decode 不跑）是 6.2%。data 加可选 `weights.nonMatmulParams`，有则现算比例，无则保留原句。
+- roofline 口径里「参数量含 embedding 与 vision 塔，高估不到 3%」写死；Qwen 的 embed（1.27B，查表）+ vision（0.46B，decode 不跑）是 6.2%。data 加可选 `weights.nonMatmulParams`，有则现算比例，无则保留原句。**只标注，不从 FLOPs 里扣**：扣了就与另三个模型口径不一致，ADR-0010 选的是「含 embedding，高估」，四个模型保持同一方向。
 - 假设区 state 那条的「不到 2%」与临界上下文公式，见 §4。
 - roofline KV 行的「latent 是所有 head 共享的，TP 内每卡读一份完整副本」改为 family 提供 `kvTpDesc`，缺省沿用原句。
 
@@ -161,7 +161,7 @@ TP4×DP2 在三个口径下都是 p5en 上最高的一档，b300 / b200 / p5 上
 
 ## 后果与验证
 
-`verify-app.js` 从 14 个用例扩到 **23 个**，新增 9 条全是本模型，期望值由独立手算脚本给出（输入抄自 config / safetensors / datasheet，按 ADR-0008 / 0009 / 0010 的式子），再与引擎对账 —— **显存侧全部精确一致，roofline 三位有效数字一致，临界上下文在 ±1% 内**：
+`verify-app.js` 从 14 个用例扩到 **24 个**，新增 10 条全是本模型，期望值由独立手算脚本给出（输入抄自 config / safetensors / datasheet，按 ADR-0008 / 0009 / 0010 的式子），再与引擎对账 —— **显存侧全部精确一致，roofline 三位有效数字一致，临界上下文在 ±1% 内**：
 
 | 用例 | 钉住的是什么 | 路数 |
 |---|---|---|
@@ -174,6 +174,7 @@ TP4×DP2 在三个口径下都是 p5en 上最高的一档，b300 / b200 / p5 上
 | `1×g7e TP1/DP8` | 域 = 1 上 TP=1 不出跨域告警；HBM 1597 GB/s → 40.4 ms | 16 |
 | `1×g6e TP1/DP8` BF16 | **装不下**，banner 点出「TP 上限 1，权重切不开」 | 0 |
 | `1×g6e` FP8 · 1K · util 0.95 | 只差 0.5 GiB 的那条线：0.95 装下、0.90 装不下 | 64 |
+| `3×p5en TP4/DP6` | 建议器不得推荐 TP3/6/12/24（§6）；延迟 / 容量两个目标下的候选 TP 都必须在 {1, 2, 4, 8} 内 | 300 |
 
 dense / GQA 专属断言：图例无 `routed expert`、tiles 无 `expert`、无 expert bank 告警、徽章无专家编号、假设区无 expert 参数量条、roofline 无 expert 两行且通信行写明「没有 MoE 层」、EP 恒为 1、同机型建议里没有 EP≠1 的候选、TP>4 有复制告警 / 1<TP≤4 有不复制 banner、hero 在 TP8 写「复制 2 份」、控件改名与隐藏。
 
