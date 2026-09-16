@@ -127,6 +127,68 @@ const CASES = [
     state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
     expect: { bf16: [890, 0], fp8: [890, 0] }, kvFixed: true,
     expectLookupGiB: 189.13 },
+
+  // ---- Qwen3.8-27B(ADR-0012:第一个 dense、第一个 GQA)----
+  // 65,536 B/token = 16 层 × 2 × 4 kv head × 256 × 2 B。KV 复制因子是 max(1, TP/4),不是 TP ——
+  // 所以 TP8 与 TP4 的单卡 KV 份额相同(都是 ÷4),TP8 比 TP4 少一半 DP,并发几乎减半。
+  // 期望值全部来自独立手算脚本(权重 55,562,855,904 B、state 150,994,944 B/请求、每卡 12 GiB overhead)。
+  { model: "qwen3.8-27b", label: "默认 1×p5en TP8/DP1(TP > n_kv_heads,KV ×2)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 53], fp8: [32768, 106] },
+    // 六个预设 @128K/0.90:TP4×DP2 最高(100),TP8(53)与 TP1×DP8(56)打平 —— 甜点在 n_kv_heads 上
+    expectPresets: [53, 100, 84, 56, 46, 16],
+    // 32 路 × 128K:权重 6.47 GiB + 32 路 × 2 GiB KV(÷4 份额,不是 ÷8)+ state 读写 → 71.6 GiB → 16.0 ms
+    roof: { conc: 32, stepMs: "16.0", regime: "mem", ridge: "never", kvCross: 10943 } },
+  { model: "qwen3.8-27b", label: "1×p5en TP4/DP2(TP = n_kv_heads,KV ×1)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 100], fp8: [32768, 196] },
+    roof: { conc: 64, stepMs: "17.7", regime: "mem", ridge: "never", kvCross: 21886 } },
+  // TP=1:每卡背满 51.75 GiB 权重;1 路请求只落在一个 DP rank(8 GiB KV + 144 MiB state)
+  { model: "qwen3.8-27b", label: "1×p5en TP1/DP8(KV ×1,权重 ×8)· 1 路",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 56], fp8: [32768, 120] },
+    expectLoad: { conc: 1, requestsByDp: [1, 0, 0, 0, 0, 0, 0, 0], perDpCapacity: 7, peakUsedGiB: 71.9, minUsedGiB: 63.7 },
+    roof: { conc: 1, stepMs: "13.4", regime: "mem", ridge: "never", kvCross: 843214 } },
+  // PP>1(每个模型必须有一条):KV 与 state 都 ÷PP,权重 ÷TP÷PP
+  { model: "qwen3.8-27b", label: "PP2 1×p5en TP4/DP1/PP2",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 1, pp: 2, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 106], fp8: [32768, 209] },
+    roof: { conc: 16, stepMs: "3.30", regime: "mem", ridge: "never", kvCross: 101370 } },
+  // 1K 上下文:GDN state(144 MiB/请求,FP32)是主导项 —— 单卡 16 MiB KV + 18 MiB state
+  { model: "qwen3.8-27b", label: "1K 上下文:GDN state 是主导项", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 3265], fp8: [32768, 4270] },
+    expectPresets: [3265, 4014, 3504, 2480, 1852, 888],
+    // 1024 路:TP8 的 all-reduce 5.2 ms 已经与算力 7.2 ms 同量级,但 state 读写让 HBM 线仍是 13.1 ms
+    roof: { conc: 1024, stepMs: "13.1", regime: "mem", ridge: "never", kvCross: "always" } },
+  // 官方 FP8 checkpoint(实测 28.75 GiB):权重从 6.47 降到 3.59 GiB/卡,只多出 2 路 —— KV 才是大头
+  { model: "qwen3.8-27b", label: "1×p5en TP8/DP1 · 官方 FP8 权重",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 1, neFmt: "fp8", expFmt: "bf16" },
+    expect: { bf16: [65536, 55], fp8: [32768, 109] },
+    roof: { conc: 32, stepMs: "15.4", regime: "mem", ridge: "never", kvCross: 5055 } },
+  // 无 NVLink 机型(ADR-0001 第一次实际起作用):域 = 1,TP 只能是 1,每卡背满权重
+  { model: "qwen3.8-27b", label: "1×g7e TP1/DP8(无 NVLink,TP 上限 1)",
+    state: { instId: "g7e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 16], fp8: [32768, 40] },
+    roof: { conc: 8, stepMs: "40.4", regime: "mem", ridge: "never", kvCross: 843214 } },
+  // g6e:BF16 权重 51.75 + 12 GiB 超出 40.2 GiB 预算 → 装不下;TP=2 显存够但要跨 PCIe
+  { model: "qwen3.8-27b", label: "1×g6e TP1/DP8 BF16 → 装不下",
+    state: { instId: "g6e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 0], fp8: [32768, 0] } },
+  // g6e + 官方 FP8 + util 0.95 + 1K:装下了,1.7 GiB 余量 → 每卡 8 路。util 0.90 差 0.5 GiB 仍装不下 ——
+  // 12 GiB overhead 那个猜测在这台机器上直接决定生死
+  { model: "qwen3.8-27b", label: "1×g6e TP1/DP8 · FP8 权重 · 1K/util 0.95", ctxIdx: 0, util: 95,
+    state: { instId: "g6e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "fp8", expFmt: "bf16" },
+    expect: { bf16: [65536, 64], fp8: [32768, 80] } },
+  // 3 台 = 24 卡:stage 的约数里有 3 / 6 / 12 / 24,都不整除 4 个 kv head 或 16 个 GDN k head。
+  // PR #4 review 抓到建议器曾把 TP6/DP4 当成候选(告警说起不来,卡片却让你「应用到页面」)。
+  // 这条用例钉住:建议里出现的 TP 必须都在合法集合 {1, 2, 4, 8} 里(检查在下面 qwen 专属块)。
+  { model: "qwen3.8-27b", label: "3×p5en TP4/DP6:建议器不得推荐 TP3/6/12/24",
+    state: { instId: "p5en.48xlarge", n: 3, tp: 4, dp: 6, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [65536, 300], fp8: [32768, 588] },
+    // 探针停在 1 路:此时延迟目标下 TP8/DP3(权重 ÷8)是真改善,候选必然存在,断言才不是空的;
+    // 48 路时 TP4/DP6 自己就是延迟与容量两个目标的最优,没有候选是对的,不是 bug
+    roof: { conc: 1, stepMs: "3.36", regime: "mem", ridge: "never", kvCross: 843214 } },
 ];
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
@@ -174,10 +236,12 @@ for (const kv of ["bf16", "fp8"]) {
                             totalDeltaBytes: gpuTotal - C.totalUsed,
                             peakUsedGiB: C.used / GIB, minUsedGiB: C.minUsed / GIB,
                             lookupGiB: C.lookup / GIB,
-                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep,
-                            insightHtml: document.getElementById("roofactions").innerHTML,
-                            insightDisplay: document.getElementById("roofactions").style.display });
+                            tp: S.tp, dp: S.dp, pp: S.pp, ep: S.ep });
   render();
+  // 决策层(延迟目标)与通信表都要在 render() 之后读:此前 insightHtml 在 render() 之前取,
+  // 拿到的是上一次渲染的内容(首轮是页面默认状态),延迟目标那一栏的断言其实没对着用例状态查
+  globalThis.__probe[globalThis.__probe.length - 1].insightHtml = document.getElementById("roofactions").innerHTML;
+  globalThis.__probe[globalThis.__probe.length - 1].insightDisplay = document.getElementById("roofactions").style.display;
   globalThis.__probe[globalThis.__probe.length - 1].commHtml =
     document.getElementById("commtbl").innerHTML;
   // roofline(ADR-0010):最忙那张卡的每步下界、regime、拐点、临界上下文
@@ -204,6 +268,10 @@ markPreset();
 // 此时降低延迟目标下不应拿同一条「实测校准」重复补满三栏;校准动作只留在「下一次验证」。
 if (${JSON.stringify(c.model)} === "kimi-k3") {
   const keep = { ...S };
+  // 页面默认状态(1 路)下的延迟目标:此前这条断言读的是探针改状态前的首次渲染,恰好就是 1 路;
+  // 探针改为 render() 之后读以后,拿到的是 roof 用例的 64 路 —— 那时 TP4/DP8/EP32 是真改善,所以这里单独渲染 1 路
+  Object.assign(S, { concIdx: 0 }); roofGoal = "latency"; syncOptions("probe"); render();
+  globalThis.__defaultInsight = document.getElementById("roofactions").innerHTML;
   Object.assign(S, { instId: "p6-b300.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32,
                      concIdx: 0, ctxIdx: 0, kvDt: "fp8", neFmt: "bf16", expFmt: "mxfp4" });
   syncOptions("probe"); render();
@@ -303,8 +371,11 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   if (c.model === "kimi-k3") {
     if (!capacityInsight.includes("data-roof-parallel"))
       fail.push("Kimi 容量目标下没有可应用的同机型并行切分");
-    if (!insight.includes("没有可信的同机型切分改善"))
-      fail.push("Kimi 默认延迟目标应诚实说明没有可信的同机型切分改善");
+    if (!String(globalThis.__defaultInsight || "").includes("没有可信的同机型切分改善"))
+      fail.push("Kimi 默认状态(1 路)的延迟目标应诚实说明没有可信的同机型切分改善");
+    // 64 路下 TP4/DP8/EP32 让每个 DP rank 少一半 token,ITL 下界确实更低 —— ADR-0011 对 K3 验证的正是「降 TP 升 DP 减 MLA KV 副本」
+    if (!insight.includes("TP4 / DP8 / PP1 / EP32"))
+      fail.push("Kimi 64 路的延迟目标应给出 TP4/DP8/EP32(每 rank 少一半 token)");
     const exhausted = String(globalThis.__exhaustedInsight || "");
     const exhaustedCards = (exhausted.match(/class="ra-card"/g) || []).length;
     if (exhaustedCards !== 0)
@@ -331,6 +402,45 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
       fail.push("DeepSeek 容量建议应显式写出降低 TP 会增加单卡 engram 的代价");
     if (capacityInsight.includes('data-roof-set="kvDt"'))
       fail.push("DeepSeek 的 KV dtype 架构固定,不应建议切换 KV dtype");
+  }
+
+  if (c.model === "qwen3.8-27b") {
+    // dense(ADR-0012):页面上不能残留任何 MoE 专属的行、徽章、图例;EP 恒为 1
+    const legend = String(els.get("legend")?.innerHTML ?? ""), tiles = String(els.get("tiles")?.innerHTML ?? "");
+    const bannersHtml = String(els.get("banners")?.innerHTML ?? ""), nodes = String(els.get("nodes")?.innerHTML ?? "");
+    const assump = String(els.get("assumplist")?.innerHTML ?? ""), roof = String(els.get("rooftbl")?.innerHTML ?? "");
+    if (legend.includes("routed expert")) fail.push("dense 模型的图例里不应有 routed expert");
+    if (tiles.includes("expert")) fail.push("dense 模型的 tiles 里不应出现 expert");
+    if (bannersHtml.includes("expert bank")) fail.push("dense 模型不应出现 expert bank 复制告警");
+    if (nodes.includes("专家 #")) fail.push("dense 模型的 GPU 徽章里不应有专家编号");
+    if (assump.includes("routed expert 逻辑参数量")) fail.push("dense 模型的假设区不应有 routed expert 参数量那条");
+    if (roof.includes("命中的 routed expert") || roof.includes("命中专家的矩阵乘")) fail.push("dense 模型的 roofline 算式里不应有 expert 行");
+    if (!roof.includes("dense 模型,没有 MoE 层")) fail.push("dense 模型的 roofline 通信行应写明没有 MoE 层");
+    if (!b.commHtml.includes("dense 模型,没有 MoE 层")) fail.push("dense 模型的通信表应写明没有 MoE 层");
+    if (b.ep !== 1 || f.ep !== 1) fail.push(`dense 模型的 EP 应恒为 1,实为 ${b.ep}`);
+    if (/data-ep="(?!1")/.test(capacityInsight)) fail.push("dense 模型的同机型建议不应出现 EP≠1 的候选");
+    // 建议器只能给出引擎起得来的 TP:24 q head / 4 kv head / 16 GDN k head → 合法 TP 只有 1 / 2 / 4 / 8
+    for (const [name, html] of [["延迟目标", insight], ["容量目标", capacityInsight]])
+      for (const m of html.matchAll(/data-tp="(\d+)"/g))
+        if (![1, 2, 4, 8].includes(Number(m[1]))) fail.push(`${name}的同机型建议推荐了不合法的 TP${m[1]}(不整除 head 数,引擎会拒绝启动)`);
+    if (c.state.n === 3 && !capacityInsight.includes("data-roof-parallel") && !insight.includes("data-roof-parallel"))
+      fail.push("3×p5en 上过滤掉非法 TP 后,合法候选(如 TP8/DP3、TP2/DP12)仍应存在,不应一个建议都没有");
+    // GQA:复制因子随 TP 变,两个方向的告警都要在;KV 单卡份额 = ÷ min(TP, 4)
+    if (c.state.tp > 4 && !bannersHtml.includes("超过 n_kv_heads=4")) fail.push("TP>4 时应有「KV 复制」告警");
+    if (c.state.tp > 1 && c.state.tp <= 4 && !bannersHtml.includes("KV 不复制")) fail.push("1<TP≤4 时应有「KV 不复制」的 good banner");
+    if (c.state.tp === 8 && !tiles.includes("复制 <b>2</b> 份")) fail.push("TP8 的 hero 应写 KV 复制 2 份(不是 8 份)");
+    if (c.state.tp === 4 && !tiles.includes("不复制")) fail.push("TP4 的 hero 应写 KV 不复制");
+    if (c.label.startsWith("默认 1×p5en TP8/DP1")) {
+      if (!capacityInsight.includes("TP4 / DP2 / PP1 / EP1")) fail.push("Qwen 容量建议应识别 TP4/DP2(KV 不再复制,DP 翻倍)");
+      if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×2 降到 ×1")) fail.push("Qwen 容量建议应把副本数写成 ×2 → ×1(GQA),不是 ×8 → ×4");
+    }
+    // 无 NVLink 机型上 TP=1:不该有跨域告警;g6e BF16 装不下时要点出「TP 上限是 1,权重切不开」
+    if (c.state.instId === "g7e.48xlarge" && bannersHtml.includes("超出 NVLink 域")) fail.push("g7e TP=1 不应有跨域告警");
+    if (c.state.instId === "g6e.48xlarge" && c.state.neFmt === "bf16" && !bannersHtml.includes("权重切不开")) fail.push("g6e BF16 装不下时应点出 TP 上限 1、权重切不开");
+    // 「非 expert 权重」在 dense 页上应叫「权重」
+    if (String(els.get("precName")?.textContent ?? "") !== "权重") fail.push("dense 模型的权重格式控件应叫「权重」");
+    if (String(els.get("epCtl")?.style?.display) !== "none" || String(els.get("expFmtCtl")?.style?.display) !== "none")
+      fail.push("dense 模型应隐藏 EP 与 expert 权重两个控件");
   }
 
   return { fail, probe: globalThis.__probe, presets: globalThis.__presets };

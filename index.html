@@ -13,6 +13,7 @@
 <script src="data/models/kimi-k3.js"></script>
 <script src="data/models/glm-5.3-flash.js"></script>
 <script src="data/models/deepseek-v4.1-flash.js"></script>
+<script src="data/models/qwen3.8-27b.js"></script>
 <style>
   /* 冷灰色板。浅色是基准,深色是同一组色相按深色底重新取阶(不是自动反色);
      三个 series 色与 app.html 的堆叠条同色,在两种底色上都过了 CVD / 对比度校验。 */
@@ -182,7 +183,7 @@
     <span class="sep"></span>
     <a href="https://github.com/shawnawshk/model-viz/blob/main/docs/instance-specs.md" title="G5–G7 / P4d–P6 共 57 个实例的规格总目录(以 API 的 MiB 为真值)">instance-specs.md</a>
     <span class="sep"></span>
-    <a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr" title="已锁定的设计决策(0010:decode roofline 下界,部分取代 0003 的「只算显存」)">adr/0001–0010</a>
+    <a href="https://github.com/shawnawshk/model-viz/tree/main/docs/adr" title="已锁定的设计决策(0010:decode roofline 下界;0011:同机型 Pareto 反事实;0012:GQA family + dense 模型)">adr/0001–0012</a>
   </div>
 
   <footer id="foot"></footer>
@@ -200,6 +201,8 @@ document.getElementById("models").innerHTML = Object.entries(REG.models).map(([i
   // 第三桶(按 TP 切的查表)只有部分模型有,缺省 0 —— 与 app.html 的口径一致,见 ADR-0009 §1
   const tpSharded = m.weights.tpShardedBytes || 0;
   const nonExpert = m.weights.totalBytes - m.weights.expertBytes - tpSharded;
+  // dense 模型(ADR-0012)没有 moe 块:只有一桶权重,不显示 expert 那一行,「非 expert」这个限定词也不用
+  const dense = !m.moe;
   const total = m.weights.totalBytes;
   const lookupName = m.tpShardedShort || "查表";
   // 堆叠条按三桶的固定顺序:非 expert → expert → 查表;下面的文字行带同色 swatch,身份不靠颜色单独承载
@@ -212,10 +215,10 @@ document.getElementById("models").innerHTML = Object.entries(REG.models).map(([i
     <div class="wbar" role="img" aria-label="权重构成">${segs}</div>
     <div class="wtot">权重合计 ${f1(total / GIB)} GiB</div>
     <div class="spec">
-      <div><span><span class="sw" style="background:var(--series-attn)"></span>非 expert</span><b>${f1(nonExpert / GIB)} GiB</b></div>
-      <div><span><span class="sw" style="background:var(--series-expert)"></span>其中 expert</span><b>${f1(m.weights.expertBytes / GIB)} GiB</b></div>
+      <div><span><span class="sw" style="background:var(--series-attn)"></span>${dense ? "权重(dense,无 MoE)" : "非 expert"}</span><b>${f1(nonExpert / GIB)} GiB</b></div>
+      ${dense ? "" : `<div><span><span class="sw" style="background:var(--series-expert)"></span>其中 expert</span><b>${f1(m.weights.expertBytes / GIB)} GiB</b></div>`}
       ${tpSharded ? `<div><span><span class="sw" style="background:var(--series-lookup)"></span>${lookupName}</span><b>${f1(tpSharded / GIB)} GiB</b></div>` : ""}
-      <div><span>量化</span><b>${m.quantFormat.toUpperCase()}</b></div>
+      <div><span>量化</span><b>${m.quantFormat === "bf16" ? "无(BF16)" : m.quantFormat.toUpperCase()}</b></div>
       <div><span>候选机型</span><b>${m.candidateInstances.length} 个</b></div>
     </div>
   </a>`;
