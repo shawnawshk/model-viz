@@ -186,7 +186,9 @@ const CASES = [
   { model: "qwen3.8-27b", label: "3×p5en TP4/DP6:建议器不得推荐 TP3/6/12/24",
     state: { instId: "p5en.48xlarge", n: 3, tp: 4, dp: 6, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
     expect: { bf16: [65536, 300], fp8: [32768, 588] },
-    roof: { conc: 48, stepMs: "6.60", regime: "mem", ridge: "never", kvCross: 101370 } },
+    // 探针停在 1 路:此时延迟目标下 TP8/DP3(权重 ÷8)是真改善,候选必然存在,断言才不是空的;
+    // 48 路时 TP4/DP6 自己就是延迟与容量两个目标的最优,没有候选是对的,不是 bug
+    roof: { conc: 1, stepMs: "3.36", regime: "mem", ridge: "never", kvCross: 843214 } },
 ];
 
 const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
@@ -266,6 +268,10 @@ markPreset();
 // 此时降低延迟目标下不应拿同一条「实测校准」重复补满三栏;校准动作只留在「下一次验证」。
 if (${JSON.stringify(c.model)} === "kimi-k3") {
   const keep = { ...S };
+  // 页面默认状态(1 路)下的延迟目标:此前这条断言读的是探针改状态前的首次渲染,恰好就是 1 路;
+  // 探针改为 render() 之后读以后,拿到的是 roof 用例的 64 路 —— 那时 TP4/DP8/EP32 是真改善,所以这里单独渲染 1 路
+  Object.assign(S, { concIdx: 0 }); roofGoal = "latency"; syncOptions("probe"); render();
+  globalThis.__defaultInsight = document.getElementById("roofactions").innerHTML;
   Object.assign(S, { instId: "p6-b300.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32,
                      concIdx: 0, ctxIdx: 0, kvDt: "fp8", neFmt: "bf16", expFmt: "mxfp4" });
   syncOptions("probe"); render();
@@ -365,8 +371,11 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   if (c.model === "kimi-k3") {
     if (!capacityInsight.includes("data-roof-parallel"))
       fail.push("Kimi 容量目标下没有可应用的同机型并行切分");
-    if (!insight.includes("没有可信的同机型切分改善"))
-      fail.push("Kimi 默认延迟目标应诚实说明没有可信的同机型切分改善");
+    if (!String(globalThis.__defaultInsight || "").includes("没有可信的同机型切分改善"))
+      fail.push("Kimi 默认状态(1 路)的延迟目标应诚实说明没有可信的同机型切分改善");
+    // 64 路下 TP4/DP8/EP32 让每个 DP rank 少一半 token,ITL 下界确实更低 —— ADR-0011 对 K3 验证的正是「降 TP 升 DP 减 MLA KV 副本」
+    if (!insight.includes("TP4 / DP8 / PP1 / EP32"))
+      fail.push("Kimi 64 路的延迟目标应给出 TP4/DP8/EP32(每 rank 少一半 token)");
     const exhausted = String(globalThis.__exhaustedInsight || "");
     const exhaustedCards = (exhausted.match(/class="ra-card"/g) || []).length;
     if (exhaustedCards !== 0)
