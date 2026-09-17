@@ -171,15 +171,16 @@ const CASES = [
     state: { instId: "g7e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
     expect: { bf16: [65536, 16], fp8: [32768, 40] },
     roof: { conc: 8, stepMs: "40.4", regime: "mem", ridge: "never", kvCross: 843214 } },
-  // g6e:BF16 权重 51.75 + 12 GiB 超出 40.2 GiB 预算 → 装不下;TP=2 显存够但要跨 PCIe
-  { model: "qwen3.8-27b", label: "1×g6e TP1/DP8 BF16 → 装不下",
-    state: { instId: "g6e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
+  // 2026-09-17:g6e 不再是候选(它的生死线由未校准的 12 GiB overhead 单独决定,见
+  // qwen3.8-27b.js 的 candidateInstances 注释),原先那两条 g6e 用例删除。本模型的「装不下」
+  // 用例改由 1M 上下文 + g7e TP1×DP8 承担 —— 权重装得下但**一路 KV 都放不进**,
+  // 与 DSv4.1 那条「权重本身就超预算」是不同的代码路径,两条都要留。
+  // 手算:g7e 预算 96 × 0.90 = 86.4;权重 55,562,855,904 B ÷ TP1 = 51.7465,+12 overhead = 63.7465
+  //   → 余量 22.6535 GiB。1M 单路 BF16 = 64.0 KV + 0.1406 state = 64.1406 GiB > 22.65 → 0 路;
+  //   FP8 = 32.0 + 0.1406 = 32.1406 GiB,仍 > 22.65 → 也是 0 路(切 dtype 救不回来)。
+  { model: "qwen3.8-27b", label: "1×g7e TP1/DP8 · 1M → 一路 KV 都放不进", ctxIdx: 10,
+    state: { instId: "g7e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "bf16", expFmt: "bf16" },
     expect: { bf16: [65536, 0], fp8: [32768, 0] } },
-  // g6e + 官方 FP8 + util 0.95 + 1K:装下了,1.7 GiB 余量 → 每卡 8 路。util 0.90 差 0.5 GiB 仍装不下 ——
-  // 12 GiB overhead 那个猜测在这台机器上直接决定生死
-  { model: "qwen3.8-27b", label: "1×g6e TP1/DP8 · FP8 权重 · 1K/util 0.95", ctxIdx: 0, util: 95,
-    state: { instId: "g6e.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1, neFmt: "fp8", expFmt: "bf16" },
-    expect: { bf16: [65536, 64], fp8: [32768, 80] } },
   // 3 台 = 24 卡:stage 的约数里有 3 / 6 / 12 / 24,都不整除 4 个 kv head 或 16 个 GDN k head。
   // PR #4 review 抓到建议器曾把 TP6/DP4 当成候选(告警说起不来,卡片却让你「应用到页面」)。
   // 这条用例钉住:建议里出现的 TP 必须都在合法集合 {1, 2, 4, 8} 里(检查在下面 qwen 专属块)。
@@ -434,9 +435,12 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
       if (!capacityInsight.includes("TP4 / DP2 / PP1 / EP1")) fail.push("Qwen 容量建议应识别 TP4/DP2(KV 不再复制,DP 翻倍)");
       if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×2 降到 ×1")) fail.push("Qwen 容量建议应把副本数写成 ×2 → ×1(GQA),不是 ×8 → ×4");
     }
-    // 无 NVLink 机型上 TP=1:不该有跨域告警;g6e BF16 装不下时要点出「TP 上限是 1,权重切不开」
+    // 无 NVLink 机型上 TP=1:不该有跨域告警
     if (c.state.instId === "g7e.48xlarge" && bannersHtml.includes("超出 NVLink 域")) fail.push("g7e TP=1 不应有跨域告警");
-    if (c.state.instId === "g6e.48xlarge" && c.state.neFmt === "bf16" && !bannersHtml.includes("权重切不开")) fail.push("g6e BF16 装不下时应点出 TP 上限 1、权重切不开");
+    // 已知覆盖缺口(2026-09-17):「TP 上限 1,权重切不开」那条 banner 现在**没有用例覆盖**。
+    // 它要求「无 NVLink 且权重本身超预算」,而 g6e 撤出候选后,四个模型的候选里再没有这种机型
+    // (g7e 96 GiB 上 Qwen BF16 权重 63.75 < 86.4 预算,装得下)。这条路径因此在 UI 上不可达。
+    // 不用后门 state 去测一个用户选不到的机型 —— 等 overhead 提为输入、g6e 可能加回时再补。
     // 「非 expert 权重」在 dense 页上应叫「权重」
     if (String(els.get("precName")?.textContent ?? "") !== "权重") fail.push("dense 模型的权重格式控件应叫「权重」");
     if (String(els.get("epCtl")?.style?.display) !== "none" || String(els.get("expFmtCtl")?.style?.display) !== "none")
