@@ -2,3 +2,5 @@
 CLAUDE.local.md
 # Superdesign 的仓库分析缓存与画布状态,本地工作文件。
 .superdesign/
+# 2026-09-16 的一次性显存口径实测(临时 K8s manifest + 引擎日志),跑完即删。
+verify-vllm/

@@ -1088,7 +1088,11 @@ const SERIES = [
     pvNote: MD.kvDtypeFixed ? "字节数由参考实现的量化调用直接给出,不是引擎选项" : "元素数由 config.json 推导;字节数取决于引擎的 --kv-cache-dtype" },
   { key: "state",  cls: "s-kda",    varName: "--series-kda",    label: `${STATE_LABEL}(只随并发涨)`, short: STATE_LABEL, pv: "e",
     pvNote: MD.stateNote || "结构由 config 推导,但 state dtype 假设为 FP32(若引擎用 BF16 则减半)" },
-  { key: "oh",     cls: "s-oh",     varName: "--overhead",      label: "激活 + 通信 buffer(估 12 GiB)", short: "激活 + buffer", pv: "g", pvNote: "纯猜测,无实测依据;实际随 batch、CUDA graph、DeepEP buffer 变化" },
+  // pv 仍是「猜测」:页面用的 12 GiB 本身不是实测值。但 2026-09-16 已有一档实测
+  // (docs/measurements.md M-001),所以 pvNote 里不能再写「无实测依据」——那句已被证伪。
+  // 反过来也不能拿那一档去声称本页普遍偏保守:同一个替换在 g7e/TP1 上是 50% 而不是 5%,
+  // 而且别处的真实开销可能超过 12 GiB。结论一律限定在实测的那个配置上。
+  { key: "oh",     cls: "s-oh",     varName: "--overhead",      label: "激活 + 通信 buffer(估 12 GiB)", short: "激活 + buffer", pv: "g", pvNote: "12 GiB 是拍的常数,不是实测值。唯一一档实测:GLM-5.3-Flash / TP8 / p5en 上引擎自报 6.98 GiB(non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20),仅在那一个配置上本页高约 72%。换模型 / 换 TP 不能照搬,别处的真实开销也可能超过 12 GiB。实际随 batch、CUDA graph、DeepEP buffer 变化" },
 ];
 SERIES.find(s => s.key === "attn").short = NE_LABEL;
 { const e = SERIES.find(s => s.key === "expert"); if (e) e.short = "routed expert 权重"; }
@@ -1307,7 +1311,7 @@ function render() {
       <b>它与 recurrent state 的关键差别:TP 切不掉。</b>环里存的是所有 head 共享的 ${MD.layers.find(g => FAMILY[g.family].perReqBytes(g) > 0).windowElems} 维 latent,所以每张卡一份完整副本 —— 行为与 KV cache 相同,与 per-head 的 recurrent state 相反。峰值单卡占用 = <code>ceil(并发 ÷ DP) × ${(M.windowBytesPerReq / 1048576).toFixed(3)} MiB ÷ PP</code>(<b>没有 ÷TP</b>)。<br>
       与 KV 相等的临界上下文 = <code>${fint(M.windowBytesPerReq)} ÷ ${fint(C.kvBytesPerToken)}</code> ≈ <b>${fint(Math.round(M.windowBytesPerReq / C.kvBytesPerToken))} tokens</b> —— 短于这个长度,这个定长 buffer 就比真正的 KV 还大。拖到 1K 上下文看得最清楚。<br>
       <b>存储 dtype 是假设</b>:参考实现分配的是默认 dtype(BF16),但注释说数值上是 FP8;若引擎直接存 FP8 则本项减半。</li>` : ""}
-    <li><b>12 GiB/卡的激活 + 通信 buffer 是粗估</b>,实际随 batch、CUDA graph、DeepEP buffer 大小变化。</li>
+    <li><b>12 GiB/卡的激活 + 通信 buffer 是拍的常数,不是实测值</b>。<b>只有一档实测,而且只对那一档成立</b>:2026-09-16 在 p5en 上对 GLM-5.3-Flash 起了一次服务(TP8、<code>util 0.90</code>、<code>max-num-seqs 512</code>),引擎自报 <code>non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20 = 6.98 GiB</code> —— <b>在那一个配置上</b>本页高约 72%,它的路数因此偏低约 5%(53 → 56,引擎自报上限 55.15)。<br><b>换模型、换 TP、换 batch 都不能照搬这个差值,方向也不保证</b>:同样做这个替换,Qwen3.8-27B 在 g7e/TP1 上是 16 → 24 路(<b>50%</b>,不是 5%);而 TP=1 没有跨卡通信 buffer、激活却不分片,DeepSeek-V4.1-Flash 的 <code>hc_mult = 4</code> 更意味着残差流 4 份副本、激活峰值本该更大 —— <b>别处的真实开销也可能超过 12 GiB,那时本页会高估容量</b>。三项分量各随 TP 规模与拓扑、<code>max_num_batched_tokens</code>、CUDA graph capture 形状数变化。实测细节见 <code>docs/measurements.md</code> M-001。</li>
     <li>PP 的层切分按均分算,<b>忽略了</b> embedding(stage 0)、LM head(末 stage)和 ${kvFamilyName} 层分布不均带来的 stage 失衡。</li>
     ${roofAsm}
   `;

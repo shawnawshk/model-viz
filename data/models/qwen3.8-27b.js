@@ -82,15 +82,24 @@ REG.models["qwen3.8-27b"] = {
 
   // ---- 候选实例:业务判断(ADR-0005 §2)。2026-09-16 由本次会话拟定,未逐个与用户确认,可删。
   // 前三个模型都是 P 系那 4 个;这个模型 51.75 GiB 权重一张卡就装得下,G 系与 H100 80GB 才是它真正会被部署的地方,
-  // 所以在 4 个 P 系(便于四个模型并排比较)之外加了 p5 / g7e / g6e:
+  // 所以在 4 个 P 系(便于四个模型并排比较)之外加了 p5 / g7e:
   //   p5(H100 80GB):TP4×DP2 @128K/0.90 = 46 路,TP1×DP8 只剩 8 路(每卡 63.75 GiB 权重 + overhead,只剩 8 GiB 给 KV)
-  //   g7e(RTX PRO 6000 96GB,无 NVLink):TP 上限 1,TP1×DP8 @128K/0.90 = 16 路 —— ADR-0001 第一次实际咬人的机型
-  //   g6e(L40S 44.7GB,无 NVLink):BF16 权重 51.75 + 12 GiB overhead 装不下;TP=2 显存够但要跨 PCIe;
-  //       切官方 FP8(28.75 GiB)在 util 0.90 下仍差 0.5 GiB,util 0.95 才装下,1K 上下文 64 路 ——
-  //       整页里唯一由「12 GiB overhead 猜测」直接决定生死的机型,留着就是为了把这件事摆出来
+  //   g7e(RTX PRO 6000 96GB,无 NVLink):TP 上限 1,TP1×DP8 @128K/0.90 = 16 路 —— ADR-0001 第一次实际咬人的机型。
+  //       余量 22.6(BF16)/ 45.7(FP8)GiB,远大于 overhead 假设的误差,所以那个猜测在这台机器上
+  //       翻不了「装得下」的结论,只影响路数(12 → 6.98 GiB 会让 128K 从 16 变 24 路)。
+  //
+  // 2026-09-17 移除 g6e(L40S 44.7GB)。理由不是「它装不下」,而是**本工具在这台机器上答不了**:
+  //   util 0.90 的预算只有 40.23 GiB,官方 FP8 权重 28.75 GiB,余量 11.5 GiB —— 而 2026-09-16 在 p5en 上
+  //   实测到的非权重非 KV 开销是 6.98 GiB(non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20),
+  //   与本页硬写的 12 GiB 差 5 GiB,而这 5 GiB 恰好跨过 g6e 的生死线:12 GiB 下判「装不下,0 路」,
+  //   6.98 GiB 下 1K 上下文是 176 路。红字的方向由一个未校准的常量单独决定,而摆一台答不了的机器
+  //   配一个自信的红字是最坏的选项,所以先撤掉。
+  //   注意那 6.98 是 GLM / TP8 / p5en 的值,**不能直接搬到 Qwen / TP1 / g6e** —— TP1 没有 NCCL buffer 那 1.74,
+  //   但激活不分片又可能更大。所以这不是「换个数就对了」,是「这台机器上没有可信的数」。
+  //   等 overhead 提为界面输入(实测细节见 docs/measurements.md M-001)再考虑加回。
   candidateInstances: [
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5e.48xlarge",
-    "p5.48xlarge", "g7e.48xlarge", "g6e.48xlarge",
+    "p5.48xlarge", "g7e.48xlarge",
   ],
   defaultInstance: "p5en.48xlarge",
   // 起始切分故意选「传统」的 TP8/DP1(8 卡机器上的反射动作):TP 超过 n_kv_heads=4 之后 KV 开始复制 2 份,
@@ -168,12 +177,21 @@ REG.models["qwen3.8-27b"] = {
     + `(kv head 允许 TP 是它的倍数,那就是复制)。TP=16(两台)被 <code>24 % 16 ≠ 0</code> 挡住,vLLM / SGLang 会拒绝启动 —— `
     + `本页选到这类切分会出红字,数字按机械除法算出,不代表可部署。所以这个模型<b>跨机器只能靠 DP 或 PP</b>,而一张卡就装得下它,跨机器本来也没必要。`,
 
-    `<b>每卡 12 GiB overhead 那个猜测在小模型上分量更大。</b>TP=8 时每卡权重只有 6.47 GiB,overhead 是权重的 <b>1.9 倍</b>;`
-    + `g6e(44.7 GiB)上它直接决定装不装得下(FP8 权重 28.75 + 12 = 40.75 GiB,util 0.90 的预算是 40.23)。`
+    `<b>每卡 12 GiB overhead 那个猜测在四个模型里对本模型影响最大,而它在本模型上的方向未知。</b>TP=8 时每卡权重只有 6.47 GiB,`
+    + `overhead 是权重的 <b>1.9 倍</b>。2026-09-16 在 p5en 上对 GLM-5.3-Flash 起了一次服务,引擎自报的非权重非 KV 开销是 `
+    + `<b>6.98 GiB</b>(non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20),<b>在那个配置上</b>本页高了约 72%。`
+    + `<b>但这个差值搬不到本模型头上</b>:同样把 12 换成 6.98,GLM 在 p5en/TP8 上是 53 → 56 路(5%),`
+    + `而本模型在 g7e/TP1 上是 16 → 24 路(<b>50%</b>)—— 幅度差一个量级,正因为小模型上 overhead `
+    + `占固定开销的比重大得多。<b>方向也不保证</b>:TP=1 没有跨卡通信 buffer,可是激活不分片又可能更大,`
+    + `所以本模型的真实开销未必低于 12 GiB。它<b>能翻转小显存机型的装不装得下</b>:原候选里的 g6e(44.7 GiB)`
+    + `就是被这 5 GiB 单独决定的,已因此撤出候选,见 <code>candidateInstances</code> 的注释。<br>`
     + `vLLM recipe 还记了一件与本页口径相反的事:CUDA graph capture 的分配<b>在 util 预算之外</b>(1× 5090 上「0.80 和 0.93 都只剩 47 MiB」,`
     + `要 <code>--enforce-eager</code> 才起得来),而本页把 12 GiB 整个放在预算之内。两种口径都不算错,但反解 overhead 时要先对齐这一点。`
-    + `recipe 里那组引擎自报数(2× 5090 TP2、FP8 权重 14.28 GiB/卡、FP8 KV、262K:KV 池 377,456 tokens)是本项目见到的第一组 <code>measured</code>,`
-    + `但它不在 AWS 机型上、且 vLLM 混合池(attention KV 与 GDN state 共享、按页对齐)的分配规则本页不建模,所以不能直接拿来反解。`,
+    + `recipe 里那组引擎自报数(2× 5090 TP2、FP8 权重 14.28 GiB/卡、FP8 KV、262K:KV 池 377,456 tokens)是本项目见到的第一组`
+    + `<b>引擎自报</b>读数,但按 <code>docs/glossary.md</code> 的 provenance 定义它<b>不计入 <code>measured</code></b> —— 那一级要求`
+    + `「目标硬件实测」,而 5090 既不在候选机型里、这组数也不是本项目跑出来的。<b>唯一进入 <code>measured</code> 的是`
+    + `<code>docs/measurements.md</code> M-001</b>(p5en 上的 GLM-5.3-Flash)。`
+    + `加上 vLLM 混合池(attention KV 与 GDN state 共享、按页对齐)的分配规则本页不建模,这组 5090 数字也不能直接拿来反解。`,
 
     `<b>roofline 的算力行在这个模型上比在 MoE 模型上更松。</b>两件事:(1) attention 本身的 FLOPs 未计,而 128K 下它是 `
     + `<code>4 × 131,072 × 24 head × 256 × 16 层 ≈ 51.5 GFLOP/token</code>,与权重矩阵乘的 <code>2 × 27.78B = 55.6 GFLOP</code> <b>同量级</b> —— `
