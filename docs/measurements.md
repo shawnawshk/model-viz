@@ -1,7 +1,11 @@
 # 实测记录
 
-本项目至今**唯一**的 `measured` 一级数据。每条记录必须写全:机型、切分、引擎版本行为、完整的
-serve 参数、引擎原话、以及**这条实测能推广到哪、不能推广到哪**。
+本项目至今**唯一**的 `measured` 一级数据。每条记录必须写全:机型、切分、**引擎版本(带 commit)与
+模型 revision**、引擎实际生效的关键配置、完整的 serve 参数、引擎原话、以及**这条实测能推广到哪、
+不能推广到哪**。凡是当时没记下、事后无法恢复的标识符,**明写「已丢」,不许含糊过去**。
+
+> 教训(M-001):按可变 tag 拉镜像、`hf download` 不带 `--revision`,事后就只能靠引擎自报的
+> 版本号补救。**以后做实测一律 pin 住镜像 digest 与模型 revision。**
 
 口径约定见 [glossary.md](glossary.md) 的 provenance 五级;为什么必须靠实测消除假设见
 `adr/0004`、`adr/0007`、`adr/0008`、`adr/0009`。
@@ -14,9 +18,41 @@ serve 参数、引擎原话、以及**这条实测能推广到哪、不能推广
 共用同一个常数,而它直接决定最大并发。ADR-0004 / 0007 里反复写的消除办法是「在目标机型上起一次
 服务,读引擎自报的数反解」—— 这是第一次真的做。
 
-### 配置
+### 版本与来源(定死,便于复现)
 
-vLLM(镜像 `vllm/vllm-openai:glm53-flash`),单台 p5en.48xlarge(8×H200),`serve` 参数:
+| 项 | 值 | 可复现性 |
+|---|---|---|
+| 硬件 | AWS `p5en.48xlarge`,8×H200 | 定死 |
+| vLLM | **`0.28.1rc1.dev580+g385dce36b`**(git commit `385dce36b`) | **定死** —— 引擎自报,见 `core.py:123` |
+| 容器镜像 | tag `vllm/vllm-openai:glm53-flash` | **digest 已丢**,见下 |
+| 模型权重 | `zai-org/GLM-5.3-Flash`,`hf download` 未带 `--revision`(引擎自报 `revision=None`) | **未 pin**,见下 |
+
+**镜像 digest 不可恢复。** 当时按 tag 拉取,节点已销毁,而这个 tag 是可变的 —— 现在去查
+registry 拿到的是「现在」的 digest,不能证明是 2026-09-16 拉到的那一个。所以镜像层面
+**只能靠上面那个 vLLM commit 定位**;它才是决定 allocator / CUDA-graph / 显存记账行为的东西。
+
+**模型 revision 未 pin,但几乎可以确定。** 下载时没写 `--revision`,取的是当时的 `main`。
+HF 上该仓库的 `lastModified` 是 **2026-09-07T12:13:47Z**,早于本次实测(09-16),
+而当前 `main` 的 sha 是 `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` —— 时间上它就是当时那一份,
+**但本次运行没有把它记下来,所以这是推断不是证据**。以后做实测一律带 `--revision`。
+
+### 引擎实际生效的配置
+
+下面这几项直接决定这份显存账,复现时必须一致(全部摘自引擎自报的 `core.py:123` 那行):
+
+| 项 | 值 | 为什么重要 |
+|---|---|---|
+| `max_num_batched_tokens` | **8192** | 决定 4.04 GiB 的激活峰值 |
+| `cudagraph_mode` | `FULL_AND_PIECEWISE`,`max_cudagraph_capture_size = 512` | 决定 1.2 GiB 的 CUDA graph 那一项 |
+| `enable_prefix_caching` | `True` | 它使 Mamba cache 走 `'align'` 模式 → attention page 撑到 640 tokens、mamba page padding 20.75% |
+| `enable_chunked_prefill` | `True` | 与上面的 token 预算配套 |
+| `compilation mode` | `NONE`(`enforce_eager=False`) | 未开 inductor 编译;开了会改激活峰值 |
+| `quantization` / `dtype` | `fp8` / `torch.bfloat16` | 权重 38.24 GiB 的前提 |
+| `seed` | `0` | — |
+
+### `serve` 参数
+
+单台 p5en.48xlarge(8×H200):
 
 ```
 /root/.cache/huggingface/GLM-5.3-Flash
@@ -98,5 +134,10 @@ core.py:379           init engine (profile, create kv cache, warmup model) took 
 ### 原始件
 
 完整启动日志(5,816 行)当时抓在工作机的 `verify-vllm/glm53-p5en-util090.log`,**未入库**
-(一次性实验产物)。上面「引擎原话」一节是逐字摘录,配上完整的 serve 参数已足以复现:
-在 p5en 上按同一组参数起一次服务,读 `gpu_worker.py` 与 `kv_cache_utils.py` 那几行即可。
+(一次性实验产物)。上面「引擎原话」一节是逐字摘录。
+
+**复现条件,按可靠性排序**:在 p5en 上用 **vLLM commit `385dce36b`**、同一组 serve 参数、
+以及上面「引擎实际生效的配置」那张表里的各项,起一次服务,读 `gpu_worker.py:876` 与
+`kv_cache_utils.py:2315` 两行即可。**若换了 vLLM 版本,这份账不保证可复现** —— allocator、
+CUDA-graph 记账、混合池分页规则都在版本间变过。镜像 digest 与模型 revision 当时没记(见上),
+所以严格意义上这条实测**只能近似复现,不能逐字复现**。
