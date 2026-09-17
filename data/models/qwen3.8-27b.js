@@ -187,8 +187,11 @@ REG.models["qwen3.8-27b"] = {
     + `就是被这 5 GiB 单独决定的,已因此撤出候选,见 <code>candidateInstances</code> 的注释。<br>`
     + `vLLM recipe 还记了一件与本页口径相反的事:CUDA graph capture 的分配<b>在 util 预算之外</b>(1× 5090 上「0.80 和 0.93 都只剩 47 MiB」,`
     + `要 <code>--enforce-eager</code> 才起得来),而本页把 12 GiB 整个放在预算之内。两种口径都不算错,但反解 overhead 时要先对齐这一点。`
-    + `recipe 里那组引擎自报数(2× 5090 TP2、FP8 权重 14.28 GiB/卡、FP8 KV、262K:KV 池 377,456 tokens)是本项目见到的第一组 <code>measured</code>,`
-    + `但它不在 AWS 机型上、且 vLLM 混合池(attention KV 与 GDN state 共享、按页对齐)的分配规则本页不建模,所以不能直接拿来反解。`,
+    + `recipe 里那组引擎自报数(2× 5090 TP2、FP8 权重 14.28 GiB/卡、FP8 KV、262K:KV 池 377,456 tokens)是本项目见到的第一组`
+    + `<b>引擎自报</b>读数,但按 <code>docs/glossary.md</code> 的 provenance 定义它<b>不计入 <code>measured</code></b> —— 那一级要求`
+    + `「目标硬件实测」,而 5090 既不在候选机型里、这组数也不是本项目跑出来的。<b>唯一进入 <code>measured</code> 的是`
+    + `<code>docs/measurements.md</code> M-001</b>(p5en 上的 GLM-5.3-Flash)。`
+    + `加上 vLLM 混合池(attention KV 与 GDN state 共享、按页对齐)的分配规则本页不建模,这组 5090 数字也不能直接拿来反解。`,
 
     `<b>roofline 的算力行在这个模型上比在 MoE 模型上更松。</b>两件事:(1) attention 本身的 FLOPs 未计,而 128K 下它是 `
     + `<code>4 × 131,072 × 24 head × 256 × 16 层 ≈ 51.5 GFLOP/token</code>,与权重矩阵乘的 <code>2 × 27.78B = 55.6 GFLOP</code> <b>同量级</b> —— `
