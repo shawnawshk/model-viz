@@ -683,26 +683,25 @@ for (const id of MD.candidateInstances) {
     throw new Error(`机型 ${id} 缺 hbmGBs / denseTflops.bf16,roofline 无法计算`);
 }
 
-// 40 与 80 是为了让「总卡数」永远落在梯子上:台数下拉是 1/2/3/4/5/6/8/10/12/16,
-// 每机型都是 8 卡,于是卡数 ∈ {8,16,24,32,40,48,64,80,96,128} —— 原来缺 40(5 台)与 80(10 台)。
-// 见下面 concIdxForWorld 的注释。
+// 40 与 80 是为了让「能被 DP 整除的最小一档」总能找到。DP 可以是总卡数的任意约数,而 5 台 /
+// 10 台(40 / 80 卡)下 DP 可取 5 / 10 / 20 —— 梯子里原本没有它们的倍数(48、96、128 都不被
+// 5 整除)。加上这两档后,78 种可达的(卡数, DP)组合全部有解。见下面 concIdxForDp。
 const CONC_STEPS = [1,2,4,8,16,24,32,40,48,64,80,96,128,192,256,384,512,768,1024,1536,2048,3072,4096];
 const CTX_STEPS  = [1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576];
 
-// 并发的默认档 = 该切分的总卡数,即「每张卡平均 1 路」。
+// 并发的默认档 = **DP**,即「每个 DP rank 恰好 1 路」。
 // 为什么不是 1:一个请求整路落在一个 DP rank 上(不能均摊成分数请求),所以 DP>1 时 1 路的分配是
-// [1,0,0,…] —— 图上只有第一张卡有 KV,看着像坏了。而卡数一定能被 DP 整除(引擎硬断言
-// TP×DP×PP = 卡数),所以这个默认值**保证**每个 DP rank 拿到相同的整数路数。固定 8 做不到这一点:
-// GLM 的「两台 TP1×DP16」与 K3 的「反例 纯 DP32」在 8 路下仍然不均。
-// 代价:K3 的「方案 1 TP32/EP32」上限只有 20 路,卡数 32 → 一点开就红。那是真话(TP32 跨 4 个
-// NVLink 域,连每卡 1 路都做不到),刻意不回避 —— 28 个切分里只有这一个会红。
-const concIdxForWorld = w => {
-  const i = CONC_STEPS.indexOf(w);
-  if (i >= 0) return i;
-  // 卡数不在梯子上(将来出现非 8 卡机型时)→ 退到不超过它的最大一档,仍尽量贴近「每卡 1 路」
-  let j = 0;
-  while (j + 1 < CONC_STEPS.length && CONC_STEPS[j + 1] <= w) j++;
-  return j;
+// [1,0,0,…] —— 图上只有第一张卡有 KV,看着像坏了。均匀的充要条件就是「conc 能被 DP 整除」,
+// 而 DP 是满足它的**最小**值 —— 所以本来就均匀的配置(DP=1)仍然停在 1 路,不会被推成红字。
+//
+// **不能用总卡数。** 一个 DP rank 跨 TP×PP 张卡,所以 conc=卡数 会让每个 rank 拿 TP×PP 路,
+// 不是每卡 1 路:K3 默认 TP8/DP4 会变成每 rank 8 路;K3 的 TP32/DP1 本来 1 路就完全均匀,
+// 却会被设成 32 路而它上限只有 20 —— 白白撞红。这是本函数第一版犯的错。
+const concIdxForDp = dp => {
+  const i = CONC_STEPS.findIndex(c => c % dp === 0);   // 能被 DP 整除的最小一档
+  // 可达组合都有解,所以 -1 只可能来自将来新增的机型 / 台数。那时退到 1 路 ——
+  // 宁可显示不均,也不要静默给一个不能被 DP 整除的数。
+  return i >= 0 ? i : 0;
 };
 
 const PRESETS = MD.presets.filter(p => {
@@ -729,8 +728,8 @@ const qsInst = new URLSearchParams(location.search).get("instance");
 const initInst = MD.candidateInstances.includes(qsInst) ? qsInst : MD.defaultInstance;
 const S = { instId: initInst,
             ...MD.defaultParallel,             // 起始切分是 per-model 的:K3 要 4 台起,GLM 一台就够
-            // 并发默认「每卡 1 路」= 总卡数,理由见 concIdxForWorld
-            concIdx: concIdxForWorld(MD.defaultParallel.n * REG.instances[initInst].gpusPerInstance),
+            // 并发默认「每个 DP rank 1 路」= DP,理由见 concIdxForDp
+            concIdx: concIdxForDp(MD.defaultParallel.dp),
             ctxIdx: 7, util: 90,
             expFmt: MD.quantFormat,                    // 默认原生格式
             neFmt: MD.nonExpertFormats[0].id,          // 默认实际存储格式
@@ -1942,14 +1941,15 @@ document.getElementById("presets").innerHTML = PRESETS.map((p, i) =>
 document.getElementById("presets").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
   const p = PRESETS[+b.dataset.i];
-  // 并发一并回到该预设的「每卡 1 路」:预设描述的是并行切分,不是负载,所以不该受上一次拖到哪的影响。
-  // **不能回到 1 路** —— 预设里 DP 最大的那几个(GLM 的 TP1×DP8 / 两台 TP1×DP16、K3 的纯 DP32)
-  // 在 1 路下只有第一张卡有 KV,而这些恰恰是最该看清每卡分布的按钮。见 concIdxForWorld。
+  // 并发一并回到该预设的「每个 DP rank 1 路」= DP:预设描述的是并行切分,不是负载,
+  // 所以不该受上一次拖到哪的影响。**DP>1 的预设不能回到 1 路** —— GLM 的 TP1×DP8 /
+  // 两台 TP1×DP16、K3 的纯 DP32 在 1 路下只有第一张卡有 KV,而这些恰恰是最该看清每卡分布的按钮。
+  // DP=1 的预设仍然停在 1 路(DP 就是 1),不会被推成红字。见 concIdxForDp。
   // util / 上下文 / 两个 dtype / 两个权重格式一律「不」重置 —— 它们是页面的全局口径,
   // 你拖到 1M 上下文就是想在 1M 下比较几个切分,预设不该把它拽回去。
   // 代价是按钮上的路数必须现算(下面 markPreset),不能写死在数据文件里。
   Object.assign(S, { instId: p.inst, n: p.n, tp: p.tp, dp: p.dp, pp: p.pp, ep: p.ep,
-                     concIdx: concIdxForWorld(p.n * REG.instances[p.inst].gpusPerInstance) });
+                     concIdx: concIdxForDp(p.dp) });
   syncOptions("preset"); syncLoadLabels(); render(); markPreset();
 });
 
