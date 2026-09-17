@@ -96,7 +96,7 @@ REG.models["qwen3.8-27b"] = {
   //   配一个自信的红字是最坏的选项,所以先撤掉。
   //   注意那 6.98 是 GLM / TP8 / p5en 的值,**不能直接搬到 Qwen / TP1 / g6e** —— TP1 没有 NCCL buffer 那 1.74,
   //   但激活不分片又可能更大。所以这不是「换个数就对了」,是「这台机器上没有可信的数」。
-  //   等 overhead 提为界面输入(见 verify-vllm/README.md §0)再考虑加回。
+  //   等 overhead 提为界面输入(实测细节见 docs/measurements.md M-001)再考虑加回。
   candidateInstances: [
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5e.48xlarge",
     "p5.48xlarge", "g7e.48xlarge",
@@ -179,10 +179,12 @@ REG.models["qwen3.8-27b"] = {
 
     `<b>每卡 12 GiB overhead 那个猜测在小模型上分量更大,而且现在知道它偏高。</b>TP=8 时每卡权重只有 6.47 GiB,`
     + `overhead 是权重的 <b>1.9 倍</b>。2026-09-16 在 p5en 上对 GLM-5.3-Flash 起了一次服务,引擎自报的非权重非 KV 开销是 `
-    + `<b>6.98 GiB</b>(non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20)—— 本页这个常量高了约 72%,`
-    + `因此<b>本页所有路数都偏保守约 5%</b>(同一台 p5en 上 TP8/DP1 从 53 变 56;g7e 128K 从 16 变 24)。`
-    + `方向单一、不会高估,但它<b>能翻转小显存机型的装不装得下</b>:原候选里的 g6e(44.7 GiB)就是被这 5 GiB 单独决定的,`
-    + `已因此撤出候选,见 <code>candidateInstances</code> 的注释。<br>`
+    + `<b>6.98 GiB</b>(non-torch 1.74 + 激活峰值 4.04 + CUDA graph 1.20),<b>在那个配置上</b>本页高了约 72%。`
+    + `<b>但这个差值搬不到本模型头上</b>:同样把 12 换成 6.98,GLM 在 p5en/TP8 上是 53 → 56 路(5%),`
+    + `而本模型在 g7e/TP1 上是 16 → 24 路(<b>50%</b>)—— 幅度差一个量级,正因为小模型上 overhead `
+    + `占固定开销的比重大得多。<b>方向也不保证</b>:TP=1 没有跨卡通信 buffer,可是激活不分片又可能更大,`
+    + `所以本模型的真实开销未必低于 12 GiB。它<b>能翻转小显存机型的装不装得下</b>:原候选里的 g6e(44.7 GiB)`
+    + `就是被这 5 GiB 单独决定的,已因此撤出候选,见 <code>candidateInstances</code> 的注释。<br>`
     + `vLLM recipe 还记了一件与本页口径相反的事:CUDA graph capture 的分配<b>在 util 预算之外</b>(1× 5090 上「0.80 和 0.93 都只剩 47 MiB」,`
     + `要 <code>--enforce-eager</code> 才起得来),而本页把 12 GiB 整个放在预算之内。两种口径都不算错,但反解 overhead 时要先对齐这一点。`
     + `recipe 里那组引擎自报数(2× 5090 TP2、FP8 权重 14.28 GiB/卡、FP8 KV、262K:KV 池 377,456 tokens)是本项目见到的第一组 <code>measured</code>,`
