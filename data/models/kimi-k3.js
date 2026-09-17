@@ -87,11 +87,18 @@ REG.models["kimi-k3"] = {
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5e.48xlarge",
   ],
   defaultInstance: "p5en.48xlarge",
-  // 打开页面的起始切分。1453.7 GiB 权重装不进一台,所以 4 台起。
+  // 打开页面的起始切分。1453.7 GiB 权重装不进**一台 p5en**(8×141 = 1015 GiB 预算),所以默认 4 台起。
+  // 注意这不是绝对的:一台 b300 是 8×268.6、预算 241.73 GiB/卡,装得下 —— 见下面第一个预设。
   defaultParallel: { n: 4, tp: 8, dp: 4, pp: 1, ep: 32 },
 
   // 每个预设都绑定机型 —— 点它会连机型一起切过去,所以 UI 上必须把机型显示出来。
   presets: [
+    // 打头的是「一台机器就够」这条:1453.7 GiB 的 MXFP4 权重装不进一台 p5en,但装得进一台 b300。
+    // 括号里只说 p5en 装不进 —— 这一条在两种 expert 格式下都成立(BF16 只会更大),不随口径翻。
+    // TP4×DP2 是 PP=1 里最高的一档;开 PP4 能更高,但流水线气泡这张图不算,所以不拿它当门面。
+    { name: "b300 一台(p5en 一台装不进)", inst: "p6-b300.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8 },
+    // 方案 1 的 TP32 跨 4 个 NVLink 域,是本页 ADR-0001 的反例展品(「反射性地把 TP 开到总卡数」),
+    // 保留但不再打头。
     { name: "方案 1  TP32/EP32",   inst: "p5en.48xlarge",    n: 4, tp: 32, dp: 1,  pp: 1, ep: 32 },
     { name: "方案 2  TP8/PP4",     inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 1,  pp: 4, ep: 8  },
     { name: "推荐  TP8×DP4/EP32",  inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 4,  pp: 1, ep: 32 },
