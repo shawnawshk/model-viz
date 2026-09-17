@@ -18,6 +18,19 @@ const modelSrcs = srcs.filter(s => s.startsWith("data/models/"));
 if (inline.length !== 2 || srcs[0] !== "data/instances.js" || modelSrcs.length !== srcs.length - 1)
   throw new Error(`script 标签结构变了:inline=${inline.length} srcs=${srcs.join(",")}`);
 
+// 点预设时并发必须走 concIdxForWorld,不能回到 1 路。这条只能静态查:DOM stub 里
+// addEventListener 是空操作,派发不了点击事件,而下面 __presetLoads 是在探针里**重算**同一个公式,
+// 改坏 handler 它照样通过。曾经这里硬写 concIdx: 0,于是点 DP>1 的预设(GLM 的 TP1×DP8、
+// K3 的纯 DP32)只有第一张卡有 KV,图上看着像坏了。
+{
+  const h = html.match(/getElementById\("presets"\)\.addEventListener\([\s\S]*?\n\}\);/);
+  if (!h) throw new Error("找不到 presets 的 click handler —— 这条静态检查失效了,先修它");
+  if (!h[0].includes("concIdxForWorld("))
+    throw new Error("presets click handler 没用 concIdxForWorld 设并发:DP>1 的预设会只有第一张卡有 KV");
+  if (/concIdx:\s*0\b/.test(h[0]))
+    throw new Error("presets click handler 又把并发写回 1 路了");
+}
+
 // index.html 必须挂同一批 data 文件,否则索引页会漏掉模型
 const idxSrcs = [...fs.readFileSync(path.join(ROOT, "index.html"), "utf8")
   .matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map(m => m[1]);
@@ -223,6 +236,13 @@ function run(c) {
 
   // 数值探针与主脚本一起 eval —— S / compute / render 都是主脚本内部的 const,外面拿不到
   const PROBE = `
+// 页面刚加载、还没被探针改状态时的负载分配。并发默认「每卡 1 路」= 总卡数,
+// 目的就是让 DP>1 时每个 rank 拿到相同的整数路数(1 路会是 [1,0,0,…],图上只有第一张卡有 KV)。
+// 必须在下面的 Object.assign 之前取,否则拿到的是探针的 concIdx。
+globalThis.__defaultLoad = (() => {
+  const C = compute();
+  return { conc: C.conc, world: C.W, dp: S.dp, requestsByDp: C.requestsByDp };
+})();
 globalThis.__probe = [];
 for (const kv of ["bf16", "fp8"]) {
   Object.assign(S, ${JSON.stringify(c.state)}, { concIdx: ${c.expectLoad ? `CONC_STEPS.indexOf(${c.expectLoad.conc})` : c.roof ? `CONC_STEPS.indexOf(${c.roof.conc})` : "0"}, ctxIdx: ${c.ctxIdx ?? 7}, util: ${c.util ?? 90}, kvDt: kv });
@@ -256,6 +276,13 @@ globalThis.__packExamples = [1, 8, 9].map(n => distributeRequests(n, 8));
 // 这里在 kvDt=fp8 的那一轮结束后再切回 bf16,才好与 expectPresets 对账。
 Object.assign(S, { kvDt: "bf16" }); syncOptions("probe"); render();
 globalThis.__presets = PRESETS.map(p => Math.floor(presetCompute(p).maxConc));
+// 点预设时并发被设成该预设的总卡数(app.html 的 presets click)。这里复算同一个式子,
+// 断言每个预设都能整除 —— 固定 8 做不到:GLM 的两台 TP1×DP16 与 K3 的纯 DP32 会剩余数。
+globalThis.__presetLoads = PRESETS.map(p => {
+  const w = p.n * REG.instances[p.inst].gpusPerInstance;
+  const conc = CONC_STEPS[concIdxForWorld(w)];
+  return { name: p.name, world: w, dp: p.dp, conc };
+});
 markPreset();
 // 三个模型都必须能针对当前机型 / 台数给出容量方向的同机型切分反事实。
 // 具体候选仍由各 family 的 compute() 约束过滤,不能绕过 KV 复制或 engram 显存规则。
@@ -335,6 +362,21 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   // 预设按钮上的路数(BF16 KV,该用例的 util / ctxIdx 口径下)
   if (c.expectPresets && String(globalThis.__presets) !== String(c.expectPresets))
     fail.push(`预设路数应为 [${c.expectPresets}],实为 [${globalThis.__presets}]`);
+
+  // ---- 并发默认值 = 总卡数(「每卡 1 路」)。这条抓的是「DP>1 时只有第一张卡有 KV」那个显示 bug。
+  // 卡数必然被 DP 整除(TP×DP×PP = 卡数 是硬断言),所以每个 rank 的路数必须完全相同。
+  const dl = globalThis.__defaultLoad;
+  if (dl.conc !== dl.world)
+    fail.push(`默认并发应等于总卡数 ${dl.world},实为 ${dl.conc}`);
+  if (new Set(dl.requestsByDp).size !== 1)
+    fail.push(`默认口径下各 DP rank 的路数应完全相同,实为 [${dl.requestsByDp}](DP ${dl.dp})`);
+  // 点预设后同样不能出现余数
+  for (const pl of globalThis.__presetLoads) {
+    if (pl.conc !== pl.world)
+      fail.push(`预设「${pl.name}」点开后并发应为总卡数 ${pl.world},实为 ${pl.conc}`);
+    if (pl.conc % pl.dp !== 0)
+      fail.push(`预设「${pl.name}」的并发 ${pl.conc} 不能被 DP${pl.dp} 整除,各卡会不均`);
+  }
 
   // roofline(ADR-0010)。每个用例都要:step 有限且 > 0、regime 合法 —— 这两条抓的是 NaN 与字段没接上。
   for (const p of [b, f]) {
