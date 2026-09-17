@@ -247,7 +247,8 @@ function run(c) {
 // 同时不把本来均匀的 DP=1 推成红字。必须在下面的 Object.assign 之前取,否则拿到的是探针的 concIdx。
 globalThis.__defaultLoad = (() => {
   const C = compute();
-  return { conc: C.conc, world: C.W, dp: S.dp, requestsByDp: C.requestsByDp };
+  return { conc: C.conc, world: C.W, dp: S.dp, requestsByDp: C.requestsByDp,
+           floor: CONC_FLOOR, steps: CONC_STEPS.slice() };
 })();
 globalThis.__probe = [];
 for (const kv of ["bf16", "fp8"]) {
@@ -369,21 +370,34 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   if (c.expectPresets && String(globalThis.__presets) !== String(c.expectPresets))
     fail.push(`预设路数应为 [${c.expectPresets}],实为 [${globalThis.__presets}]`);
 
-  // ---- 并发默认值 = DP(「每个 DP rank 恰好 1 路」)。这条抓两件事:
-  //   (1) 原本的显示 bug —— DP>1 时 1 路只有第一张卡有 KV;
-  //   (2) 第一版的过头修法 —— conc=总卡数 会让每个 rank 拿 TP×PP 路(K3 默认变每 rank 8 路,
-  //       TP32/DP1 本来 1 路就均匀却被设成 32 路、白白撞红)。
-  // 断言写成「每个 rank 恰好 1 路」而不是复算公式:当前四个模型与全部预设的 DP 都在 CONC_STEPS 里,
-  // 所以「能被 DP 整除的最小一档」就是 DP 本身。
+  // ---- 并发默认值:能被 DP 整除、且 ≥ CONC_FLOOR 的最小一档。四条性质各抓一种错法:
+  //   均匀        —— 原本的显示 bug:DP>1 时 1 路只有第一张卡有 KV(分配 [1,0,0,…]);
+  //   ≥ 下限      —— 「所有模型页面都不许默认 1 路」这条要求;DP=1 的三个模型光靠整除会停在 1;
+  //   能被 DP 整除 —— 有余数就不均匀;
+  //   最小        —— 第一版的过头修法:conc=总卡数 让每个 rank 拿 TP×PP 路(K3 默认变每 rank
+  //                  8 路;TP32/DP1 本来 1 路就均匀,却被设成 32 路而上限只有 20、白白撞红)。
   const dl = globalThis.__defaultLoad;
-  if (String(dl.requestsByDp) !== String(Array(dl.dp).fill(1)))
-    fail.push(`默认口径下每个 DP rank 应恰好 1 路,实为 [${dl.requestsByDp}](DP ${dl.dp},卡数 ${dl.world})`);
-  if (dl.conc !== dl.dp)
-    fail.push(`默认并发应等于 DP=${dl.dp},实为 ${dl.conc}`);
-  for (const pl of globalThis.__presetLoads) {
-    if (pl.conc !== pl.dp)
-      fail.push(`预设「${pl.name}」点开后并发应为 DP=${pl.dp},实为 ${pl.conc}(卡数 ${pl.world})`);
-  }
+  // **下限的期望值必须写死在这里**,不能只用 app 自报的 dl.floor —— 否则把 CONC_FLOOR 改成 1
+  // 断言会跟着变松、静默放过(第一版就是这样,漏掉了这条错法)。8 是扫过全部 28 个切分定下来的:
+  // 装得下的配置里上限最低的是 Qwen g7e TP1×DP8 的 16 路。要动这个数,得连带重扫一遍会不会撞红。
+  const WANT_FLOOR = 8;
+  if (dl.floor !== WANT_FLOOR)
+    fail.push(`CONC_FLOOR 应为 ${WANT_FLOOR},实为 ${dl.floor} —— 改它要重扫各切分会不会撞红`);
+  const check = (what, conc, dp, byDp) => {
+    if (byDp && new Set(byDp).size !== 1)
+      fail.push(`${what}各 DP rank 的路数应完全相同,实为 [${byDp}](DP ${dp})`);
+    if (conc < dl.floor)
+      fail.push(`${what}并发 ${conc} 低于下限 ${dl.floor} —— 所有模型页面都不许默认 1 路`);
+    if (conc % dp !== 0)
+      fail.push(`${what}并发 ${conc} 不能被 DP${dp} 整除,各卡会不均`);
+    const want = dl.steps.find(c => c % dp === 0 && c >= dl.floor);
+    if (want === undefined)
+      fail.push(`${what}DP${dp} 在 CONC_STEPS 里找不到 ≥ ${dl.floor} 的可整除档`);
+    else if (conc !== want)
+      fail.push(`${what}并发应取满足条件的最小一档 ${want}(DP${dp}),实为 ${conc}`);
+  };
+  check("默认口径下", dl.conc, dl.dp, dl.requestsByDp);
+  for (const pl of globalThis.__presetLoads) check(`预设「${pl.name}」点开后`, pl.conc, pl.dp, null);
 
   // roofline(ADR-0010)。每个用例都要:step 有限且 > 0、regime 合法 —— 这两条抓的是 NaN 与字段没接上。
   for (const p of [b, f]) {
