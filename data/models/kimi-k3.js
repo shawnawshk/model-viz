@@ -11,6 +11,11 @@
 REG.models["kimi-k3"] = {
   name: "Kimi K3",
   hf: "moonshotai/Kimi-K3",
+  // 官方模型卡 Native Multimodality & Long Context:文本、图像和视频理解;pipeline_tag=image-text-to-text。
+  modalities: {
+    input: ["text", "image", "video"], output: ["text"],
+    sources: ["https://huggingface.co/moonshotai/Kimi-K3/blob/main/README.md"],
+  },
   blurb: "2.7799T 总参数 · 104B 激活 · 93 层混合注意力(69 KDA + 24 Gated MLA)· 896 routed experts / top-16",
   hidden: 7168,                              // hidden_size,只用于 PP 的 send/recv 激活量
 

@@ -15,6 +15,11 @@
 REG.models["deepseek-v4.1-flash"] = {
   name: "DeepSeek-V4.1-Flash",
   hf: "deepseek-ai/DeepSeek-V4.1-Flash",
+  // 官方模型卡明确说明原生处理图像与文本,自回归生成文本。
+  modalities: {
+    input: ["text", "image"], output: ["text"],
+    sources: ["https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/README.md"],
+  },
   blurb: "552B backbone(+196B engram)· 8B prefill / 16B decode 激活 · 40 层 CED(20 encoder + 20 decoder)"
        + " · CSA2 稀疏注意力,每 token KV 仅 890 B · 384 routed experts / top-6 · expert 原生 FP4 · 多模态",
   hidden: 5120,                              // dim,只用于 PP 的 send/recv 激活量
