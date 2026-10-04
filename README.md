@@ -19,6 +19,10 @@
 |---|---|
 | `index.html` | 入口:模型索引 + 机型目录 |
 | `app.html?model=<id>` | 唯一引擎,所有公式只有一份实现 |
+| `styles.css` | 两个页面共用的主题、导航与响应式布局 |
+| `sidebar.js` | 共用的 provider / 模型分组导航与侧栏收起状态 |
+| `assets/providers/` | 本地 provider logo、来源与许可 |
+| `favicon.svg` | 应用图标 |
 | `data/instances.js` | 机型规格:显存、NVLink 域、跨域带宽、原生 dtype、HBM 带宽、dense TFLOPS(后两项附 datasheet 出处) |
 | `data/models/<id>.js` | 模型定义:层结构、MoE、权重、候选机型 |
 | `verify-app.js` | `node verify-app.js` —— 改完 `app.html` 必须跑 |
@@ -27,6 +31,8 @@
 数据文件是 `.js` 而不是 `.json`:`file://` 下 `fetch()` 会被 CORS 拦掉,classic `<script>` 标签不受限制。
 
 加一个模型 = 加一个 `data/models/<id>.js` + 在 `index.html` 和 `app.html` 里各加一行 `<script src>`。
+侧栏按模型的 `hf` namespace 分组；新增 provider 时，在 `sidebar.js` 中登记名称和 namespace，并将 logo 放入 `assets/providers/`。
+模型定义中的 `modalities` 记录输入/输出模态（`text`、`image`、`video`）及官方来源，详情页据此展示能力标签。
 
 ## 设计文档
 

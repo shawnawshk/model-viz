@@ -15,7 +15,8 @@ const html = fs.readFileSync(path.join(ROOT, "app.html"), "utf8");
 const inline = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const srcs = [...html.matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map(m => m[1]);
 const modelSrcs = srcs.filter(s => s.startsWith("data/models/"));
-if (inline.length !== 2 || srcs[0] !== "data/instances.js" || modelSrcs.length !== srcs.length - 1)
+if (inline.length !== 2 || srcs[0] !== "data/instances.js"
+    || modelSrcs.length !== srcs.length - 2 || srcs[srcs.length - 1] !== "sidebar.js")
   throw new Error(`script 标签结构变了:inline=${inline.length} srcs=${srcs.join(",")}`);
 
 // 点预设时并发必须走 concIdxForDp(p.dp)。这条只能静态查:DOM stub 里 addEventListener 是空操作,
@@ -211,12 +212,27 @@ const CASES = [
     roof: { conc: 1, stepMs: "3.36", regime: "mem", ridge: "never", kvCross: 843214 } },
 ];
 
-const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes",
+const REQUIRED = ["h1", "sub", "scope-params", "banners", "tiles", "legend", "nodes", "model-nav",
                   "commhead", "commtbl", "tbl", "assumplist", "presets", "eq",
                   "expFmtLab", "precLab", "kvDtLab",
                   "roofhead", "roofverdict", "roofsum", "roofwarn", "rooftbl"];   // ADR-0010
 // 这几个容器里出现 undefined / NaN 就是有字段没接上 —— 页面上看起来只是少了个数字
-const CLEAN = ["tiles", "tbl", "commtbl", "assumplist", "banners", "roofverdict", "roofsum", "rooftbl"];
+const CLEAN = ["tiles", "tbl", "commtbl", "assumplist", "banners", "roofverdict", "roofsum", "rooftbl", "model-nav"];
+
+function checkNavigation(els, currentModel) {
+  const markup = String(els.get("model-nav")?.innerHTML ?? "");
+  const fail = [];
+  const links = [...markup.matchAll(/<a\b[^>]*href="app\.html\?model=([^"]+)"[^>]*>/g)];
+  const ids = links.map(link => link[1]).sort();
+  if (ids.join(",") !== Object.keys(REG.models).sort().join(","))
+    fail.push("provider 导航必须包含每个已注册模型,且每个模型只出现一次");
+  const selected = links.filter(link => link[0].includes('aria-current="page"'));
+  if (currentModel && (selected.length !== 1 || selected[0][1] !== currentModel))
+    fail.push(`provider 导航应选中 ${currentModel}`);
+  for (const [, source] of markup.matchAll(/<img\b[^>]*src="([^"]+)"/g))
+    if (!fs.existsSync(path.join(ROOT, source))) fail.push(`provider logo 文件不存在:${source}`);
+  return fail;
+}
 
 // ---- DOM stub ----
 const mkEl = id => ({
@@ -325,6 +341,7 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
     return !e || (!String(e.innerHTML).trim() && !String(e.textContent).trim());
   });
   if (empty.length) fail.push(`空容器:${empty.join(", ")}`);
+  fail.push(...checkNavigation(els, c.model));
   for (const id of CLEAN) {
     const s = String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "");
     for (const bad of ["undefined", "NaN"]) if (s.includes(bad)) fail.push(`${id} 里出现了 ${bad}`);
@@ -541,11 +558,12 @@ function runIndex() {
 
   const fail = [];
   const txt = id => String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "");
-  const IDX_REQUIRED = ["models", "insts", "foot"];
+  const IDX_REQUIRED = ["models", "insts", "foot", "model-nav"];
   for (const id of IDX_REQUIRED) {
     if (!txt(id).trim()) fail.push(`空容器:${id}`);
     for (const b of ["undefined", "NaN"]) if (txt(id).includes(b)) fail.push(`${id} 里出现了 ${b}`);
   }
+  fail.push(...checkNavigation(els));
 
   const tbl = String(els.get("insts")?.innerHTML ?? "");
   // 叶子列数 = 不带 colspan 的 th 数(表头一行或多行都成立);每个数据行的 td 数必须与之相等。

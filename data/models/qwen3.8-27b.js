@@ -15,6 +15,11 @@
 REG.models["qwen3.8-27b"] = {
   name: "Qwen3.8-27B",
   hf: "Qwen/Qwen3.8-27B",
+  // 官方模型卡 Vision-Language Understanding 与图像/视频输入示例;pipeline_tag=image-text-to-text。
+  modalities: {
+    input: ["text", "image", "video"], output: ["text"],
+    sources: ["https://huggingface.co/Qwen/Qwen3.8-27B/blob/main/README.md"],
+  },
   blurb: "27.8B dense(无 MoE,全部激活)· 64 层混合注意力(48 Gated DeltaNet 线性 + 16 Gated Attention,3:1)"
        + " · GQA 24 q / 4 kv head,head_dim 256 · 原生 BF16,官方另有 FP8 · 多模态 · 262K 原生上下文(YaRN 至 1M)",
   hidden: 5120,                              // hidden_size,只用于 PP 的 send/recv 激活量

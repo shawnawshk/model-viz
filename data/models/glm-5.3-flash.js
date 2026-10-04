@@ -14,6 +14,14 @@
 REG.models["glm-5.3-flash"] = {
   name: "GLM-5.3-Flash",
   hf: "zai-org/GLM-5.3-Flash",
+  // 官方模型卡标记 image-text-to-text;processor_config.json 同时配置图像和视频处理器。
+  modalities: {
+    input: ["text", "image", "video"], output: ["text"],
+    sources: [
+      "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/README.md",
+      "https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/processor_config.json",
+    ],
+  },
   blurb: "321.3B 总参数 · 18B 激活 · 45 层混合注意力(34 KDA 线性 + 11 DSA 稀疏)· 288 routed experts / top-8 · 原生 FP8",
   hidden: 4096,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
