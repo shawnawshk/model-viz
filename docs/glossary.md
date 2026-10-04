@@ -1,11 +1,11 @@
 # Glossary
 
-这套词汇是这个工具的领域模型。之前几轮讨论里出现过的每一次误解，根源都是下面某一条没有被区分开。
+这套词汇是这个工具的领域模型。之前几轮讨论出现过误解。每一次误解的根源，都是没有分清下面某一条术语。
 
 ## 拓扑
 
 ### NVLink 域（scale-up 域）
-一组通过 NVLink + NVSwitch 直连、彼此间带宽在数百 GB/s 量级的 GPU。**这是决定 TP 上限的边界，与实例大小无关。**
+NVLink 域是一组 GPU。这些 GPU 通过 NVLink + NVSwitch 直连。GPU 之间的带宽在数百 GB/s 量级。**NVLink 域决定 TP 上限，与实例大小无关。**
 
 | 实例 | 卡/实例 | **NVLink 域** | 域内 P2P |
 |---|---|---|---|
@@ -14,29 +14,29 @@
 | p6-b200 / p6-b300.48xlarge | 8 | 8 | NVSwitch 1800 GB/s |
 | g6e / g7 / g7e.48xlarge | 8 | **1** | 无 NVLink，仅 PCIe |
 
-**NVLink 是 P 系列独占。** G 系列一张都没有——g7/g7e 的 spec 页写「Yes via PCIe」，那是 PCIe P2P，不是 NVLink。所以 G 系 8 卡机型的域大小是 **1**：`TP > 1` 就已经在走 PCIe。
+**NVLink 是 P 系列独占。** G 系列没有 NVLink。g7/g7e 的 spec 页写「Yes via PCIe」，这里的 P2P 是 PCIe P2P，不是 NVLink。所以 G 系 8 卡机型的域大小是 **1**：`TP > 1` 时，通信就已经走 PCIe。
 
-同时注意 P 系内部域内带宽也差 2×（600 → 900 → 1800 GB/s）——域不是一个只有大小的概念。
+P 系内部的域内带宽也相差 2×（600 → 900 → 1800 GB/s）。域不只是一个大小的概念。
 
 ### 实例（instance）
-一个 EC2 实例。**与 NVLink 域不是同一个概念**，两者可以在任意方向上不相等：
+实例指一个 EC2 实例。**实例与 NVLink 域是两个不同的概念**，两者的大小关系没有固定方向：
 
 - P 系 8 卡机型：`1 实例 = 1 个域 = 8 卡`（重合）
-- G 系 8 卡机型：`1 实例 = 8 卡`，但 `1 个域 = 1 卡`（**域 < 实例**）
-- 域 > 实例的机型（一个域横跨多个实例）确实存在，但已排除出本工具范围
+- G 系 8 卡机型：`1 实例 = 8 卡`。`1 个域 = 1 卡`（**域 < 实例**）
+- 域 > 实例的机型确实存在：一个域横跨多个实例。本工具的范围已排除这类机型
 
-TP 的约束来自 **NVLink 拓扑**，不来自 EC2 实例边界。把理由说成"不能跨节点"，会把 P 系 8 卡机型的性质误当成普遍规律——`TP ≤ 8` 是那批硬件的性质，不是定理；在 G 系上正确的上限是 `TP ≤ 1`。工具的校验文案应称"跨 NVLink 域"。
+TP 的约束来自 **NVLink 拓扑**。TP 的约束不来自 EC2 实例边界。如果把理由说成"不能跨节点"，就会把 P 系 8 卡机型的性质误当成普遍规律：`TP ≤ 8` 是那批硬件的性质，不是定理；在 G 系上正确的上限是 `TP ≤ 1`。工具的校验文案应称"跨 NVLink 域"。
 
 ### scale-out 域
-跨 NVSwitch 域的连接，走 EFA + GPUDirect RDMA。带宽比域内低一个数量级以上，是所有跨域集合操作的成本来源。
+scale-out 域指跨 NVSwitch 域的连接。这类连接走 EFA + GPUDirect RDMA。scale-out 域的带宽比域内带宽低一个数量级以上。这个带宽差，是所有跨域集合操作的成本来源。
 
 ## 并行维度
 
 ### TP（tensor parallelism，张量并行）
-把**单个矩阵**横向切开，每张卡算一片，每层结束时用 all-reduce 求和。通信最密（每层 2 次），因此 **TP 度数不应超过 scale-up 域大小**。
+TP 把**单个矩阵**横向切开，每张卡算一片，每层结束时用 all-reduce 求和。TP 的通信最密（每层 2 次）。因此 **TP 度数不应超过 scale-up 域大小**。
 
 ### EP（expert parallelism，专家并行）
-把 MoE 的**整个专家**原封不动分配到不同卡上，不切矩阵。token 经 all-to-all 发到其专家所在的卡。只覆盖 routed expert，**不覆盖 attention / dense / embedding**。
+EP 把 MoE 的**整个专家**原封不动分配到不同卡上，不切矩阵。token 经 all-to-all 发到其专家所在的卡。EP 只覆盖 routed expert，**不覆盖 attention / dense / embedding**。
 
 **EP 的上限是一个 pipeline stage 的卡数，不是总卡数：**
 
@@ -46,96 +46,119 @@ stage = world ÷ PP = TP × DP        ← 一个 pipeline stage 有多少卡
 EP ≤ stage，且 EP 必须整除 routed expert 数
 ```
 
-理由：PP 是**按层切分**的，每个 stage 只持有自己那几层。这些层的专家只能摊在本 stage 的卡上 —— 摊不到别的 stage 去，因为那些卡装的是别的层。
+理由：PP 按**层**切分。每个 stage 只持有自己那几层。这些层的专家只能摊在本 stage 的卡上，摊不到别的 stage 去，因为别的 stage 的卡装的是别的层。
 
-所以 `PP = 1` 时 EP 才能取到总卡数；`PP = 2` 时上限只有总卡数的一半。例：16 卡上 `TP8/DP2/PP1` → EP 可到 16，但 `TP8/DP1/PP2` → EP 最多 8。
+所以 `PP = 1` 时，EP 才能取到总卡数。`PP = 2` 时，EP 的上限只有总卡数的一半。例：16 卡上 `TP8/DP2/PP1` 时 EP 可到 16；16 卡上 `TP8/DP1/PP2` 时 EP 最多 8。
 
-Kimi K3 有 896 = 2⁷ × 7 个 routed expert，而 stage 规模总是 2 的幂，7 除不进去，因此 EP 的实际候选就是「≤ stage 的 2 的幂」。
+Kimi K3 有 896 = 2⁷ × 7 个 routed expert。stage 规模总是 2 的幂，7 除不进 2 的幂。因此 EP 的实际候选就是「≤ stage 的 2 的幂」。
 
-`EP < stage` 时 expert bank 会被复制 `stage ÷ EP` 份 —— 见「权重复制因子」。
+`EP < stage` 时，expert bank 复制 `stage ÷ EP` 份。见「权重复制因子」。
 
 ### DP（data parallelism，推理语境）
-**与训练的 DP 不是一回事**：没有梯度、没有 all-reduce。含义是"复制权重，切分请求"——每个 DP rank 持有完整的一份 attention 权重，处理不同的请求子集，rank 之间在 attention 阶段零通信。
+推理语境下的 DP **与训练的 DP 不是一回事**：没有梯度、没有 all-reduce。DP 的含义是"复制权重，切分请求"。每个 DP rank 持有完整的一份 attention 权重，处理不同的请求子集。rank 之间在 attention 阶段零通信。
 
-在 MoE 模型里 DP 是**局部复制**：只复制非 expert 部分，expert bank 由所有 DP 组共享。所以 `DP=4` 不意味着"4 份完整模型"。
+在 MoE 模型里，DP 是**局部复制**：只复制非 expert 部分，expert bank 由所有 DP 组共享。所以 `DP=4` 不意味着"4 份完整模型"。
 
 ### DP attention
-上述 DP 只作用于 attention 块的部署方式。引擎里 `dp_size` 指的是这个，不是模型副本数。SGLang 中 `--tp` 是 world size，attention 实际 TP 度数 = `tp_size / dp_size`。
+DP attention 指上述 DP 只作用于 attention 块的部署方式。引擎里 `dp_size` 指的是这个，不是模型副本数。SGLang 中 `--tp` 是 world size，attention 实际 TP 度数 = `tp_size / dp_size`。
 
 ### PP（pipeline parallelism，流水线并行）
-按**层**切分。跨域通信只有每 token 几 KB 的 activation send/recv，是通信最省的维度；代价是流水线气泡，需要足够多的 micro-batch 填满。
+PP 按**层**切分。跨域通信只有每 token 几 KB 的 activation send/recv，是通信最省的维度。PP 的代价是流水线气泡，需要足够多的 micro-batch 填满。
 
 ### micro-batch
-调度器凑成一次 forward 的那批请求。PP 需要同时有 ≥PP 个 micro-batch 在飞才能填满流水线。decode 阶段自回归，同一请求的连续 token 无法互相流水，所以这些 micro-batch **必须是互不相干的请求** —— 这构成了 PP 的最低并发门槛。
+micro-batch 指调度器凑成一次 forward 的那批请求。PP 需要同时有 ≥PP 个 micro-batch 在飞才能填满流水线。decode 阶段自回归，同一请求的连续 token 无法互相流水，所以这些 micro-batch **必须是互不相干的请求**。这个约束构成了 PP 的最低并发门槛。
 
 ## 显存构成
 
 ### 单位（GiB，不是 GB）
-真值是 `describe-instance-types` 的 `MemoryInfo.SizeInMiB`；内部计算用字节（`MiB × 1048576`）；UI 一律显示 **GiB**（`bytes / 2^30`）。
+真值、内部计算、UI 显示三层各自的单位：
 
-厂商标称的「GB」在不同 GPU 上含义不同、无统一规律：A100/H100/H200/RTX PRO 按 GiB 标，A10G/L4/L40S 与 B300 按十进制标。**因此永远不要拿标称数字直接当某一种单位用。** 这条曾导致把 H200 的 141 GiB 当成 141×10⁹ 字节、容量低估 7.4% 的实际 bug。详见 [[adr-0006]] 与 `instance-specs.md`。
+- 真值是 `describe-instance-types` 的 `MemoryInfo.SizeInMiB`。
+- 内部计算用字节（`MiB × 1048576`）。
+- UI 一律显示 **GiB**（`bytes / 2^30`）。
+
+厂商标称的「GB」在不同 GPU 上含义不同，没有统一规律：A100/H100/H200/RTX PRO 按 GiB 标，A10G/L4/L40S 与 B300 按十进制标。**因此永远不要拿标称数字直接当某一种单位用。** 这条规则来自一个真实发生的 bug：曾把 H200 的 141 GiB 当成 141×10⁹ 字节，容量低估 7.4%。详见 [[adr-0006]] 与 `instance-specs.md`。
 
 ### 权重复制因子
-同一份权重在集群里存了几遍。由并行维度决定，是显存账的主项：
+权重复制因子指同一份权重在集群里存了几遍。由并行维度决定，是显存账的主项：
 
 - 非 expert 权重：切 `TP × PP` 份，**复制 `DP` 份**
 - routed expert：切 `EP × PP` 份，复制 `(stage / EP)` 份，其中 `stage = TP × DP = world ÷ PP`
 
 ### KV cache 复制因子
-一个 token 的 KV 在集群里存了几遍。**由 attention family 决定，不是全局常数**：
+KV cache 复制因子指一个 token 的 KV 在集群里存了几遍。**由 attention family 决定，不是全局常数**：
 
-- **MLA**（Kimi K3 的 24 个 full-attn 层）：压缩 latent 被所有 head 共享 → TP 组内每张卡各存一份完整副本 → **复制 TP 份**
-- **DSA**（DeepSeek Sparse Attention，GLM-5.3-Flash 的 11 个 full-attn 层）：与 MLA 完全相同的 latent 复制行为，**外加** lightning indexer 自己的一份 per-token key cache（同样是单头共享 → 同样复制 TP 份，但走自己的 dtype，不受 `--kv-cache-dtype` 影响）
-- **GQA**（Qwen3.8-27B 的 16 个 full-attn 层）：KV 按 kv head 切分 → `n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时开始复制 `TP / n_kv_heads` 份。复制因子是**并行配置的函数**，引擎用 `kvShards(g, tp) = min(TP, n_kv_heads)` 钩子表达，见 [[adr-0012]]。后果是 TP 的甜点落在 n_kv_heads 上：TP ≤ 4 既切权重又不复制 KV，TP=8 开始复制
-- **线性注意力 / SSM 的 recurrent state**（KDA：K3 / GLM；Gated DeltaNet：Qwen3.8-27B）：per-head，可按 head 切 → 不复制
+- **MLA**（Kimi K3 的 24 个 full-attn 层）：所有 head 共享压缩 latent，所以 TP 组内每张卡各存一份完整副本。复制因子是 **TP**
+- **DSA**（DeepSeek Sparse Attention，GLM-5.3-Flash 的 11 个 full-attn 层）：latent 的复制行为与 MLA 完全相同。DSA **额外**有 lightning indexer 自己的一份 per-token key cache，同样是单头共享、同样复制 TP 份，但走自己的 dtype，不受 `--kv-cache-dtype` 影响
+- **GQA**（Qwen3.8-27B 的 16 个 full-attn 层）：KV 按 kv head 切分。`n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时复制 `TP / n_kv_heads` 份。复制因子是**并行配置的函数**，引擎用 `kvShards(g, tp) = min(TP, n_kv_heads)` 钩子表达，见 [[adr-0012]]。后果：TP 的最佳取值是 n_kv_heads。TP ≤ 4 时既切权重又不复制 KV；TP=8 时越过 n_kv_heads，开始复制
+- **线性注意力 / SSM 的 recurrent state**（KDA：K3 / GLM；Gated DeltaNet：Qwen3.8-27B）：recurrent state 是 per-head 的，可按 head 切，所以不复制
 
 DP 和 PP 在任何 family 下都不复制 KV。
 
 ### 稀疏注意力 ≠ 省显存
-DSA 这类稀疏注意力的 `index_topk` 决定的是每个 query 去**看**多少个 token，不是**存**多少个。全部 token 的 KV 依然要留在 cache 里，**显存开销与 full attention 一模一样**。省下的是 attention 的 FLOPS 与 KV 读带宽，而按 [[adr-0003]] 这两样都不在本工具范围内。把「稀疏」当成显存优化是本工具最容易被误读的一点。
+DSA 这类稀疏注意力的 `index_topk` 决定的是每个 query 去**看**多少个 token，不是**存**多少个。全部 token 的 KV 依然要留在 cache 里，**显存开销与 full attention 相同**。稀疏注意力省下的是 attention 的 FLOPS 与 KV 读带宽，而按 [[adr-0003]] 这两样都不在本工具范围内。把「稀疏」当成显存优化，是本工具最容易引发误读的一点。
 
 ### KV cache 的 dtype
-**不是模型属性，是引擎启动参数**（`--kv-cache-dtype`，默认 `auto` = 模型 dtype = BF16；FP8 要显式开）。`config.json` 与 checkpoint 里都没有这项信息，工具无论怎么查模型都推不出来。它把每 token 的 KV 字节数直接翻倍/砍半，是本工具敏感度最高的单项，因此必须作为界面输入并显示反事实，不能当常数。详见 [[adr-0007]]。
+KV cache 的 dtype **不是模型属性，是引擎启动参数**（`--kv-cache-dtype`，默认 `auto` = 模型 dtype = BF16；FP8 要显式开）。`config.json` 与 checkpoint 里都没有这项信息，工具无论怎么查模型都推不出来。这个 dtype 把每 token 的 KV 字节数直接翻倍或砍半，是本工具敏感度最高的单项，因此必须作为界面输入并显示反事实，不能当常数。详见 [[adr-0007]]。
 
-与「KV cache 复制因子」是两件独立的事：复制因子由 attention family 与并行配置决定，dtype 由部署决定，两者相乘才是每卡的 KV 占用。
+KV cache 的 dtype 与「KV cache 复制因子」是两件独立的事：复制因子由 attention family 与并行配置决定，dtype 由部署决定，两者相乘才是每卡的 KV 占用。
 
 ### per-request 固定开销
-与序列长度无关、只随并发涨的状态。Kimi K3 的 69 个 KDA 层的 recurrent state 属于此类（96 head × 128 × 128 × 69 层）。高并发短上下文场景下它会反超随长度增长的 KV cache——**按"总 token 数"做容量规划会把这种场景估反**。
+per-request 固定开销指与序列长度无关、只随并发涨的状态。Kimi K3 的 69 个 KDA 层的 recurrent state 属于此类（96 head × 128 × 128 × 69 层）。高并发短上下文场景下，这项固定开销会反超随长度增长的 KV cache。**按"总 token 数"做容量规划，会把这种场景估反。**
 
 ### util 预算（gpu_memory_utilization）
-引擎允许动用的显存 = 物理显存 × util。权重 + overhead + KV + state 必须全部挤进这个预算，预算外的物理显存引擎不会碰。vLLM 默认 0.90。`util = 1.00` 是理论上界，不是可规划值。
+util 预算指引擎允许动用的显存 = 物理显存 × util。权重 + overhead + KV + state 必须全部挤进这个预算，预算外的物理显存引擎不会使用。vLLM 默认 0.90。`util = 1.00` 是理论上界，不是可规划值。
 
 ## roofline(decode 每步耗时下界)
 
 ### 三条线
-一个 decode step 至少要花的时间是三项里最大的那个：**HBM 读取字节 ÷ HBM 带宽**、**矩阵乘 FLOPs ÷ dense 算力**、**通信字节 ÷ 链路带宽**。三条线都取厂商 spec 峰值，所以算出来的是**下界**，实测只会更慢。取 `max` 假设三者完美重叠。详见 [[adr-0010]]。
+一个 decode step 至少要花的时间，是以下三项里最大的那个：
+
+- **HBM 读取字节 ÷ HBM 带宽**
+- **矩阵乘 FLOPs ÷ dense 算力**
+- **通信字节 ÷ 链路带宽**
+
+三条线都取厂商 spec 峰值，所以算出来的是**下界**，实测只会更慢。取 `max` 相当于假设三者完美重叠。详见 [[adr-0010]]。
 
 ### 下界 ≠ 预测
-下界不含每步固定开销（kernel launch、调度、集合通信的延迟项）、不含 attention 本身的 FLOPs、没有效率系数。低并发下实测比下界慢一个量级以上是正常的；拐点附近差距最大。把它读成「能跑到」是这套工具最容易被误读的第二件事（第一件是「稀疏省显存」）。
+下界不含以下内容：
+
+- 每步固定开销（kernel launch、调度、集合通信的延迟项）
+- attention 本身的 FLOPs
+- 效率系数
+
+低并发下实测比下界慢一个量级以上是正常的；拐点附近差距最大。把下界读成「能跑到」，是这套工具容易引发误读的第二点（第一点是「稀疏省显存」）。
 
 ### micro-step
-PP > 1 时一个 stage 处理一个 micro-batch 所花的时间。ITL = PP × micro-step（token 要走完所有 stage），吞吐 = 每 micro-step 完成一个 micro-batch。PP = 1 时 micro-step 就是 step。
+micro-step 指 PP > 1 时一个 stage 处理一个 micro-batch 所花的时间。ITL = PP × micro-step（token 要走完所有 stage），吞吐 = 每 micro-step 完成一个 micro-batch。PP = 1 时 micro-step 就是 step。
 
 ### regime
-当前配置下三条线里哪条是 max：HBM 带宽受限 / 算力受限 / 通信受限。它决定「换机器换的是什么」——带宽受限区比 HBM 带宽，算力受限区比 TFLOPS，spec 表上的总数在另一个 regime 里没用。
+regime 指当前配置下三条线里哪条是 max：HBM 带宽受限 / 算力受限 / 通信受限。regime 决定「换机器换的是什么」：
+
+- 带宽受限区，比的是 HBM 带宽。
+- 算力受限区，比的是 TFLOPS。
+- spec 表上的总数，在另一个 regime 里没用。
 
 ### 拐点(B\*)
-算力项追上 HBM 项的并发。左侧加并发几乎不加 ITL（在等搬权重），右侧 ITL 随并发线性涨。它随上下文长度移动：上下文越长，KV 读取越重，拐点越往右，直到在页面范围内不再出现。
+拐点指算力项追上 HBM 项的并发。左侧加并发几乎不加 ITL（在等搬权重），右侧 ITL 随并发线性涨。拐点的位置随上下文长度移动：上下文越长，KV 读取越重，拐点越往右，直到在页面范围内不再出现。
 
 ### 临界上下文(L\*)
-KV / state 读取追上权重读取的上下文长度（当前并发下）。短于它 ITL 基本不随上下文变，长于它线性涨。稀疏 / 线性 / 滑窗 attention 让这个点大幅右移甚至不出现——**这才是稀疏省下的东西**：读带宽，不是显存。
+临界上下文指 KV / state 读取追上权重读取的上下文长度（当前并发下）。上下文短于 L\* 时 ITL 基本不随上下文变，长于 L\* 时线性涨。稀疏 / 线性 / 滑窗 attention 让 L\* 大幅右移，甚至让 L\* 不出现。**稀疏注意力省下的是读带宽，不是显存。**
 
 ### 并发与上下文在 roofline 里的读法
-同一个滑块，两种口径：显存侧把并发读作「同时在飞的请求数」、上下文读作「容量规划的最大长度」；roofline 把并发读作「这一步的 token 数」（每请求 1 token，不含投机解码）、上下文读作「每请求此刻的长度」。
+同一个滑块，两种口径：
+
+- 显存侧：并发读作「同时在飞的请求数」，上下文读作「容量规划的最大长度」。
+- roofline 侧：并发读作「这一步的 token 数」（每请求 1 token，不含投机解码），上下文读作「每请求此刻的长度」。
 
 ## 数据可信度分级
 
-这个工具的每个数字都必须能归到以下之一。混用而不标注是它最大的失效模式。
+这个工具的每个数字都必须能归到以下之一。混用而不标注是这个工具最大的失效模式。
 
 | 级别 | 含义 | 例 |
 |---|---|---|
-| `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB；各机型的 HBM 带宽与 dense TFLOPS（[[adr-0010]]，出处 URL 在 `data/instances.js` 注释里，**只取 dense 行，不取 sparsity 行**） |
-| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账。Qwen3.8-27B：全部 BF16 51.75 GiB，以及官方 FP8 checkpoint 28.75 GiB —— 第一个「非 expert → FP8」档也是实测的模型（[[adr-0012]] §3） |
-| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；Gated DeltaNet state 的 dtype（config 写 float32，vLLM 默认落到 BF16，两个官方答案）；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 被重量化为 FP8/BF16 后按参数量推算的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
-| `guessed` | 拍的 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，且它直接决定最大并发**）。2026-09-16 起它**不再是「无依据」**：GLM-5.3-Flash / p5en / TP8 上引擎自报 6.98 GiB（[[measurements]] M-001），那一个配置上本页高 72%。但页面用的仍是 12 这个拍出来的数，而且**别的模型 / 别的 TP 既不能照搬这个差值、也不能假定方向**（同一替换在 g7e/TP1 上是 50% 而不是 5%；`hc_mult = 4` 的模型真实开销可能反而超过 12 GiB），所以这一级不变 |
-| `measured` | 目标硬件实测 | **每卡非权重非 KV 开销 6.98 GiB**，以及权重 38.24 GiB/卡、KV 池 81.79 GiB、128K 满长并发 55.15 路 —— 全部来自 2026-09-16 在 p5en 上对 GLM-5.3-Flash 起的那一次服务，见 [[measurements]] M-001。**只此一档**，页面上的数字并未因此改用实测值（见上一行）。注意本级的门槛是「**目标硬件**实测」，所以 `data/models/qwen3.8-27b.js` notes 里引的 vLLM recipe 在 1×/2× RTX 5090 上那几组引擎自报数字**不计入本级** —— 5090 不在 `data/instances.js` 里，那些数也不是本项目跑的，只能当旁证（[[measurements]] 开头有说明）。还缺的：roofline 的效率比 `实测 ÷ 下界`（见 [[adr-0010]] §6）；KV 每 token 字节数（M-001 反解不出来 —— 混合池统一 page 把 recurrent state 与 20.75% padding 摊了进去，需换 `--max-num-seqs` 跑两点法） |
+| `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB。各机型的 HBM 带宽与 dense TFLOPS 见 [[adr-0010]]，出处 URL 在 `data/instances.js` 注释里。**只取 dense 行，不取 sparsity 行** |
+| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账。Qwen3.8-27B：全部 BF16 51.75 GiB，以及官方 FP8 checkpoint 28.75 GiB。这是第一个「非 expert → FP8」档也是实测的模型（[[adr-0012]] §3） |
+| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；Gated DeltaNet state 的 dtype（config 写 float32，vLLM 默认落到 BF16，两个官方答案）；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 重量化为 FP8/BF16 后，按参数量推算出的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
+| `guessed` | 估计值 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，这一项直接决定最大并发**）。2026-09-16 起这一项**不再是「无依据」**：GLM-5.3-Flash / p5en / TP8 上引擎自报 6.98 GiB（[[measurements]] M-001），在那一个配置上本页高 72%。但页面用的仍是这个 12 GiB 的估计值，而且**别的模型 / 别的 TP 既不能照搬这个差值、也不能假定方向**（同一替换在 g7e/TP1 上是 50% 而不是 5%；`hc_mult = 4` 的模型真实开销可能反而超过 12 GiB），所以这一级不变 |
+| `measured` | 目标硬件实测 | **每卡非权重非 KV 开销 6.98 GiB**，以及权重 38.24 GiB/卡、KV 池 81.79 GiB、128K 满长并发 55.15 路。这些数字全部来自 2026-09-16 在 p5en 上对 GLM-5.3-Flash 起的那一次服务，见 [[measurements]] M-001。**目前只有这一档实测**，页面上的数字并未因此改用实测值（见上一行）。本级的门槛是「**目标硬件**实测」。所以 `data/models/qwen3.8-27b.js` notes 里引用的 vLLM recipe，在 1×/2× RTX 5090 上得到的那几组引擎自报数字，**不计入本级**：5090 不在 `data/instances.js` 里，这几组数字也不是本项目跑出来的，只能当旁证（[[measurements]] 开头有说明）。还缺两项：roofline 的效率比 `实测 ÷ 下界`（见 [[adr-0010]] §6）；KV 每 token 字节数。M-001 反解不出 KV 每 token 字节数，因为混合池用统一 page，把 recurrent state 与 20.75% padding 都摊了进去。要拆开，需要换 `--max-num-seqs` 跑两点法 |

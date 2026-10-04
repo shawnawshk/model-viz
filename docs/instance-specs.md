@@ -2,9 +2,9 @@
 
 ## 这份文件的用途
 
-**这是规格总目录，供查阅与去重——任何 instance 的规格都从这里取，不要每次去拉 API。**
+**这是规格总目录，供查阅与去重。任何 instance 的规格都从这里取。不要每次去拉 API。**
 
-它**不**决定工具支持哪些 instance。每个模型的候选 instance 列表写在该模型自己的 json（`candidateInstances`）里，建那个模型页面时单独与用户确认。「哪些机型值得为某个模型考虑」是业务判断，不从本目录自动推导。见 ADR-0005 §2。
+本目录**不**决定工具支持哪些 instance。每个模型的候选 instance 列表写在该模型自己的 json（`candidateInstances`）里。建那个模型页面时，单独与用户确认这份列表。「哪些机型值得为某个模型考虑」是业务判断，不从本目录自动推导。见 ADR-0005 §2。
 
 **口径：以 `describe-instance-types` 返回的 `MiB` 为唯一真值。** 其余单位全部由它派生。UI 显示统一用 GiB（ADR-0006）。
 
@@ -36,15 +36,23 @@ aws ec2 describe-instance-types --region us-west-2 \
 | B200 | 183359 | 179.1 | 192.3 | 180 GB | ≈GiB（含 ECC 保留） |
 | B300 | 275040 | 268.6 | **288.4** | 288 GB（NVIDIA） | 十进制 |
 
-数据中心卡（A100/H100/H200）按 GiB 标；Ada 衍生卡（A10G/L4/L40S）按十进制标；B300 又回到十进制。**因此任何计算都必须从 MiB 出发，不能拿标称数字直接当十进制 GB 用。**
+按标法分三类：
 
-> **已知影响**：`index.html` 现用 `gpuMem: 141e9`，即把 H200 的 141 当十进制 GB。真值为 `144384 MiB = 151.4e9 字节`，**低估 7.4%**（每卡 10.4 GB，32 卡 333 GB）。修正后推荐配置的最大并发从 107 路升至约 128 路。待修。
+- 数据中心卡（A100/H100/H200）按 GiB 标。
+- Ada 衍生卡（A10G/L4/L40S）按十进制标。
+- B300 又回到十进制标。
+
+**因此任何计算都必须从 MiB 出发。不能拿标称数字直接当十进制 GB 用。**
+
+> **已知影响**：`index.html` 曾用 `gpuMem: 141e9`，即把 H200 的 141 当十进制 GB。真值为
+> `144384 MiB = 151.4e9 字节`。这个常数比真值**低估 7.4%**（每卡 10.4 GB，32 卡 333
+> GB）。修正后，推荐配置的最大并发从 107 路升至约 128 路。已修正，见 `app.html` 的单位说明。
 
 ---
 
 ## NVLink / NVSwitch
 
-**NVLink 是 P 系列独占，G 系列一张都没有。** G7/G7e 多卡型号 spec 表写的是「Yes via PCIe」——那是 PCIe P2P，不是 NVLink。
+**NVLink 是 P 系列独占。G 系列一张都没有。** G7/G7e 多卡型号的 spec 表写的是「Yes via PCIe」。这是 PCIe P2P，不是 NVLink。
 
 | 实例族 | NVSwitch P2P | 来源 |
 |---|---|---|
@@ -55,13 +63,13 @@ aws ec2 describe-instance-types --region us-west-2 \
 | G5 / G5g / G6 / G6e / Gr6 | 无 | spec 表无 P2P 列 |
 | G7 / G7e 多卡（12xl+） | 无 NVLink，PCIe P2P | spec 页「Yes via PCIe」 |
 
-API 不返回 NVLink 信息，本表 NVLink 列全部来自 spec 页，级别 `spec`。
+API 不返回 NVLink 信息。本表 NVLink 列全部来自 spec 页，级别是 `spec`。
 
 ---
 
 ## EFA
 
-**EFA 支持是按 size 而非按 family 的。** 所有 G 系列族都遵循同一模式：小 size 不支持，`8xlarge` 及以上才支持。
+**EFA 支持按 size 分，不按 family 分。** 所有 G 系列族都遵循同一模式：小 size 不支持。`8xlarge` 及以上才支持。
 
 EFA 代际（来自 spec 页 / 发布公告，API 不返回代际）：
 
@@ -152,9 +160,16 @@ EFA 代际（来自 spec 页 / 发布公告，API 不返回代际）：
 
 ### 能承载大模型的候选（≥8 卡且有 NVLink）
 
-只有 5 个：`p4d.24xlarge`(320 GiB) / `p4de.24xlarge`(640 GiB) / `p5.48xlarge`(640 GiB) / `p5e`·`p5en.48xlarge`(1128 GiB) / `p6-b200`(1433 GiB) / `p6-b300`(2149 GiB)。
+只有 7 个：
 
-G 系列即便 8 卡（`g6e.48xlarge` 358 GiB、`g7e.48xlarge` 768 GiB）**也没有 NVLink**，卡间只能走 PCIe，因此不适合需要高 TP 的模型；它们的定位是单卡/少卡推理。
+- `p4d.24xlarge`（320 GiB）
+- `p4de.24xlarge`（640 GiB）
+- `p5.48xlarge`（640 GiB）
+- `p5e` · `p5en.48xlarge`（1128 GiB）
+- `p6-b200`（1433 GiB）
+- `p6-b300`（2149 GiB）
+
+G 系列即便是 8 卡（`g6e.48xlarge` 358 GiB、`g7e.48xlarge` 768 GiB），**也没有 NVLink**。卡间只能走 PCIe。因此 G 系列不适合需要高 TP 的模型。G 系列的定位是单卡/少卡推理。
 
 ### 对 Kimi K3（权重约 1.6 TB）的直接影响
 
@@ -177,6 +192,6 @@ G 系列即便 8 卡（`g6e.48xlarge` 358 GiB、`g7e.48xlarge` 768 GiB）**也�
 
 ### 未收录
 
-- `p6e-gb200.36xlarge` 及 `u-p6e-gb200x{36,72}` UltraServer：按 ADR-0005 已排除出范围；且 `us-west-2` 的 `describe-instance-types` 不返回该类型。
-- `g4dn` / `g4ad`：早于 G5，超出本清单范围。
+- `p6e-gb200.36xlarge` 及 `u-p6e-gb200x{36,72}` UltraServer：按 ADR-0005 已排除出范围。`us-west-2` 的 `describe-instance-types` 也不返回该类型。
+- `g4dn` / `g4ad`：早于 G5。超出本清单范围。
 - `trn*` / `inf*`：非 GPU。

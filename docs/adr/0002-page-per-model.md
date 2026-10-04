@@ -16,9 +16,9 @@
 
 我认为用户想要的是 A，但字面表述是 B。若按 B 实现：
 
-1. **内存模型被复制 N 份。** 当前 `compute()` 里的每一条公式（权重复制因子、KV 复制因子、util 预算、容量反解）都会在每个文件里存在一份。修一个 bug 要改 N 个文件，且必然漂移。
-2. **跨模型比较做不了。** 而这恰恰是有价值的问题：「同样 4 台 p6-b300，K3 和 DeepSeek-V4 哪个能跑更高并发」在 B 下无法回答。
-3. **instance 维度会与 model 维度相乘。** N 个模型 × M 个 instance，若两者都靠文件复制，组合爆炸。
+1. **实现会把内存模型复制成 N 份。** 当前 `compute()` 里的每一条公式（权重复制因子、KV 复制因子、util 预算、容量反解）都会在每个文件里存在一份。修一个 bug 要改 N 个文件。这些文件必然会漂移。
+2. **跨模型比较做不了。** 这恰恰是有价值的问题：「同样 4 台 p6-b300，K3 和 DeepSeek-V4 哪个能跑更高并发」。读法 B 回答不了这个问题。
+3. **instance 维度会与 model 维度相乘。** 如果两个维度都靠文件复制，N 个模型 × M 个 instance 的组合就会爆炸。
 
 ## 提议
 
@@ -33,12 +33,12 @@ model-viz/
 ```
 
 - 选择通过 URL 传递：`app.html?model=kimi-k3&instance=p6-b300`
-- `index.html` 生成模型卡片链到 `app.html?model=<id>`，用户看到的仍是「一个模型一页」
+- `index.html` 生成模型卡片，链接到 `app.html?model=<id>`。用户看到的仍是「一个模型一页」
 - 所有公式只有一份实现
 
 ## 关键难点：attention family 不是常数，是语义
 
-这是模型维度的真正成本，不在「换几个数字」上。当前实现硬编码了两个 attention family：
+模型维度的真正成本，不在「换几个数字」上。当前实现硬编码了两个 attention family：
 
 | family | KV 结构 | TP 交互 |
 |---|---|---|
@@ -54,7 +54,7 @@ model-viz/
 | 滑窗 / 混合 | 每层按窗口上限截断 | 同上，但每层容量有上限 |
 | SSM / Mamba | 固定大小 state | per-channel 可切 |
 
-**GQA 那一行是关键反例**：它的 TP 复制因子不是常数，而是 `max(1, TP / n_kv_heads)` —— 一个依赖并行配置的函数。也就是说「KV 复制因子」不能建模成模型属性，必须是 `f(attention_family, model_config, parallel_config)`。
+**GQA 那一行是关键反例**：GQA 的 TP 复制因子不是常数。TP 复制因子是 `max(1, TP / n_kv_heads)`，这是一个依赖并行配置的函数。也就是说，「KV 复制因子」不能建模成模型属性。「KV 复制因子」必须是 `f(attention_family, model_config, parallel_config)`。
 
 同理，模型维度还会改变**控件集本身**：dense 模型没有 EP 轴，MoE 才有。UI 必须能按模型隐藏无意义的维度。
 
@@ -75,11 +75,11 @@ model-viz/
 }
 ```
 
-注意 `layers` 是**分段列表**而非单一 family —— 混合注意力（K3 是 69 KDA + 24 MLA）是常态而非特例，数据契约从第一天就必须支持。
+注意：`layers` 是**分段列表**，不是单一 family。混合注意力是常态，不是特例（K3 是 69 KDA + 24 MLA）。数据契约从第一天就必须支持混合注意力。
 
 ## 决议
 
-取**读法 A**。`index.html` 做模型索引，`app.html?model=` 是唯一引擎，公式只有一份实现。
+取**读法 A**。`index.html` 做模型索引。`app.html?model=` 是唯一引擎。公式只有一份实现。
 
 ## 实施记录（2026-09-01）与两处偏离
 
@@ -93,16 +93,18 @@ data/models/kimi-k3.js      模型定义
 ```
 
 **偏离 1：数据文件用 `.js` 而非 `.json`。**
-原方案设想 `fetch()` 读 JSON。但本工具是从 `file://` 直接打开的（用户一直 `open index.html`，且页面可能要发给外部读者），而 `file://` 下 `fetch()` 会被 CORS 拦掉。可选方案是要求跑本地 HTTP server 或加构建步骤，两者都增加摩擦。
-最终用 classic `<script>` 标签加载 `.js` 数据文件（`REG.instances = {...}` / `REG.models["id"] = {...}`）——script 标签在 `file://` 下不受 CORS 限制，**零构建、零服务器、双击即用**。代价是数据文件不是纯 JSON，且新增模型要同时加一个 `<script>` 标签。
+原方案设想用 `fetch()` 读取 JSON。但本工具是从 `file://` 直接打开的。原因：用户一直用 `open index.html` 打开页面，而且页面可能要发给外部读者。在 `file://` 下，CORS 会阻止 `fetch()`。可选方案是跑一个本地 HTTP server，或者加一个构建步骤。这两种方案都会增加使用摩擦。
+
+最终方案：用 classic `<script>` 标签加载 `.js` 数据文件（`REG.instances = {...}` / `REG.models["id"] = {...}`）。`<script>` 标签在 `file://` 下不受 CORS 限制，这样可以做到**零构建、零服务器、双击即用**。代价是：数据文件不是纯 JSON，而且新增模型时要同时加一个 `<script>` 标签。
 
 **偏离 2：机型不按 `instances/<id>.json` 一个一个拆。**
-10 个机型共用同一 shape、且是扁平目录性质，拆成 10 个文件属于为不存在的规模做结构。合并为单个 `data/instances.js`。
-**模型仍是一文件一个**（`data/models/<id>.js`）——模型才是会长的那个维度，也是本 ADR 关心的轴。
+10 个机型共用同一个 shape，而且本质上是一个扁平目录。拆成 10 个文件，等于为不存在的规模做结构。所以合并为单个 `data/instances.js`。
+
+**模型仍是一文件一个**（`data/models/<id>.js`）。原因：模型才是会持续增长的维度，也是本 ADR 关心的轴。
 
 ## attention family 抽象的落地形态
 
-引擎里是一张语义表，加一个 family 就是加一条，`compute()` 不动：
+引擎里是一张语义表。加一个 family，就是加一条表项。`compute()` 不用改动：
 
 ```js
 const FAMILY = {
@@ -114,11 +116,11 @@ const FAMILY = {
 };
 ```
 
-模型的 `layers` 是分段列表，引擎遍历求和得到 `kvBytesPerToken` 与 `stateBytesPerReq`。K3 的 69 KDA + 24 MLA 由此自然表达。
+模型的 `layers` 是分段列表。引擎遍历这个列表求和，得到 `kvBytesPerToken` 与 `stateBytesPerReq`。K3 的 69 KDA + 24 MLA，由此自然表达。
 
-**仍未验证**：`gqa` 那一条（复制因子 `max(1, TP/n_kv_heads)` 是并行配置的函数，不是常数）在只有一个模型时无法验证，因此**没有预先写进表里**。加第二个模型时再加。
+**仍未验证的一点**：`gqa` 那一条，即复制因子 `max(1, TP/n_kv_heads)` 是并行配置的函数、不是常数，在只有一个模型时无法验证。因此，这一条**没有预先写进表里**。等加入第二个模型时再加。
 
 ## 未决
 
 - 是否需要跨模型对比视图，或只需跨 instance 对比？（不阻塞，可后加）
-- attention family 抽象的落地时机：见 ADR-0003，model 轴排在 instance 轴之后，契约先抽出但只填 Kimi K3 一个模型。
+- attention family 抽象的落地时机：见 ADR-0003。model 轴排在 instance 轴之后，契约先抽出，但只填 Kimi K3 一个模型。
