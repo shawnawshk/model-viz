@@ -11,6 +11,7 @@
 REG.models["kimi-k3"] = {
   name: "Kimi K3",
   hf: "moonshotai/Kimi-K3",
+  vllmRecipe: "https://recipes.vllm.ai/moonshotai/Kimi-K3",
   // 官方模型卡 Native Multimodality & Long Context:文本、图像和视频理解;pipeline_tag=image-text-to-text。
   modalities: {
     input: ["text", "image", "video"], output: ["text"],

@@ -38,16 +38,18 @@ roofline 下界与显存结果用同一组输入。
     - 这个值 ±12 GiB 时，并发变动约 20%。
     - 2026-09-16 有了第一个实测值：GLM-5.3-Flash 在 p5en/TP8 上，引擎自报 6.98 GiB。
     - **这个实测值不能外推到其他模型或其他 TP，误差方向也不确定。** 见 [`docs/measurements.md`](docs/measurements.md) M-001。
-  - **K3 与 GLM-5.3-Flash：** KV cache 的 dtype 是**假设**。BF16↔FP8 使并发变动约 100%。
-  - **仅 GLM-5.3-Flash：** DSA indexer key cache 的池化方式与 dtype，影响约 ±10%。
-  - **仅 DeepSeek-V4.1-Flash：**
-    - KV dtype 由架构固定，所以不是假设。
-    - 但这个模型有**目前最大的一项软数字**：189 GiB 的 engram 是否整张常驻 HBM。影响约 40%。
-    - 短期内**不能**用实测消除这一项，因为还没有生产引擎支持这个结构。
-  - **仅 Qwen3.8-27B：** Gated DeltaNet state 的 dtype 有两个官方答案。
+  - **除 DeepSeek-V4.1-Flash 外的所有模型：** KV cache 的 dtype 是**假设**。BF16↔FP8 使并发变动约 100%。
+  - **带 indexer 的模型：** indexer key cache 的布局与 dtype 是引擎实现。
+    - GLM-5.3-Flash：池化方式与 dtype 都没有一手依据，影响约 ±10%。
+    - GLM-5.3 与 Qwen3.8-Flash-Next：布局取自 vLLM 源码，但别的引擎可能不同。
+  - **带按 TP 切的查表的模型（DeepSeek-V4.1-Flash 的 engram、Qwen3.8-Flash-Next 的 n-gram 表）：**
+    - 查表放在 host 还是常驻 HBM，是引擎启动参数。页面把它做成输入，默认取 vLLM 的默认值（host offload，HBM 占用为 0）。见 ADR-0013。
+    - 这一项能把结论翻转：DSv4.1 的 TP1×DP8 在两档之间是 0 路 ⇄ 4,928 路。页面同屏显示另一档的路数。
+  - **仅 DeepSeek-V4.1-Flash：** KV dtype 由架构固定，所以不是假设。
+  - **Qwen3.8-27B 与 Qwen3.8-Flash-Next：** Gated DeltaNet state 的 dtype 有两个官方答案。
     - config 写 float32。
     - vLLM 默认使用 BF16。
-    - 在 1K 上下文下，两者相差约 1.5 倍。在 128K 上下文下，相差不到 1%。
+    - 在 1K 上下文下，两者相差约 1.3–1.5 倍。在 128K 上下文下，相差不到 1%。
 - **不要把本工具的结果用作容量规划或采购承诺。**
 - 每个页面的顶部按当前模型逐项列出这些软数字。页面也说明：这个清单可能不完整。
 
@@ -86,27 +88,31 @@ roofline 下界与显存结果用同一组输入。
 - [`docs/glossary.md`](docs/glossary.md)：领域词汇。包括：NVLink 域 ≠ 实例；推理 DP ≠ 训练 DP；KV 复制因子按 attention family 不同；provenance 分五级。
 - [`docs/instance-specs.md`](docs/instance-specs.md)：G5–G7 / P4d–P6 共 57 个实例的规格总目录。真值用 `describe-instance-types` 给出的 MiB。
 - [`docs/measurements.md`](docs/measurements.md)：实测记录。目前只有一条（M-001）：2026-09-16 在 p5en 上运行 GLM-5.3-Flash 服务，读取引擎自报的内存账。这条实测用来替换每卡 12 GiB overhead 这个估计常数。**每条记录都写明：结论可以推广到哪里，不能推广到哪里。**
-- [`docs/adr/`](docs/adr/)：ADR-0001 至 0012。主要决策：
+- [`docs/adr/`](docs/adr/)：ADR-0001 至 0014。主要决策：
   - TP 上限由 NVLink 域决定，不由「节点」决定；
   - 单位一律用 GiB；
   - KV cache 的 dtype 是引擎参数，不是模型属性（ADR-0009 记录了例外）；
   - 权重按三桶实测字节计算（第三桶按 TP 切，不按 PP 切）；
   - decode roofline 下界（ADR-0010）；
   - 同机型、同台数内的 Pareto 反事实建议器（ADR-0011）；
-  - GQA family 与 dense 模型（ADR-0012）：KV 复制因子是并行配置的函数；`moe` 块是可选的。
+  - GQA family 与 dense 模型（ADR-0012）：KV 复制因子是并行配置的函数；`moe` 块是可选的；
+  - 按 TP 切的查表放在哪是引擎参数，默认取 vLLM 的 host offload（ADR-0013）；
+  - QSA family（ADR-0014）：主 KV 按 kv head 切，indexer key 每卡一份；DSA 支持 IndexCache。
 
 ## 当前收录
 
-4 个模型，10 个机型（P6/P5/P4 与 G7/G6e）。
+6 个模型，10 个机型（P6/P5/P4 与 G7/G6e）。
 
 | 模型 | 权重 | 结构 | 一台 p5en 的最大并发 |
 |---|---|---|---|
 | [Kimi K3](data/models/kimi-k3.js) | 1453.7 GiB（MXFP4） | 93 层 = 69 KDA + 24 MLA · 896 experts / top-16 | 一台装不下。最少 4 台 → 68 路 |
 | [GLM-5.3-Flash](data/models/glm-5.3-flash.js) | 305.8 GiB（FP8） | 45 层 = 34 KDA + 11 DSA · 288 experts / top-8 | 320 路（TP1×DP8） |
-| [DeepSeek-V4.1-Flash](data/models/deepseek-v4.1-flash.js) | 475.2 GiB（原生 FP4/FP8 混合） | 40 层 = 4 CSA2 + 36 SWA · 384 experts / top-6 | 538 路（TP4×DP2；TP1 装不下） |
+| [GLM-5.3](data/models/glm-5.3.js) | 703.7 GiB（FP8；官方 BF16 版 1,403 GiB） | 78 层全 DSA（21 层带 indexer，57 层复用 top-k）· 256 experts / top-8 | 2 路（TP8/DP1，vLLM recipe 的配置）；TP1×DP8 一路 128K 的 KV 都放不进。两台 TP1×DP16 是 64 路 |
+| [DeepSeek-V4.1-Flash](data/models/deepseek-v4.1-flash.js)（同样适用于 -1017） | 475.2 GiB（原生 FP4/FP8 混合） | 40 层 = 4 CSA2 + 36 SWA · 384 experts / top-6 | 4,928 路（TP1×DP8，engram 放 host）；engram 常驻 HBM 时 538 路（TP4×DP2），TP1 装不下 |
 | [Qwen3.8-27B](data/models/qwen3.8-27b.js) | 51.7 GiB（BF16；官方 FP8 28.7 GiB） | 64 层 = 48 Gated DeltaNet + 16 GQA · **dense，无 MoE** | 100 路（TP4×DP2；TP8 只有 53 路） |
+| [Qwen3.8-Flash-Next](data/models/qwen3.8-flash-next.js) | 335.3 GiB（BF16，其中 n-gram 表 95.4 GiB；官方 FP8 172.8 GiB） | 48 层 = 36 Gated DeltaNet + 12 QSA · 512 experts / top-10 | 196 路（TP2×DP4）；官方 TEP8 只有 52 路 |
 
-> 上表的四个路数都在以下口径下读取：**128K 上下文 / util 0.90 / BF16 KV / 原生量化**。
+> 上表的路数都在以下口径下读取：**128K 上下文 / util 0.90 / BF16 KV / 原生量化 / 查表放 host（vLLM 默认）**。
 >
 > **报告任何路数时，都必须同时报告口径。** 例如，同一个 TP1×DP8：
 > - 改为 1M 上下文，只剩 40 路；
@@ -114,7 +120,7 @@ roofline 下界与显存结果用同一组输入。
 >
 > 页面上的预设按钮按当前口径**实时计算**路数，并把口径标在数字旁边（`320 路 @128K/0.90`）。
 
-四个模型的切分权衡**方向各不相同**。这是本工具最值得看的一点：
+各模型的切分权衡**方向各不相同**。这是本工具最值得看的一点：
 
 - **K3 需要 TP。** 非 expert 权重有 106.5 GiB，用 DP 复制它的代价很高。
 - **GLM 需要 DP。**
@@ -122,17 +128,25 @@ roofline 下界与显存结果用同一组输入。
   - TP 会把 KV latent 复制 TP 份。
   - 在同一台机器上、128K 上下文下：TP1×DP8 是 320 路，TP8/DP1 只有 53 路。
   - 这个 6 倍差距随口径变小：在 1K 上下文下只剩 1.11×。在 1K 下，TP2×DP4 的并发超过这两个配置。
-- **DSv4.1 的 TP 有下限，下限随单卡显存变化。**
-  - 475.2 GiB 权重中有 189.13 GiB 是 engram。engram 只能按 TP 切。
-  - 在 p5en 上，TP 必须 ≥ 4（TP4 = 538 路 > TP8 = 488 路）。
-  - 在 b300 上，TP = 2 最优。TP = 1 差 5.56 GiB，装不下。
-  - 在 GLM 页上，点 TP1×DP8 时并发增加 6 倍。在 DSv4.1 页上，同样的操作直接显示红字「装不下」。
+- **GLM-5.3 在一台和两台上方向相反。**
+  - expert bank 有 684 GiB。一台 p5en 上，它先占掉每卡预算的 67%。
+  - 所以一台上 TP1×DP8 装不下（一路 128K 的 KV 要 11.3 GiB），而 GLM-5.3-Flash 上这是最好的一档。
+  - 两台把 expert bank 摊到 16 卡，KV 复制的代价重新占主导：TP1×DP16 是 TP8/DP2 的 5.3 倍。
+- **DSv4.1 的结论取决于 engram 放在哪。**
+  - 475.2 GiB 权重中有 189.13 GiB 是 engram。vLLM 默认把它放在 host 内存。
+  - 放 host 时，KV 只有 890 B/token，TP 越小越好：p5en 上 TP1×DP8 是 4,928 路，官方 MP=8 是 697 路。
+  - 常驻 HBM 时，engram 只能按 TP 切，TP 有下限：p5en 上 TP 必须 ≥ 4（TP4 = 538 路 > TP8 = 488 路）；b300 上 TP = 1 差 4.30 GiB，装不下。
+  - 页面上切换「查表放置」，同一个 TP1×DP8 预设在 0 路与 4,928 路之间翻转。
 - **Qwen3.8-27B 的最佳 TP 等于 n_kv_heads。**
   - GQA 只有 4 个 kv head。
   - TP ≤ 4 时，KV 按 head 切，不复制。同时 TP 也切分权重。
   - TP = 8 时，TP 超过 4 个 head，KV 复制 2 份，DP 减少一半。并发从 100 路降到 53 路，与 TP1×DP8 的 56 路接近。
   - Qwen3.8-27B 是第一个 dense 模型。它也是第一个把 H100 80GB 与 G 系（g7e）列入候选的模型。
   - g7e 没有 NVLink，域 = 1，所以 TP 上限是 1。每张卡都必须放下全部 51.75 GiB 权重。这是 ADR-0001「显存装得下不代表能用」第一次在页面上起作用。
+- **Qwen3.8-Flash-Next 是 Qwen3.8-27B 与 DSv4.1 两页的叠加。**
+  - QSA 只有 2 个 kv head，TP 的最佳取值是 2：TP2×DP4 是 196 路，vLLM recipe 的 TEP8 复制 KV 4 份，只有 52 路。
+  - n-gram 表常驻 HBM 时只能按 TP 切，TP1×DP8 装不下 —— DSv4.1 的「TP 有下限」回来了。
+  - vLLM recipe 写明 H100 上 n-gram 表必须 offload，n-gram 嵌入目前不支持 PP。
   - 候选机型原来还有 g6e。2026-09-17 移除了 g6e。原因：
     - g6e 的余量是 11.5 GiB（预算 40.23 − 官方 FP8 权重 28.75）。
     - 每卡 12 GiB overhead 的估计值与实测值之间的差，大于这个余量。

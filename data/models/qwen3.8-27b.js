@@ -15,6 +15,7 @@
 REG.models["qwen3.8-27b"] = {
   name: "Qwen3.8-27B",
   hf: "Qwen/Qwen3.8-27B",
+  vllmRecipe: "https://recipes.vllm.ai/Qwen/Qwen3.8-27B",
   // 官方模型卡 Vision-Language Understanding 与图像/视频输入示例;pipeline_tag=image-text-to-text。
   modalities: {
     input: ["text", "image", "video"], output: ["text"],

@@ -1,4 +1,4 @@
-// DeepSeek-V4.1-Flash —— deepseek-ai/DeepSeek-V4.1-Flash
+// DeepSeek-V4.1-Flash —— deepseek-ai/DeepSeek-V4.1-Flash(页面链接指向同结构的刷新版 -1017,见 hf 字段)
 //
 // 数据分级(见 docs/glossary.md 的 provenance 五级):
 //   结构参数              derived  —— config.json(text_config)+ inference/config.json
@@ -7,21 +7,31 @@
 //   每 token KV 字节数     derived  —— 从 inference/model.py 的 buffer 形状与量化调用反推,
 //                                    结果与 model card 的头号数字「890 bytes per token」精确吻合。
 //                                    **这是本项目第一个 dtype 也有一手依据的模型**,见 ADR-0009 §3
-//   engram 是否常驻 HBM    guessed  —— 本页按「整张常驻」计。量级 40%,是本页最大的软数字
+//   engram 放在哪          引擎参数 —— vLLM 自 2026-09-21 起支持 engram,默认 cpu_offload = true(整张表放 host),
+//                                    已提为界面输入,默认取 vLLM 默认值(ADR-0013)。旧口径「整张常驻 HBM」是另一档
 //   SWA 环形 buffer dtype  estimated —— 参考实现分配 BF16,注释说数值上是 FP8
+//
+// 同结构的刷新版 deepseek-ai/DeepSeek-V4.1-Flash-1017(2026-10-17)与本 checkpoint 的 config.json、inference/config.json、
+// inference/*.py、index.json(含 96,085 个张量的 shard 映射)逐文件相同,48 个 shard 的 safetensors header
+// (每个张量的 dtype / shape / data_offsets)逐个相同 —— 只有权重值变了。所以本页每一个数都同样适用于 -1017,
+// 不另开一页(2026-10-30 与用户确认),只在 blurb 与 notes 第一条里注明。
 //
 // 注意 index.json 必须走 resolve 端点,raw 只返回 git-lfs 指针。
 
 REG.models["deepseek-v4.1-flash"] = {
   name: "DeepSeek-V4.1-Flash",
-  hf: "deepseek-ai/DeepSeek-V4.1-Flash",
+  // 页面的 HF 链接、标题与首页卡片指向 -1017(2026-10-30 用户要求)。下面所有字节数是在 V4.1-Flash 上逐张量读的,
+  // 两者 48 个 shard 的 header 逐个相同,所以对 -1017 同样成立。
+  hf: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  vllmRecipe: "https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash",   // -1017 的地址会 307 跳到这里;那一页写着「1017 is the default here」「share its config and footprint」
   // 官方模型卡明确说明原生处理图像与文本,自回归生成文本。
   modalities: {
     input: ["text", "image"], output: ["text"],
     sources: ["https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/README.md"],
   },
   blurb: "552B backbone(+196B engram)· 8B prefill / 16B decode 激活 · 40 层 CED(20 encoder + 20 decoder)"
-       + " · CSA2 稀疏注意力,每 token KV 仅 890 B · 384 routed experts / top-6 · expert 原生 FP4 · 多模态",
+       + " · CSA2 稀疏注意力,每 token KV 仅 890 B · 384 routed experts / top-6 · expert 原生 FP4 · 多模态"
+       + " · 同结构的 -1017 刷新版适用本页全部数字",
   hidden: 5120,                              // dim,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构 ----
@@ -94,7 +104,10 @@ REG.models["deepseek-v4.1-flash"] = {
   // ---- 第三桶的文案 ----
   tpShardedLabel: "engram 哈希查表(按 TP 切,不按 PP 切)",
   tpShardedShort: "engram 查表",
-  tpShardedNote: "字节数实测(2 × 384M 行 × 256 维 FP8);可疑的是放置方式 —— 「整张常驻 HBM」是猜测,量级 40%",
+  tpShardedNote: "字节数实测(2 × 384M 行 × 256 维 FP8);vLLM 默认放 host(cpu_offload),常驻 HBM 时按 TP 切",
+  // 常驻那一档的另一个出路,显示在「常驻 HBM」那条 banner 里
+  lookupHbmCaveat: `vLLM 另有 <code>--engram-config '{"embedding_across_dp": true}'</code>:把 hash head 摊到 TP × DP 全部卡上、只存一份,`
+    + `代价是每步多一次 DP 间的集合通信 —— 本页不建模这一档,它介于常驻与 offload 之间。`,
 
   // ---- 每请求固定占用的文案(滑窗环,不是 recurrent state)----
   stateNote: "滑窗环形 buffer:结构由 config 推出(window_size 128),但存储 dtype 是假设(BF16 或 FP8)",
@@ -124,45 +137,62 @@ REG.models["deepseek-v4.1-flash"] = {
 
   // ---- 候选实例:业务判断,与用户逐个确认,不从 instance 目录自动推导(ADR-0005 §2)。
   // 与 K3 / GLM 两页对齐,只保留 P 系这 4 个,便于三个模型并排比较。
-  // 本模型与前两个的关键差别:475.24 GiB 权重里有 189.13 GiB 只能按 TP 切,于是
-  // **TP 有下限,且下限随单卡显存移动** —— p5en/p5e 上 TP 必须 ≥4,b200 上 ≥2,b300 上 ≥2
-  // (b300 的 TP=1 差 5.56 GiB)。H100 80GB 一档整台都装不下 189 GiB ÷ 8 + 275 GiB ÷ 8,不在候选里。
+  // 本模型与前两个的关键差别:475.24 GiB 权重里有 189.13 GiB 的 engram,它常驻 HBM 时只能按 TP 切,于是
+  // **常驻时 TP 有下限,且下限随单卡显存移动** —— p5en/p5e 上 TP 必须 ≥4,b200 / b300 上 ≥2(b300 的 TP=1 差 4.30 GiB)。
+  // vLLM 默认把 engram 放 host(ADR-0013),那时这条下限不存在。H100 80GB 在常驻时整台装不下,offload 时一台 TP8 就有 213 路 @128K,
+  // 但不在 2026-09-09 确认的候选里。
   candidateInstances: [
     "p6-b300.48xlarge", "p6-b200.48xlarge", "p5en.48xlarge", "p5e.48xlarge",
   ],
   defaultInstance: "p5en.48xlarge",
   // 起始切分取官方 inference/README.md 明写的 MP=8 —— 这是唯一有一手依据的切分。
-  // 点一下旁边的 TP4/DP2 就能看到它在本页口径下其实不是最高的那档。
+  // 默认口径(engram 放 host)下 TP 越小越高:TP1×DP8 是它的 7 倍;把 engram 切成常驻,TP1 / TP2 又直接装不下。
   defaultParallel: { n: 1, tp: 8, dp: 1, pp: 1, ep: 8 },
 
   // 每个预设都绑定机型 —— 点它会连机型一起切过去,所以 UI 上必须把机型显示出来。
   //
   // 名字里「不要」写绝对路数,也「不要」写「推荐 / 最优」(ADR-0008 §9 / ADR-0005)。
-  // 本模型尤其不能标:最优 TP 随机型变(见下表),标它就是把一个随口径漂移的结论钉死。
-  // 128K / util 0.90 / 原生 FP4 下手算(路数):
-  //     机型            TP1      TP2      TP4     TP8
-  //     p5en 1 台     装不下   装不下      532     487
-  //     b200 1 台     装不下      500    1,134   1,020
-  //     b300 1 台   差 5.56G    3,340    2,554   1,498
-  // 三个机型的最优 TP 分别是 4 / 4 / 2,而 TP=1 在三个上全部装不下。
-  // 这与 GLM 那页的教训方向**相反**:GLM 上 TP 越小越好(TP 复制 KV latent),
-  // 这里 KV 只有 890 B/token,复制它几乎不疼,掐住你的是只能按 TP 切的 engram。
-  // 所以名字只描述结构,括号里标该切分下 engram 被切成几份 —— 这是差异的机制,恒真。
+  // 本模型尤其不能标:最优 TP 随机型变、更随「查表放置」翻转(见下表),标它就是把一个随口径漂移的结论钉死。
+  // 128K / util 0.90 / 原生 FP4 下手算(路数;2026-10-30 重算,旧表里 b200 / b300 的数已过期):
+  //                     engram 放 host(vLLM 默认)              engram 常驻 HBM
+  //     机型          TP1     TP2     TP4     TP8          TP1        TP2     TP4    TP8
+  //     p5en 1 台   4,928   2,648   1,370     697       差 119G    差 19.3G    538    488
+  //     b200 1 台   7,344   3,856   1,974     998       差 84.9G       524   1,140    790
+  //     b300 1 台  13,024   6,696   3,394   1,708       差 4.30G     3,364   2,560  1,500
+  // 两档的结论方向**相反**:
+  //   放 host 时,KV 只有 890 B/token,复制它几乎不疼,TP 越小越好 —— 与 GLM-5.3-Flash 同向;
+  //   常驻时,掐住你的是只能按 TP 切的 engram,TP 有下限(p5en ≥4、b200 / b300 ≥2),最优 TP 是 4 / 4 / 2。
+  // 所以名字只描述结构,括号里标常驻时 engram 被切成几份 —— 这是常驻那一档差异的机制,恒真。
   presets: [
-    { name: "TP8/DP1(官方 MP=8,engram ÷8)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8  },
-    { name: "TP4/DP2(engram ÷4)",            inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8  },
-    // 这两个在 p5en 上装不下 —— 留着不是凑数:GLM 那页点 TP1×DP8 是并发跳 6 倍,
-    // 这一页点它是直接红字。两页对照才看得出 engram 把选择空间砍掉了一半。
-    { name: "TP2/DP4(engram ÷2)",            inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
-    { name: "TP1×DP8(engram 不切)",          inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8  },
-    // b300 显存大到 TP=2 能塞进 engram 的一半,于是最优 TP 反而降下来
-    { name: "b300 TP2/DP4(engram ÷2)",       inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
-    // 两台:EP 翻倍摊薄 expert,但 engram 仍只跟 TP 走 —— 所以 TP 不能跟着降
-    { name: "两台 TP4/DP4/EP16",              inst: "p5en.48xlarge",    n: 2, tp: 4, dp: 4, pp: 1, ep: 16 },
+    { name: "TP8/DP1(官方 MP=8;常驻时 engram ÷8)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8  },
+    { name: "TP4/DP2(常驻时 engram ÷4)",            inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8  },
+    // 这两个在 engram 常驻时装不下 —— 留着不是凑数:放 host 时它们是 p5en 上最高的两档,
+    // 切成常驻就直接红字。同一个按钮在两档之间 0 路 ⇄ 几千路,这是本页最该被看见的事。
+    { name: "TP2/DP4(常驻时 engram ÷2)",            inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
+    { name: "TP1×DP8(常驻时 engram 不切)",          inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8  },
+    // b300 显存大到常驻时 TP=2 也能塞进 engram 的一半,于是常驻那一档的最优 TP 降下来
+    { name: "b300 TP2/DP4(常驻时 engram ÷2)",       inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
+    // 两台:EP 翻倍摊薄 expert,但常驻时 engram 仍只跟 TP 走 —— 所以 TP 不能跟着降
+    { name: "两台 TP4/DP4/EP16",                     inst: "p5en.48xlarge",    n: 2, tp: 4, dp: 4, pp: 1, ep: 16 },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
   notes: [
+    `<b>本页同样适用于 <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017" target="_blank" rel="noopener noreferrer">DeepSeek-V4.1-Flash-1017</a></b>`
+    + `(2026-10-17 的刷新版,model card 自称「minor update」)。两者的 <code>config.json</code>、<code>inference/config.json</code>、`
+    + `<code>inference/</code> 下的 <code>model.py / convert.py / engram.py / kernel.py / vision.py / README.md</code> <b>逐文件相同</b>,`
+    + `<code>index.json</code> 的 <code>total_size</code> 与 96,085 个张量的 shard 映射相同,48 个 shard 的 safetensors header `
+    + `(每个张量的 <code>dtype / shape / data_offsets</code>)<b>逐个相同</b> —— 只有权重的值变了。显存与 roofline 只看结构与字节数,`
+    + `所以本页每一个数对 -1017 都成立,不另开一页。`,
+
+    `<b>engram 现在有生产引擎实现了,而它默认不进 HBM。</b>vLLM 从 2026-09-21 起有 engram 的功能页(<code>docs/features/engram.md</code>):`
+    + `模型带 <code>engram_layer_ids</code> 就自动建 <code>EngramConfig()</code>,<code>cpu_offload</code> 默认 <code>true</code> —— `
+    + `两张表放在 pinned host memory 上,要查的行由 token id 提前算出,在前几层计算时经 UVA 从侧 stream 预取,「省下的 GPU 显存给 KV cache」。`
+    + `host 侧每个 DP replica 一份 TP 切片;同节点的 DP replica 默认经 <code>/dev/shm</code> 共享一份(<code>dp_shared_memory</code>)。`
+    + `常驻 HBM 要显式传 <code>--engram-config.cpu_offload false</code>;另有 <code>embedding_across_dp</code> 把 hash head 摊到 TP × DP 全部卡上,本页不建模。<br>`
+    + `这一页原先把「整张表常驻 HBM」当默认、标为本页最大的猜测(量级 40%)。ADR-0013 把它改成了输入,默认取 vLLM 的默认值;`
+    + `p5en 上官方 MP=8 因此从 488 路变成 697 路,TP1×DP8 从装不下变成 4,928 路。旧口径还在,切到「常驻 HBM」就能看到。`,
+
     `<b>权重全部是实测值,与 index.json 精确相等</b>。做法是对 48 个 shard 各发两个 Range 请求读 `
     + `safetensors header,把 <b>96,085</b> 个张量的 <code>dtype / shape / data_offsets</code> 求和:`
     + `字节合计 <code>510,286,023,000</code>,与 <code>index.json</code> 的 `

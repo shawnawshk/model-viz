@@ -91,7 +91,9 @@ KV cache 复制因子指一个 token 的 KV 在集群里存了几遍。**由 att
 - **MLA**（Kimi K3 的 24 个 full-attn 层）：所有 head 共享压缩 latent，所以 TP 组内每张卡各存一份完整副本。复制因子是 **TP**
 - **DSA**（DeepSeek Sparse Attention，GLM-5.3-Flash 的 11 个 full-attn 层）：latent 的复制行为与 MLA 完全相同。DSA **额外**有 lightning indexer 自己的一份 per-token key cache，同样是单头共享、同样复制 TP 份，但走自己的 dtype，不受 `--kv-cache-dtype` 影响
 - **GQA**（Qwen3.8-27B 的 16 个 full-attn 层）：KV 按 kv head 切分。`n_kv_heads ≥ TP` 时不复制；`n_kv_heads < TP` 时复制 `TP / n_kv_heads` 份。复制因子是**并行配置的函数**，引擎用 `kvShards(g, tp) = min(TP, n_kv_heads)` 钩子表达，见 [[adr-0012]]。后果：TP 的最佳取值是 n_kv_heads。TP ≤ 4 时既切权重又不复制 KV；TP=8 时越过 n_kv_heads，开始复制
-- **线性注意力 / SSM 的 recurrent state**（KDA：K3 / GLM；Gated DeltaNet：Qwen3.8-27B）：recurrent state 是 per-head 的，可按 head 切，所以不复制
+- **QSA**（Qwen Sparse Attention，Qwen3.8-Flash-Next 的 12 个 full-attn 层）：两部分切法相反。主 KV 是 GQA，按 kv head 切，复制因子 `max(1, TP / n_kv_heads)`（n_kv_heads = 2）；另有一份压缩的 indexer key（每 4 个 token 一行、只有 1 个 head），TP 切不掉，复制 TP 份，走引擎的 `indexer_kv_dtype`。引擎里 `kvShards` 只切前一部分，见 [[adr-0014]]
+- **IndexCache**（GLM-5.3 的 `indexer_types = "shared"` 层）：这种 DSA 层复用上一个 full 层选出的 top-k，不存自己的 indexer key。latent 照存照读
+- **线性注意力 / SSM 的 recurrent state**（KDA：K3 / GLM；Gated DeltaNet：Qwen3.8-27B / Qwen3.8-Flash-Next）：recurrent state 是 per-head 的，可按 head 切，所以不复制
 
 DP 和 PP 在任何 family 下都不复制 KV。
 
@@ -102,6 +104,9 @@ DSA 这类稀疏注意力的 `index_topk` 决定的是每个 query 去**看**多
 KV cache 的 dtype **不是模型属性，是引擎启动参数**（`--kv-cache-dtype`，默认 `auto` = 模型 dtype = BF16；FP8 要显式开）。`config.json` 与 checkpoint 里都没有这项信息，工具无论怎么查模型都推不出来。这个 dtype 把每 token 的 KV 字节数直接翻倍或砍半，是本工具敏感度最高的单项，因此必须作为界面输入并显示反事实，不能当常数。详见 [[adr-0007]]。
 
 KV cache 的 dtype 与「KV cache 复制因子」是两件独立的事：复制因子由 attention family 与并行配置决定，dtype 由部署决定，两者相乘才是每卡的 KV 占用。
+
+### 查表放置（engram / n-gram 表）
+DeepSeek-V4.1-Flash 的 engram 与 Qwen3.8-Flash-Next 的 n-gram 表（vLLM 叫 PLE）是按行切的大查表，每 token 只查几十行。放在哪**不是模型属性，是引擎启动参数**：vLLM 只要模型带这类层就自动启用 `EngramConfig`，默认 `cpu_offload = true`，整张表放在 pinned host memory 上经 UVA 查，HBM 占用为 0；传 `--engram-config.cpu_offload false` 才常驻 HBM，那时按 TP 切、不按 PP 切。页面把它做成输入，默认取 vLLM 的默认值，见 [[adr-0013]]。这一项能把结论翻转（DSv4.1 的 TP1×DP8 在两档之间是 0 路 ⇄ 4,928 路）。
 
 ### per-request 固定开销
 per-request 固定开销指与序列长度无关、只随并发涨的状态。Kimi K3 的 69 个 KDA 层的 recurrent state 属于此类（96 head × 128 × 128 × 69 层）。高并发短上下文场景下，这项固定开销会反超随长度增长的 KV cache。**按"总 token 数"做容量规划，会把这种场景估反。**
@@ -158,7 +163,7 @@ regime 指当前配置下三条线里哪条是 max：HBM 带宽受限 / 算力�
 | 级别 | 含义 | 例 |
 |---|---|---|
 | `spec` | `describe-instance-types` API 或厂商 spec sheet | p6-b300 每卡 275040 MiB = 268.6 GiB。各机型的 HBM 带宽与 dense TFLOPS 见 [[adr-0010]]，出处 URL 在 `data/instances.js` 注释里。**只取 dense 行，不取 sparsity 行** |
-| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账。Qwen3.8-27B：全部 BF16 51.75 GiB，以及官方 FP8 checkpoint 28.75 GiB。这是第一个「非 expert → FP8」档也是实测的模型（[[adr-0012]] §3） |
-| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；Gated DeltaNet state 的 dtype（config 写 float32，vLLM 默认落到 BF16，两个官方答案）；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**；expert 重量化为 FP8/BF16 后，按参数量推算出的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
+| `derived` | 由 `config.json` / HF safetensors 元数据（含逐张量 header）/ `index.json` 的 `total_size` 算出 | K3：routed expert 共 2.7227T 参数、1347.0 GiB；非 expert 57.19B、106.5 GiB。GLM：expert 290.32 GiB、非 expert 15.46 GiB，字节数与 `total_size`、参数量与 HF API 三方精确对账。Qwen3.8-27B：全部 BF16 51.75 GiB，以及官方 FP8 checkpoint 28.75 GiB。这是第一个「非 expert → FP8」档也是实测的模型（[[adr-0012]] §3）。GLM-5.3 的官方 BF16 checkpoint、Qwen3.8-Flash-Next 的官方 FP8 checkpoint 也逐张量读了，页面上那一档标 `measured: true`，不按参数量推算（[[adr-0013]] §6） |
+| `estimated` | 推算，有明确误差来源 | KDA state 的 dtype 假设为 FP32；Gated DeltaNet state 的 dtype（config 写 float32，vLLM 默认落到 BF16，两个官方答案）；**KV cache 的 dtype（界面可切，但选哪档仍是假设）**；**DSA indexer key cache 的池化方式与 dtype**（GLM-5.3-Flash 没有一手依据；GLM-5.3 的 132 B/层与 Qwen3.8-Flash-Next 的 BF16 默认取自 vLLM 源码，但仍是引擎实现）；expert 重量化为 FP8/BF16 后，按参数量推算出的字节数；roofline 里的 expert 命中率（均匀路由）、all-to-all 的 BF16 假设 |
 | `guessed` | 估计值 | 每卡 12 GiB 激活 + 通信 buffer（**当前唯一的 guessed 项，这一项直接决定最大并发**）。2026-09-16 起这一项**不再是「无依据」**：GLM-5.3-Flash / p5en / TP8 上引擎自报 6.98 GiB（[[measurements]] M-001），在那一个配置上本页高 72%。但页面用的仍是这个 12 GiB 的估计值，而且**别的模型 / 别的 TP 既不能照搬这个差值、也不能假定方向**（同一替换在 g7e/TP1 上是 50% 而不是 5%；`hc_mult = 4` 的模型真实开销可能反而超过 12 GiB），所以这一级不变 |
 | `measured` | 目标硬件实测 | **每卡非权重非 KV 开销 6.98 GiB**，以及权重 38.24 GiB/卡、KV 池 81.79 GiB、128K 满长并发 55.15 路。这些数字全部来自 2026-09-16 在 p5en 上对 GLM-5.3-Flash 起的那一次服务，见 [[measurements]] M-001。**目前只有这一档实测**，页面上的数字并未因此改用实测值（见上一行）。本级的门槛是「**目标硬件**实测」。所以 `data/models/qwen3.8-27b.js` notes 里引用的 vLLM recipe，在 1×/2× RTX 5090 上得到的那几组引擎自报数字，**不计入本级**：5090 不在 `data/instances.js` 里，这几组数字也不是本项目跑出来的，只能当旁证（[[measurements]] 开头有说明）。还缺两项：roofline 的效率比 `实测 ÷ 下界`（见 [[adr-0010]] §6）；KV 每 token 字节数。M-001 反解不出 KV 每 token 字节数，因为混合池用统一 page，把 recurrent state 与 20.75% padding 都摊了进去。要拆开，需要换 `--max-num-seqs` 跑两点法 |
