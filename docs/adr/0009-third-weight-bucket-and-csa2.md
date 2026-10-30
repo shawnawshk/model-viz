@@ -1,6 +1,6 @@
 # ADR-0009：权重加第三桶（按 TP 切的查表），新增 CSA2 family，KV dtype 承认例外
 
-- 状态：**Accepted → 已在 `app.html` + `index.html` + 三个 data 文件实施**（2026-09-10）
+- 状态：**Accepted → 已在 `app.html` + `index.html` + 三个 data 文件实施**（2026-09-10）。§2「engram 整张算进 HBM，不做成界面开关」于 2026-10-30 被 [ADR-0013](0013-lookup-placement-is-an-input.md) 取代：vLLM 已实现 engram，默认放 host 内存。其余各节仍然有效。
 - 触发：收录第三个模型 DeepSeek-V4.1-Flash（`deepseek-ai/DeepSeek-V4.1-Flash`）
 - 影响：data 契约的 `weights` 块（**又一次不兼容改动**）、新增 `csa2` / `swa` family、新增「不可 TP 切的每请求固定字节」、`kvDtypes` 允许声明为架构固定
 - 相关：[ADR-0007](0007-kv-dtype-is-an-input.md)（本 ADR 给它记一条例外）、[ADR-0008](0008-two-bucket-measured-weights-and-dsa.md)（两桶权重 / `perTokenFixedBytes`）、[ADR-0004](0004-provenance-first-class.md)（provenance）、[ADR-0003](0003-scope-memory-feasibility-only.md)（只算显存）

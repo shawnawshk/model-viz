@@ -32,6 +32,11 @@ if (inline.length !== 2 || srcs[0] !== "data/instances.js"
     throw new Error("presets click handler 又把并发写回 1 路了");
 }
 
+// 两个页面里静态引用的 assets/ 文件必须存在 —— 图片路径写错,页面上只是一个空框,不会报错
+for (const page of ["app.html", "index.html"])
+  for (const [, ref] of fs.readFileSync(path.join(ROOT, page), "utf8").matchAll(/(?:src|href)="(assets\/[^"]+)"/g))
+    if (!fs.existsSync(path.join(ROOT, ref))) throw new Error(`${page} 引用的 ${ref} 不存在`);
+
 // index.html 必须挂同一批 data 文件,否则索引页会漏掉模型
 const idxSrcs = [...fs.readFileSync(path.join(ROOT, "index.html"), "utf8")
   .matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map(m => m[1]);
@@ -104,49 +109,154 @@ const CASES = [
     // 这就是预设路数不能写死在数据文件里的原因。
     expectPresets: [7, 48, 28, 56, 128, 136] },
 
-  // ---- DeepSeek-V4.1-Flash(ADR-0009)----
+  // ---- DeepSeek-V4.1-Flash(ADR-0009 / 0013)----
   // 这个模型的 kvDtypes 只有一档(FP4,架构固定),所以探针那两轮 bf16/fp8 会落到同一档 ——
   // 期望值故意写成两个相同的数,再由 kvFixed 显式断言「切 dtype 确实无效」。
   // 890 B/token 是独立外部核对点:它等于 model card 的头号数字「890 bytes per token」。
-  { model: "deepseek-v4.1-flash", label: "官方 MP=8:1×p5en TP8/DP1/EP8",
+  //
+  // 2026-10-30(ADR-0013):engram 放在哪提成了输入,默认 = vLLM 默认的 host offload。
+  // 前三条是新默认口径;后面带 lookupPlace: "hbm" 的是原来那组「整张常驻 HBM」用例,数字逐字未改 ——
+  // 常驻那条代码路径(÷TP 不 ÷PP、TP 下限、装不下的红字、建议器里的 engram 代价)仍要有人钉住。
+  { model: "deepseek-v4.1-flash", label: "默认(engram 放 host):官方 MP=8 1×p5en TP8/DP1/EP8",
     state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 697], fp8: [890, 697] }, kvFixed: true, expectLookupGiB: 0,
+    // 放 host 时 TP 越小越高:TP1×DP8 是 MP=8 的 7 倍;常驻时那两个预设是 0(见下面 hbm 那条)
+    expectPresets: [697, 1370, 2648, 4928, 6696, 3348],
+    // roofline 不看 engram 放哪(它每 token 只查几十行):与常驻那条的 3.46 ms 相同
+    roof: { conc: 32, stepMs: "3.46", regime: "mem", ridge: "never", kvCross: 2850132 } },
+  { model: "deepseek-v4.1-flash", label: "engram 放 host:TP1×DP8 → 常驻时装不下的那一档",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 4928], fp8: [890, 4928] }, kvFixed: true, expectLookupGiB: 0,
+    // TP1:非 expert 10.45 GiB 整读 + 命中的 expert,64 路 × 128K 的 CSA2 读取压不过权重,临界上下文超出 2^24
+    roof: { conc: 64, stepMs: "7.16", regime: "mem", ridge: "never", kvCross: "never" } },
+  { model: "deepseek-v4.1-flash", label: "1K · engram 放 host", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+    expect: { bf16: [890, 13806], fp8: [890, 13806] }, kvFixed: true,
+    expectPresets: [13806, 27158, 52492, 97696, 132632, 66340] },
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · 官方 MP=8:1×p5en TP8/DP1/EP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 488], fp8: [890, 488] }, kvFixed: true,
-    // 第 3、4 个预设(TP2/DP4 与 TP1×DP8)在 p5en 上是 0 —— engram 只能按 TP 切,
-    // TP<4 时单卡就背不动它。这两个 0 是本模型最该被钉住的东西,别当成写错了删掉。
+    // 第 3、4 个预设(TP2/DP4 与 TP1×DP8)在常驻时是 0 —— engram 只能按 TP 切,
+    // TP<4 时单卡就背不动它。这两个 0 是常驻那一档最该被钉住的东西,别当成写错了删掉。
     expectPresets: [488, 538, 0, 0, 3364, 1680],
     // CSA2 的 decode 读取走 indexer 全扫 + top-512 latent,不是全量 KV:32 路 × 128K 一共只读 15.5 GiB。
     roof: { conc: 32, stepMs: "3.46", regime: "mem", ridge: "never", kvCross: 2850132 } },
   // p5en 上 TP4/DP2 反超官方的 TP8/DP1:engram ÷4 比 ÷8 贵,但 KV 少复制一半。
-  { model: "deepseek-v4.1-flash", label: "1×p5en TP4/DP2/EP8(engram ÷4)",
-    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · 1×p5en TP4/DP2/EP8(engram ÷4)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 538], fp8: [890, 538] }, kvFixed: true },
   // 短上下文用例。ADR-0009 §5:滑窗环形 buffer 是 5.000 MiB/请求且与上下文无关,
   // 1K 下它占单请求的 85% —— 漏乘它,1K 的期望值会差 6.75 倍,而 128K 只差 4.5%。
-  // **只有这条用例能抓住那个漏乘**,别把它删了。
-  { model: "deepseek-v4.1-flash", label: "1K 上下文:滑窗环 buffer 是主导项", ctxIdx: 0,
-    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+  // **只有这条与上面的「1K · engram 放 host」能抓住那个漏乘**,别把它们删了。
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · 1K 上下文:滑窗环 buffer 是主导项", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 9682], fp8: [890, 9682] }, kvFixed: true,
     expectPresets: [9682, 10658, 0, 0, 66640, 33340],
     roof: { conc: 256, stepMs: "8.00", regime: "mem", ridge: "never", kvCross: 812625 } },
-  // roofline 专用(ADR-0010):三个模型在 p5en / b300 上的所有常规切分,4096 路之内都到不了算力受限 ——
+  // roofline 专用(ADR-0010):各模型在 p5en / b300 上的常规切分,4096 路之内都到不了算力受限 ——
   // 扫描下来只有这一个配置的拐点落在滑块范围内(约 4,022 路),所以用它钉住「算力受限」regime 与拐点二分。
-  // 显存上它装不下(engram ÷2 = 94.6 GiB),roofline 不管装不装得下,两个结论并排出现是刻意的。
-  { model: "deepseek-v4.1-flash", label: "roofline:TP2/DP4/EP8 · 1K · 4096 路 → 算力受限", ctxIdx: 0,
-    state: { instId: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+  // 显存上它在常驻时装不下(engram ÷2 = 94.6 GiB),roofline 不管装不装得下,两个结论并排出现是刻意的。
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · roofline:TP2/DP4/EP8 · 1K · 4096 路 → 算力受限", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 0], fp8: [890, 0] }, kvFixed: true,
     roof: { conc: 4096, stepMs: "10.1", regime: "comp", ridge: 4022, kvCross: 205264 } },
   // PP>1(每个模型必须有一条)。这里同时钉住 ADR-0009 §8:engram 不按 PP 切,
-  // 所以 lookup 在 PP=2 下与 PP=1 相同(都是 189.13 ÷ TP 4 = 47.28 GiB)。
-  { model: "deepseek-v4.1-flash", label: "PP2 1×p5en TP4/DP1/PP2/EP4",
-    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 1, pp: 2, ep: 4, neFmt: "native", expFmt: "mxfp4" },
+  // 所以常驻时 lookup 在 PP=2 下与 PP=1 相同(都是 189.13 ÷ TP 4 = 47.28 GiB)。
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · PP2 1×p5en TP4/DP1/PP2/EP4",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 1, pp: 2, ep: 4, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 561], fp8: [890, 561] }, kvFixed: true,
     expectLookupGiB: 47.28 },
-  // 装不下的用例。前两个模型都没有「权重本身就超预算」的用例走过这条路径,
-  // 而这正是本模型最容易出现的状态(TP 太小 → engram 背不动)。
-  { model: "deepseek-v4.1-flash", label: "TP1×DP8:engram 不切 → 装不下",
-    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4" },
+  // 装不下的用例:「权重本身就超预算」这条路径。常驻时这是本模型最容易出现的状态(TP 太小 → engram 背不动)。
+  { model: "deepseek-v4.1-flash", label: "常驻 HBM · TP1×DP8:engram 不切 → 装不下",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "mxfp4", lookupPlace: "hbm" },
     expect: { bf16: [890, 0], fp8: [890, 0] }, kvFixed: true,
     expectLookupGiB: 189.13 },
+
+  // ---- GLM-5.3(78 层全 DSA + IndexCache;expert bank 703.7 GiB)----
+  // 92,628 B/token = 78 × 576 × 2(latent,BF16)+ 21 × 132(indexer key,只在 full 层存,走 vLLM 的 FP8 + fp32 scale 布局)。
+  // FP8 档 47,700 = 78 × 576 + 2,772 —— indexer 那一项不随 --kv-cache-dtype 变。期望值全部来自独立手算。
+  { model: "glm-5.3", label: "默认 2×p5en TP8/DP2/EP16(KV ×8)",
+    state: { instId: "p5en.48xlarge", n: 2, tp: 8, dp: 2, pp: 1, ep: 16, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 12], fp8: [47700, 22] },
+    // 六个预设 @128K/0.90:一台 TP8(recipe)只有 2 路,一台 TP1×DP8 一路 128K 的 KV 都放不进;两台 PP2 最高
+    expectPresets: [12, 2, 64, 88, 0, 88],
+    // 8 路:非 expert 2.44 GiB + 命中的 expert 整读;57 个 shared 层不扫 indexer,所以 KV 读取不随上下文线性涨到压过权重
+    roof: { conc: 8, stepMs: "3.12", regime: "mem", ridge: "never", kvCross: 1086908 } },
+  // vLLM recipe 的 8×H200 标准配置:权重装得下,128K 下只剩 2 路(FP8 KV 4 路)
+  { model: "glm-5.3", label: "vLLM recipe:1×p5en TP8/DP1/EP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 2], fp8: [47700, 4] },
+    roof: { conc: 8, stepMs: "5.69", regime: "mem", ridge: "never", kvCross: 968546 } },
+  // 与 GLM-5.3-Flash 方向相反:一台上 TP1×DP8 权重装得下(117.1 / 126.9 GiB),但一路 128K 的 KV(11.31 GiB)都放不进
+  { model: "glm-5.3", label: "1×p5en TP1/DP8/EP8:权重装得下,128K 一路 KV 都放不进",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 0], fp8: [47700, 8] } },
+  // PP>1(每个模型必须有一条)
+  { model: "glm-5.3", label: "PP2 2×p5en TP1/DP8/PP2/EP8",
+    state: { instId: "p5en.48xlarge", n: 2, tp: 1, dp: 8, pp: 2, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 88], fp8: [47700, 168] },
+    roof: { conc: 16, stepMs: "4.36", regime: "mem", ridge: "never", kvCross: 14841368 } },
+  { model: "glm-5.3", label: "1×p6-b300 TP1/DP8/EP8",
+    state: { instId: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 88], fp8: [47700, 168] },
+    roof: { conc: 64, stepMs: "13.5", regime: "mem", ridge: "never", kvCross: 4431214 } },
+  // recipe:「要跑满 1M 需要 8×B200 + FP8 KV」—— 本页口径下 b200 TP8 1M 正好 FP8 1 路、BF16 0 路
+  { model: "glm-5.3", label: "1×p6-b200 TP8 · 1M:FP8 KV 才放得下一路", ctxIdx: 10,
+    state: { instId: "p6-b200.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "native", expFmt: "fp8" },
+    expect: { bf16: [92628, 0], fp8: [47700, 1] },
+    expectPresets: [0, 0, 0, 8, 0, 8] },
+  // 官方 BF16 checkpoint(逐张量实测 1,368 GiB expert):两台 b300 才宽裕。钉住 measured 那条文案路径
+  { model: "glm-5.3", label: "2×p6-b300 TP8/DP2/EP16 · 官方 BF16 expert",
+    state: { instId: "p6-b300.48xlarge", n: 2, tp: 8, dp: 2, pp: 1, ep: 16, neFmt: "native", expFmt: "bf16" },
+    expect: { bf16: [92628, 24], fp8: [47700, 48] } },
+
+  // ---- Qwen3.8-Flash-Next(ADR-0013 / 0014:QSA + n-gram 表;MoE + GQA + GDN 第一次同时出现)----
+  // 25,344 B/token = 12 × 2 × 2 kv head × 256 × 2(主 KV,BF16)+ 12 × 128 × 2 ÷ 4(indexer 压缩 key,BF16,不随 --kv-cache-dtype 变)。
+  // 单卡:主 KV ÷ min(TP, 2),indexer key 不除。n-gram 表默认放 host。期望值全部来自独立手算。
+  { model: "qwen3.8-flash-next", label: "默认 TEP8:1×p5en TP8/DP1/EP8(KV ×4)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 52], fp8: [13056, 99] }, expectLookupGiB: 0,
+    // 七个预设 @128K/0.90:TP2×DP4 最高(196),官方 TEP8 只有它的约 1/4
+    expectPresets: [52, 102, 196, 184, 18, 60, 472],
+    roof: { conc: 8, stepMs: "1.46", regime: "mem", ridge: "never", kvCross: 871144 } },
+  { model: "qwen3.8-flash-next", label: "1×p5en TP2/DP4/EP8(TP = n_kv_heads,KV ×1)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 196], fp8: [13056, 360] },
+    roof: { conc: 32, stepMs: "4.49", regime: "mem", ridge: "never", kvCross: 3013378 } },
+  // 常驻那一档:n-gram 表 95.37 GiB ÷ TP
+  { model: "qwen3.8-flash-next", label: "常驻 HBM · 1×p5en TP4/DP2/EP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16", lookupPlace: "hbm" },
+    expect: { bf16: [25344, 72], fp8: [13056, 136] }, expectLookupGiB: 23.84,
+    expectPresets: [45, 72, 80, 0, 11, 0, 360] },
+  { model: "qwen3.8-flash-next", label: "常驻 HBM · 1×p5en TP1/DP8:n-gram 表不切 → 装不下",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16", lookupPlace: "hbm" },
+    expect: { bf16: [25344, 0], fp8: [13056, 0] }, expectLookupGiB: 95.37 },
+  { model: "qwen3.8-flash-next", label: "p5 H100 TEP8(官方 H100 配置)",
+    state: { instId: "p5.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 18], fp8: [13056, 35] },
+    roof: { conc: 8, stepMs: "2.09", regime: "mem", ridge: "never", kvCross: 871144 } },
+  // PP>1(每个模型必须有一条):数字照算,但页面必须出「vLLM 起不来」的红字(检查在下面 qwen-next 专属块)
+  { model: "qwen3.8-flash-next", label: "PP2 1×p5en TP4/DP1/PP2/EP4(vLLM 不支持)",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 4, dp: 1, pp: 2, ep: 4, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 104], fp8: [13056, 195] },
+    roof: { conc: 16, stepMs: "1.36", regime: "mem", ridge: "never", kvCross: 1775056 } },
+  // 1K:GDN state(108 MiB/请求,FP32)÷8 后仍占单请求的 51%
+  { model: "qwen3.8-flash-next", label: "1K 上下文 · TEP8", ctxIdx: 0,
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 3312], fp8: [13056, 4293] },
+    expectPresets: [3312, 4308, 4972, 4688, 1170, 1604, 12020],
+    roof: { conc: 1024, stepMs: "15.5", regime: "mem", ridge: "never", kvCross: 193 } },
+  // 官方 FP8 checkpoint:expert 与 n-gram 表一起换。放 host 时只省 expert;常驻时 n-gram 表也跟着减半(47.68 ÷ 8 = 5.96)
+  { model: "qwen3.8-flash-next", label: "官方 FP8 checkpoint · TEP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "bf16", expFmt: "fp8" },
+    expect: { bf16: [25344, 61], fp8: [13056, 115] } },
+  { model: "qwen3.8-flash-next", label: "常驻 HBM · 官方 FP8 checkpoint · TEP8",
+    state: { instId: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 8, neFmt: "bf16", expFmt: "fp8", lookupPlace: "hbm" },
+    expect: { bf16: [25344, 58], fp8: [13056, 108] }, expectLookupGiB: 5.96 },
+  { model: "qwen3.8-flash-next", label: "1×p6-b300 TP2/DP4/EP8",
+    state: { instId: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8, neFmt: "bf16", expFmt: "bf16" },
+    expect: { bf16: [25344, 472], fp8: [13056, 872] },
+    roof: { conc: 64, stepMs: "4.02", regime: "mem", ridge: "never", kvCross: 2028466 } },
 
   // ---- Qwen3.8-27B(ADR-0012:第一个 dense、第一个 GQA)----
   // 65,536 B/token = 16 层 × 2 × 4 kv head × 256 × 2 B。KV 复制因子是 max(1, TP/4),不是 TP ——
@@ -342,6 +452,9 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   });
   if (empty.length) fail.push(`空容器:${empty.join(", ")}`);
   fail.push(...checkNavigation(els, c.model));
+  // 每个模型页都要有 vLLM recipe 外链(数据文件的 vllmRecipe),而且必须指向 recipes.vllm.ai —— 页面里引用的 recipe 配置都出自那里
+  if (!String(els.get("model-recipe")?.href ?? "").startsWith("https://recipes.vllm.ai/"))
+    fail.push(`${c.model} 缺 vLLM recipe 链接(data 里的 vllmRecipe)`);
   for (const id of CLEAN) {
     const s = String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "");
     for (const bad of ["undefined", "NaN"]) if (s.includes(bad)) fail.push(`${id} 里出现了 ${bad}`);
@@ -472,7 +585,26 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
     if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×8 降到 ×1"))
       fail.push("GLM 容量建议应解释 TP1/DP8 的收益来自减少 KV 副本");
   }
-  if (c.model === "deepseek-v4.1-flash" && c.label.startsWith("官方 MP=8")) {
+  // 查表放置(ADR-0013):控件只在带查表的模型上出现;两档各有自己的 banner,反事实路数与另一档的用例互相对得上
+  {
+    const hasLookup = !!REG.models[c.model].weights.tpShardedBytes;
+    const bannersHtml = String(els.get("banners")?.innerHTML ?? "");
+    if (String(els.get("lookupCtl")?.style?.display) !== (hasLookup ? "" : "none"))
+      fail.push(`${c.model} 的「查表放置」控件应${hasLookup ? "显示" : "隐藏"}`);
+    if (hasLookup && c.state.lookupPlace === "hbm" && !bannersHtml.includes("整张常驻 HBM(不是 vLLM 默认)"))
+      fail.push("常驻 HBM 时应有「不是 vLLM 默认」的 warning");
+    if (hasLookup && c.state.lookupPlace !== "hbm" && !bannersHtml.includes("放在 host 内存(vLLM 默认)"))
+      fail.push("默认口径下应有「放在 host 内存(vLLM 默认)」的 banner");
+    if (hasLookup && c.state.lookupPlace === "hbm" && !capacityInsight.includes('data-roof-set="lookupPlace"'))
+      fail.push("常驻 HBM 时,容量目标的首选动作应是把查表放回 host");
+  }
+
+  if (c.model === "deepseek-v4.1-flash" && c.label.startsWith("默认(engram 放 host)")) {
+    // 放 host 时 engram 不在 HBM,建议器里不该再出现「降 TP 会增加单卡 engram」这类代价
+    if (capacityInsight.includes("engram 查表"))
+      fail.push("engram 放 host 时,容量建议不应再写单卡 engram 的代价");
+  }
+  if (c.model === "deepseek-v4.1-flash" && c.label.startsWith("常驻 HBM · 官方 MP=8")) {
     if (!capacityInsight.includes("data-roof-parallel"))
       fail.push("DeepSeek 容量目标下没有可应用的同机型并行切分");
     if (!capacityInsight.includes("TP4 / DP2 / PP1 / EP8"))
@@ -483,6 +615,45 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
       fail.push("DeepSeek 容量建议应显式写出降低 TP 会增加单卡 engram 的代价");
     if (capacityInsight.includes('data-roof-set="kvDt"'))
       fail.push("DeepSeek 的 KV dtype 架构固定,不应建议切换 KV dtype");
+  }
+
+  if (c.model === "glm-5.3") {
+    const roof = String(els.get("rooftbl")?.innerHTML ?? ""), bannersHtml = String(els.get("banners")?.innerHTML ?? "");
+    // IndexCache:57 个 shared 层的 decode 读法必须单独写出来(不扫 indexer)
+    if (!roof.includes("复用上一个 full 层的 top-k")) fail.push("GLM-5.3 的 roofline 应写出 shared 层复用 top-k、不扫 indexer");
+    // 第一个没有 recurrent state、也没有滑窗环的模型:图例 / 明细表里不该留一个 0 的 state 行
+    for (const id of ["legend", "tbl"]) if (String(els.get(id)?.innerHTML ?? "").includes("recurrent state"))
+      fail.push(`GLM-5.3 没有 recurrent state,${id} 里不该出现这一项`);
+    if (c.label.startsWith("默认 2×p5en")) {
+      if (!capacityInsight.includes("TP1 / DP16 / PP1 / EP16")) fail.push("GLM-5.3 两台 TP8/DP2 的容量建议应识别 TP1/DP16");
+      if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×8 降到 ×1")) fail.push("GLM-5.3 容量建议应解释收益来自 KV 副本 ×8 → ×1");
+    }
+    if (c.state.expFmt === "bf16" && !bannersHtml.includes("官方 checkpoint 逐张量实测"))
+      fail.push("GLM-5.3 的 BF16 expert 是官方 checkpoint 实测档,banner 不应写成按参数量推算");
+  }
+
+  if (c.model === "qwen3.8-flash-next") {
+    const bannersHtml = String(els.get("banners")?.innerHTML ?? ""), tiles = String(els.get("tiles")?.innerHTML ?? "");
+    // 合法 TP:24 q head / 2 kv head(可被 TP 整除或整除 TP)/ 48 v 与 16 k 个 GDN head → 1 / 2 / 4 / 8
+    for (const [name, html] of [["延迟目标", insight], ["容量目标", capacityInsight]])
+      for (const m of html.matchAll(/data-tp="(\d+)"/g))
+        if (![1, 2, 4, 8].includes(Number(m[1]))) fail.push(`${name}的同机型建议推荐了不合法的 TP${m[1]}`);
+    // QSA 的主 KV 复制因子 max(1, TP/2);indexer key 不算进「复制几份」里(否则 TP2 会被误判成复制 1.03 份)
+    if (c.state.tp > 2 && !bannersHtml.includes("超过 n_kv_heads=2")) fail.push("TP>2 时应有「KV 复制」告警");
+    if (c.state.tp === 2 && !bannersHtml.includes("KV 不复制")) fail.push("TP=2 时应有「KV 不复制」的 good banner");
+    if (c.state.tp === 8 && !tiles.includes("复制 <b>4</b> 份")) fail.push("TP8 的 hero 应写 KV 复制 4 份");
+    if (c.state.tp > 1 && !bannersHtml.includes("indexer 的压缩 key")) fail.push("QSA 的 KV banner 应交代 indexer key 每卡一份");
+    if (c.state.pp > 1 && !bannersHtml.includes("起不来")) fail.push("PP>1 时应有「vLLM 起不来」的红字(n-gram 表不支持 PP)");
+    if (c.label.startsWith("默认 TEP8")) {
+      if (!capacityInsight.includes("TP2 / DP4 / PP1 / EP8")) fail.push("Qwen-Next 容量建议应识别 TP2/DP4(TP = n_kv_heads)");
+      if (!capacityInsight.includes("每路 KV 的跨卡副本从 ×4 降到 ×1")) fail.push("Qwen-Next 容量建议应写 KV 副本 ×4 → ×1");
+    }
+    if (c.state.expFmt === "fp8") {
+      if (!bannersHtml.includes("官方 checkpoint 逐张量实测")) fail.push("官方 FP8 checkpoint 那一档应标为逐张量实测");
+      if (!bannersHtml.includes("降到")) fail.push("BF16 → FP8 是变小,banner 不应写「涨到」");
+    }
+    if (c.state.lookupPlace === "hbm" && !bannersHtml.includes("这一档的路数是上限"))
+      fail.push("Qwen-Next 常驻 HBM 时应显示 recipe 里那条「常驻会 OOM」的反证");
   }
 
   if (c.model === "qwen3.8-27b") {

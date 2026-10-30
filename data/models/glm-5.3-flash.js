@@ -14,6 +14,7 @@
 REG.models["glm-5.3-flash"] = {
   name: "GLM-5.3-Flash",
   hf: "zai-org/GLM-5.3-Flash",
+  vllmRecipe: "https://recipes.vllm.ai/zai-org/GLM-5.3-Flash",
   // 官方模型卡标记 image-text-to-text;processor_config.json 同时配置图像和视频处理器。
   modalities: {
     input: ["text", "image", "video"], output: ["text"],
@@ -40,6 +41,9 @@ REG.models["glm-5.3-flash"] = {
           + "另有 3 个 kernel=4 的短卷积 state,量级可忽略,未计入" },
   ],
   totalLayers: 45,
+
+  // 边界声明里 indexer key cache 那一条的后半句(前半句「按每 token N B 计」由引擎拼)。各模型的依据硬度不同,所以各写各的
+  indexerAsm: `其 pooling 方式与 dtype <b>都没有一手依据</b> —— 若引擎不做池化压缩则是这个数的 4 倍(见下方假设区)`,
 
   // ---- KV cache 的 dtype:不是模型属性,是引擎的运行时选项(--kv-cache-dtype)----
   // 理由与 K3 完全相同,见 ADR-0007。第一项即默认值(auto = 模型 dtype = BF16)。
