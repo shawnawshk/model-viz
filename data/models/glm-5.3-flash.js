@@ -15,6 +15,7 @@ REG.models["glm-5.3-flash"] = {
   name: "GLM-5.3-Flash",
   hf: "zai-org/GLM-5.3-Flash",
   vllmRecipe: "https://recipes.vllm.ai/zai-org/GLM-5.3-Flash",
+  sglangCookbook: "https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.3-Flash",
   // 官方模型卡标记 image-text-to-text;processor_config.json 同时配置图像和视频处理器。
   modalities: {
     input: ["text", "image", "video"], output: ["text"],

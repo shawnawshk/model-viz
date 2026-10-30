@@ -18,6 +18,7 @@ REG.models["qwen3.8-flash-next"] = {
   name: "Qwen3.8-Flash-Next",
   hf: "Qwen/Qwen3.8-Flash-Next",
   vllmRecipe: "https://recipes.vllm.ai/Qwen/Qwen3.8-Flash-Next",
+  sglangCookbook: "https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next",
   // 官方模型卡 pipeline_tag = image-text-to-text,「Causal Language Model with Vision Encoder」;repo 带 video_preprocessor_config.json。
   modalities: {
     input: ["text", "image", "video"], output: ["text"],

@@ -50,6 +50,8 @@
           <a class="model-hf-link" id="model-hf" target="_blank" rel="noopener noreferrer"><img class="link-logo" src="assets/providers/huggingface.svg" alt="" width="15" height="15"><span data-en="View on Hugging Face">在 Hugging Face 查看</span><svg width="13" height="13" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M11 3h6v6M17 3l-8 8M8 4H4v12h12v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
           <!-- vLLM 官方部署 recipe(数据文件的 vllmRecipe;没有就隐藏)。页面里引用的 recipe 配置都出自这里 -->
           <a class="model-hf-link" id="model-recipe" target="_blank" rel="noopener noreferrer"><img class="link-logo" src="assets/providers/vllm.svg" alt="" width="15" height="15">vLLM recipe<svg width="13" height="13" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M11 3h6v6M17 3l-8 8M8 4H4v12h12v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+          <!-- SGLang 官方 cookbook(数据文件的 sglangCookbook;没有就隐藏)。只是外链,页面里的数字不引用它 -->
+          <a class="model-hf-link" id="model-sglang" target="_blank" rel="noopener noreferrer"><img class="link-logo" src="assets/providers/sglang.png" alt="" width="15" height="15">SGLang cookbook<svg width="13" height="13" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M11 3h6v6M17 3l-8 8M8 4H4v12h12v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
         </div>
       </div>
     </div>
@@ -2037,6 +2039,8 @@ document.getElementById("model-description").textContent = MD.blurb;
 document.getElementById("model-hf").href = "https://huggingface.co/" + MD.hf;
 const recipeLink = document.getElementById("model-recipe");
 if (MD.vllmRecipe) recipeLink.href = MD.vllmRecipe; else recipeLink.style.display = "none";
+const sglangLink = document.getElementById("model-sglang");
+if (MD.sglangCookbook) sglangLink.href = MD.sglangCookbook; else sglangLink.style.display = "none";
 const checkpointParams = M.totalParams >= 1e12
   ? (M.totalParams / 1e12).toFixed(2) + "T" : (M.totalParams / 1e9).toFixed(1) + "B";
 const modalityLabels = { text: L("文本", "text"), image: L("图像", "image"), video: L("视频", "video") };

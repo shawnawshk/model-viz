@@ -15,6 +15,7 @@ REG.models["glm-5.3"] = {
   name: "GLM-5.3",
   hf: "zai-org/GLM-5.3",
   vllmRecipe: "https://recipes.vllm.ai/zai-org/GLM-5.3",
+  sglangCookbook: "https://docs.sglang.io/cookbook/autoregressive/GLM/GLM-5.3",
   // 官方模型卡 pipeline_tag = text-generation;config.json 里没有 vision_config。
   modalities: {
     input: ["text"], output: ["text"],
