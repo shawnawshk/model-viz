@@ -460,6 +460,9 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
   // 每个模型页都要有 vLLM recipe 外链(数据文件的 vllmRecipe),而且必须指向 recipes.vllm.ai —— 页面里引用的 recipe 配置都出自那里
   if (!String(els.get("model-recipe")?.href ?? "").startsWith("https://recipes.vllm.ai/"))
     fail.push(`${c.model} 缺 vLLM recipe 链接(data 里的 vllmRecipe)`);
+  // SGLang cookbook 外链同理(data 里的 sglangCookbook),必须指向 docs.sglang.io —— 不用 lmsysorg.mintlify.app,那是它的托管地址,页面 canonical 是前者
+  if (!String(els.get("model-sglang")?.href ?? "").startsWith("https://docs.sglang.io/cookbook/"))
+    fail.push(`${c.model} 缺 SGLang cookbook 链接(data 里的 sglangCookbook)`);
   for (const id of CLEAN) {
     const s = String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "");
     for (const bad of ["undefined", "NaN"]) if (s.includes(bad)) fail.push(`${id} 里出现了 ${bad}`);

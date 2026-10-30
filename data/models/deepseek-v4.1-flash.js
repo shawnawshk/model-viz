@@ -24,6 +24,7 @@ REG.models["deepseek-v4.1-flash"] = {
   // 两者 48 个 shard 的 header 逐个相同,所以对 -1017 同样成立。
   hf: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
   vllmRecipe: "https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash",   // -1017 的地址会 307 跳到这里;那一页写着「1017 is the default here」「share its config and footprint」
+  sglangCookbook: "https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4_1",   // 这一页的 variant 选项里同时有 V4.1-Flash 与 -1017
   // 官方模型卡明确说明原生处理图像与文本,自回归生成文本。
   modalities: {
     input: ["text", "image"], output: ["text"],
