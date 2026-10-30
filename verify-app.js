@@ -15,8 +15,8 @@ const html = fs.readFileSync(path.join(ROOT, "app.html"), "utf8");
 const inline = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const srcs = [...html.matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map(m => m[1]);
 const modelSrcs = srcs.filter(s => s.startsWith("data/models/"));
-if (inline.length !== 2 || srcs[0] !== "data/instances.js"
-    || modelSrcs.length !== srcs.length - 2 || srcs[srcs.length - 1] !== "sidebar.js")
+if (inline.length !== 2 || srcs[0] !== "i18n.js" || srcs[1] !== "data/instances.js"
+    || modelSrcs.length !== srcs.length - 3 || srcs[srcs.length - 1] !== "sidebar.js")
   throw new Error(`script 标签结构变了:inline=${inline.length} srcs=${srcs.join(",")}`);
 
 // 点预设时并发必须走 concIdxForDp(p.dp)。这条只能静态查:DOM stub 里 addEventListener 是空操作,
@@ -353,14 +353,19 @@ const mkEl = id => ({
   closest: () => null, querySelectorAll: () => [],
 });
 
-function run(c) {
+// i18n.js 在繁体时用 document.write 同步插入 OpenCC;stub 里直接在全局作用域 eval 那个文件。
+// 必须用间接 eval:在本模块的函数里直接 eval,UMD 会看到 CommonJS 的 exports,把 OpenCC 挂到 module.exports 上
+const docWrite = s => { const m = String(s).match(/src="([^"]+)"/); if (m) (0, eval)(fs.readFileSync(path.join(ROOT, m[1]), "utf8")); };
+
+// 原有用例一律固定用简体跑(?lang=zh-Hans),断言里的中文字符串才有意义;另外两种语言见下面的 runLang()
+function run(c, lang = "zh-Hans") {
   const els = new Map();
   global.document = {
     getElementById(id) { if (!els.has(id)) els.set(id, mkEl(id)); return els.get(id); },
     querySelectorAll: () => [], addEventListener() {}, body: mkEl("body"),
-    documentElement: { dataset: {} },
+    documentElement: { dataset: {} }, title: "", write: docWrite,
   };
-  global.location = { search: `?model=${c.model}` };
+  global.location = { search: `?model=${c.model}&lang=${lang}` };
   global.localStorage = { getItem: () => null, setItem() {} };
   global.matchMedia = () => ({ matches: false });
   global.innerWidth = 1600;
@@ -705,7 +710,7 @@ if (${JSON.stringify(c.model)} === "kimi-k3") {
 // 上面的用例只覆盖 app.html。index.html 那两个 innerHTML 一直没人管,而它同样会
 // 半途出错而不露相:机型表的 <th> 与 <td> 数一旦对不上,整张表往后错一列,页面其余
 // 部分照样正常。行数与卡片数分别与 data 对账,顺带钉住 split("<tr>") 的切法。
-function runIndex() {
+function runIndex(lang = "zh-Hans") {
   const idxHtml = fs.readFileSync(path.join(ROOT, "index.html"), "utf8");
   const idxInline = [...idxHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
   if (idxInline.length !== 2)
@@ -715,9 +720,9 @@ function runIndex() {
   global.document = {
     getElementById(id) { if (!els.has(id)) els.set(id, mkEl(id)); return els.get(id); },
     querySelectorAll: () => [], addEventListener() {}, body: mkEl("body"),
-    documentElement: { dataset: {} },
+    documentElement: { dataset: {} }, title: "", write: docWrite,
   };
-  global.location = { search: "" };
+  global.location = { search: `?lang=${lang}` };
   global.localStorage = { getItem: () => null, setItem() {} };
   global.matchMedia = () => ({ matches: false });
   global.window = global;
@@ -757,7 +762,137 @@ function runIndex() {
   if (nCards !== modelSrcs.length)
     fail.push(`模型卡 ${nCards} 张,但挂了 ${modelSrcs.length} 个模型`);
 
-  return { fail, nCards, nRows: rows.length, nTh };
+  return { fail, nCards, nRows: rows.length, nTh, els };
+}
+
+// ---- 界面语言(ADR-0015)----
+// 四组检查,各抓一种错法:
+//   (1) 静态标记:页面里每一段可见的中文都要有英文(data-en / data-en-title / data-en-aria-label),否则英文页面上会露出中文;
+//   (2) 数据文件:每个要显示的字段都有 xxxEn,而且中英两版的数字、<code> 片段、链接逐个一致 —— 翻译最容易错的就是数字;
+//   (3) 每个模型、首页在英文 / 繁体下各渲染一次:不许有 undefined / NaN,英文里不许剩汉字,繁体里不许剩简体字;
+//   (4) 语言判定顺序:?lang= > 上次的选择 > 浏览器语言。
+const HAN = /[㐀-鿿豈-﫿　-〿＀-￯]/;
+function checkStaticMarkup(file) {
+  const src = fs.readFileSync(path.join(ROOT, file), "utf8");
+  const fail = [];
+  const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+  const tok = /<!--[\s\S]*?-->|<script\b[\s\S]*?<\/script>|<style\b[\s\S]*?<\/style>|<(\/?)([a-zA-Z][\w-]*)((?:\s+[^\s=>\/]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?)*)\s*(\/?)>|([^<]+)/g;
+  const attrsOf = a => Object.fromEntries([...a.matchAll(/([^\s=\/]+)(?:\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+)))?/g)].map(m => [m[1], m[3] ?? m[4] ?? m[5] ?? ""]));
+  const stack = [];
+  let htmlAttrs = {};
+  for (const m of src.matchAll(tok)) {
+    if (m[2]) {
+      const tag = m[2].toLowerCase();
+      if (m[1]) { const i = stack.map(x => x.tag).lastIndexOf(tag); if (i >= 0) stack.length = i; continue; }
+      const at = attrsOf(m[3] || "");
+      if (tag === "html") htmlAttrs = at;
+      for (const [k, v] of Object.entries(at)) {
+        if (k.startsWith("data-en") && HAN.test(v)) fail.push(`${file}: ${k} 里有汉字:${v.slice(0, 40)}`);
+        if ((k === "title" || k === "aria-label") && HAN.test(v) && !(`data-en-${k}` in at))
+          fail.push(`${file}: <${tag} ${k}="${v.slice(0, 30)}"> 缺 data-en-${k}`);
+      }
+      if (!VOID.has(tag) && !m[4]) stack.push({ tag, en: "data-en" in at });
+    } else if (m[5] && HAN.test(m[5]) && !/^(<!--|<script|<style)/.test(m[0])) {
+      const inTitle = stack.some(x => x.tag === "title");
+      if (inTitle ? !("data-en-doc-title" in htmlAttrs) : !stack.some(x => x.en))
+        fail.push(`${file}: 这段文字没有英文(缺 data-en):${m[5].trim().slice(0, 40)}`);
+    }
+  }
+  return fail;
+}
+function checkDataTranslations() {
+  const fail = [];
+  const SCALARS = ["blurb", "indexerAsm", "tpShardedLabel", "tpShardedShort", "tpShardedNote", "stateNote",
+                   "lookupHbmCaveat", "ppUnsupported", "expertLayerDesc", "nonExpertFixedDesc"];
+  // 数字:逗号后紧跟 3 位才算千分位;「X 亿」= X×100 M、「X 万」= X/100 M,对应英文的「…M」
+  const nums = t => (t.replace(/<[^>]+>/g, " ")
+      .replace(/(\d+(?:\.\d+)?)\s*亿/g, (_, x) => " " + Math.round(parseFloat(x) * 100) + " ")
+      .replace(/(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*万/g, (_, x) => " " + +(parseFloat(x.replace(/,/g, "")) / 100).toFixed(2) + " ")
+      .match(/\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?/g) || []).map(x => x.replace(/,/g, "")).sort().join(" ");
+  // <code> 不看顺序逐个配对(英文语序会调换「X 的 Y」):逐字节相同;只有中文那一段本身带汉字(如「16 层」)时,
+  // 这一段放宽到只比数字与符号。每个中文片段都要配上一个英文片段,英文也不许多出来
+  const relax = c => c.replace(/[A-Za-z㐀-鿿]+/g, "").replace(/\s+/g, " ").trim();
+  const codeList = t => [...t.matchAll(/<code>([\s\S]*?)<\/code>/g)].map(x => x[1]);
+  const sameCodes = (zh, en) => { const e = codeList(en);
+    for (const c of codeList(zh)) {
+      const i = HAN.test(c) ? e.findIndex(x => relax(x) === relax(c)) : e.indexOf(c);
+      if (i < 0) return false;
+      e.splice(i, 1);
+    }
+    return e.length === 0; };
+  const hrefs = t => [...t.matchAll(/href="([^"]+)"/g)].map(x => x[1]).sort().join(" ");
+  const pair = (where, zh, en) => {
+    if (zh == null) return;
+    if (en == null) { fail.push(`${where} 缺英文(${where.split(".").pop()}En)`); return; }
+    if (HAN.test(en)) fail.push(`${where} 的英文里有汉字`);
+    if (nums(zh) !== nums(en)) fail.push(`${where} 中英数字不一致:[${nums(zh)}] vs [${nums(en)}]`);
+    if (!sameCodes(zh, en)) fail.push(`${where} 中英 <code> 片段不一致`);
+    if (hrefs(zh) !== hrefs(en)) fail.push(`${where} 中英链接不一致`);
+  };
+  global.REG = { instances: {}, models: {} };
+  for (const s of modelSrcs) (0, eval)(fs.readFileSync(path.join(ROOT, s), "utf8"));
+  for (const [id, m] of Object.entries(REG.models)) {
+    for (const k of SCALARS) pair(`${id}.${k}`, m[k], m[k + "En"]);
+    if ((m.notesEn || []).length !== (m.notes || []).length) fail.push(`${id}.notesEn 与 notes 条数不同`);
+    (m.notes || []).forEach((n, i) => pair(`${id}.notes[${i}]`, n, (m.notesEn || [])[i]));
+    for (const [arr, key] of [["kvDtypes", "label"], ["expertFormats", "label"], ["nonExpertFormats", "label"], ["presets", "name"], ["layers", "label"]])
+      (m[arr] || []).forEach((o, i) => pair(`${id}.${arr}[${i}].${key}`, o[key], o[key + "En"]));
+  }
+  return fail;
+}
+// 英文 / 繁体下渲染一次页面默认状态。英文:可见输出里不许有汉字(语言下拉框本身除外);
+// 繁体:逐字检查,cn→tw 的字形转换还会改动的字就是漏转的简体字
+function langLeftovers(els, lang) {
+  const out = new Set();
+  if (lang === "zh-Hant" && typeof OpenCC === "undefined") return ["繁体没有加载 OpenCC(vendor/opencc-js/cn2t.js)"];
+  const ch = lang === "zh-Hant" ? OpenCC.Converter({ from: "cn", to: "tw" }) : null;
+  for (const [id, e] of els) {
+    if (id === "lang") continue;
+    const t = String(e.innerHTML ?? "") + String(e.textContent ?? "") + String(e.title ?? "");
+    if (lang === "en") { for (const m of t.matchAll(/.{0,20}[㐀-鿿豈-﫿　-〿＀-￯].{0,20}/g)) out.add(`${id}: …${m[0]}…`); }
+    else for (const m of t.matchAll(/[㐀-鿿]/g)) if (ch(m[0]) !== m[0]) out.add(`${id}: 「${m[0]}」应为「${ch(m[0])}」`);
+  }
+  return [...out];
+}
+function runLang(model, lang) {
+  const els = new Map();
+  global.document = {
+    getElementById(id) { if (!els.has(id)) els.set(id, mkEl(id)); return els.get(id); },
+    querySelectorAll: () => [], addEventListener() {}, body: mkEl("body"),
+    documentElement: { dataset: {} }, title: "", write: docWrite,
+  };
+  global.location = { search: `?model=${model}&lang=${lang}` };
+  global.localStorage = { getItem: () => null, setItem() {} };
+  global.matchMedia = () => ({ matches: false });
+  global.innerWidth = 1600;
+  global.window = global;
+  eval(inline[0]);
+  for (const s of srcs) eval(fs.readFileSync(path.join(ROOT, s), "utf8"));
+  eval(inline[1]);
+  const fail = [];
+  const empty = REQUIRED.filter(id => { const e = els.get(id); return !e || (!String(e.innerHTML).trim() && !String(e.textContent).trim()); });
+  if (empty.length) fail.push(`空容器:${empty.join(", ")}`);
+  for (const id of CLEAN) for (const b of ["undefined", "NaN"])
+    if ((String(els.get(id)?.innerHTML ?? "") + String(els.get(id)?.textContent ?? "")).includes(b)) fail.push(`${id} 里出现了 ${b}`);
+  fail.push(...langLeftovers(els, lang).slice(0, 8));
+  if (document.documentElement.lang !== { en: "en", "zh-Hant": "zh-TW" }[lang]) fail.push(`<html lang> 应为 ${{ en: "en", "zh-Hant": "zh-TW" }[lang]},实为 ${document.documentElement.lang}`);
+  return fail;
+}
+function checkLangDetection() {
+  const fail = [];
+  const pick = (search, saved, nav) => {
+    global.location = { search }; global.localStorage = { getItem: () => saved, setItem() {} };
+    global.document = { documentElement: { dataset: {} }, write() {} };
+    const keep = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", { value: { languages: [nav], language: nav }, configurable: true, writable: true });
+    try { (0, eval)(fs.readFileSync(path.join(ROOT, "i18n.js"), "utf8")); return I18N.LANG; }
+    finally { if (keep) Object.defineProperty(globalThis, "navigator", keep); else delete globalThis.navigator; }
+  };
+  const want = [[["?lang=en", "zh-Hant", "zh-CN"], "en"], [["", "zh-Hant", "en-US"], "zh-Hant"], [["", null, "zh-TW"], "zh-Hant"],
+                [["", null, "zh-HK"], "zh-Hant"], [["", null, "zh-Hant-TW"], "zh-Hant"], [["", null, "zh-CN"], "zh-Hans"],
+                [["", null, "zh"], "zh-Hans"], [["", null, "en-US"], "en"], [["", null, "ja-JP"], "en"], [["?lang=xx", null, "zh-CN"], "zh-Hans"]];
+  for (const [[q, sv, nv], w] of want) { const got = pick(q, sv, nv); if (got !== w) fail.push(`?lang=${q || "-"} / 上次=${sv} / 浏览器=${nv} 应判为 ${w},实为 ${got}`); }
+  return fail;
 }
 
 let bad = 0;
@@ -785,9 +920,27 @@ if (idx.fail.length) {
   console.log(`✓ index.html — ${idx.nCards} 张模型卡 · 机型表 ${idx.nRows} 行 × ${idx.nTh} 列,th/td 自洽`);
 }
 
-if (bad || idx.fail.length) {
+// 界面语言(ADR-0015)
+const i18nFail = [];
+for (const f of ["app.html", "index.html"]) i18nFail.push(...checkStaticMarkup(f));
+i18nFail.push(...checkDataTranslations());
+for (const lang of ["en", "zh-Hant"]) {
+  for (const id of Object.keys(REG.models)) i18nFail.push(...runLang(id, lang).map(m => `${lang} · ${id}:${m}`));
+  const ix = runIndex(lang);
+  i18nFail.push(...ix.fail.map(m => `${lang} · index.html:${m}`), ...langLeftovers(ix.els, lang).slice(0, 8).map(m => `${lang} · index.html:${m}`));
+}
+i18nFail.push(...checkLangDetection());
+if (i18nFail.length) {
+  console.error("✗ 界面语言");
+  for (const m of i18nFail.slice(0, 60)) console.error(`    ${m}`);
+} else {
+  console.log(`✓ 界面语言 — 静态标记全部有英文 · 数据文件中英数字逐个一致 · ${Object.keys(REG.models).length} 个模型 + 首页在 EN / 繁体下渲染干净 · 语言判定 10 种情形`);
+}
+
+if (bad || idx.fail.length || i18nFail.length) {
   if (bad) console.error(`\n✗ ${bad}/${CASES.length} 个用例失败`);
   if (idx.fail.length) console.error("✗ index.html 渲染检查失败");
+  if (i18nFail.length) console.error(`✗ 界面语言检查失败(${i18nFail.length} 处)`);
   process.exit(1);
 }
 console.log(`\n✓ ${CASES.length} 个用例全过 · ${REQUIRED.length} 个容器非空 · index.html 渲染自洽 · `

@@ -22,6 +22,8 @@ REG.models["glm-5.3"] = {
   },
   blurb: "753.3B 总参数(含 MTP 层)· 39B 激活 · 78 层全 DSA 稀疏注意力(21 层带 indexer,57 层复用 top-k)"
        + " · 256 routed experts / top-8 · 原生 FP8 · 纯文本",
+  blurbEn: "753.3B total parameters (including the MTP layer) · 39B activated · 78 layers, all DSA sparse attention (21 layers with an indexer, 57 reusing the top-k)"
+       + " · 256 routed experts / top-8 · native FP8 · text only",
   hidden: 6144,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构 ----
@@ -45,13 +47,15 @@ REG.models["glm-5.3"] = {
   // 边界声明里 indexer key cache 那一条的后半句(前半句由引擎拼)
   indexerAsm: `布局取自 vLLM 源码(每个 full 层 128 B FP8 + 4 B scale,57 个 shared 层不存)—— 是引擎实现,不在 checkpoint 里,`
     + `别的引擎可能不同;没有 IndexCache 的话是 78 层 × 132 = 10,296 B,KV 多约 8%`,
+  indexerAsmEn: `layout taken from vLLM source (128 B FP8 + 4 B scale per full layer; the 57 shared layers store none) — it is an engine implementation detail, not in the checkpoint, `
+    + `so other engines may differ; without IndexCache it would be 78 layers × 132 = 10,296 B, about 8% more KV`,
 
   // ---- KV cache 的 dtype:不是模型属性,是引擎的运行时选项(--kv-cache-dtype)----
   // 理由同 ADR-0007。第一项即默认值(auto = 模型 dtype = BF16)。
   // vLLM recipe 的所有 NVIDIA 命令都显式传了 --kv-cache-dtype fp8 / fp8_e4m3 —— 那是部署选择,不是默认值。
   kvDtypes: [
-    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2 },
-    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1 },
+    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2, labelEn: "BF16 (engine default)" },
+    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1, labelEn: "FP8 (opt-in)" },
   ],
 
   moe: {
@@ -61,6 +65,7 @@ REG.models["glm-5.3"] = {
     latent: 6144, inter: 2048,   // expert 直接吃 hidden_size
   },
   expertLayerDesc: "76 层(75 层主干 + 1 层 MTP)",
+  expertLayerDescEn: "76 layers (75 backbone + 1 MTP)",
 
   // ---- 权重:两桶实测字节 + 两个参数量(口径见 ADR-0008)----
   weights: {
@@ -86,14 +91,14 @@ REG.models["glm-5.3"] = {
   // 59,585 个张量合计 1,506,659,919,872 B,与它的 index.json 精确相等;expert 1,468,878,815,232 B = 734,439,407,616 × 2,
   // 一个不差(没有 scale 张量)。1,368 GiB,一台机器装不下,recipe 也写明 BF16 要多机。
   expertFormats: [
-    { id: "fp8",  label: "FP8(原生)", bytesPerParam: null },
-    { id: "bf16", label: "BF16(官方 BF16 checkpoint)", bytesPerParam: 2, measured: true },
+    { id: "fp8",  label: "FP8(原生)", bytesPerParam: null, labelEn: "FP8 (native)" },
+    { id: "bf16", label: "BF16(官方 BF16 checkpoint)", bytesPerParam: 2, measured: true, labelEn: "BF16 (official BF16 checkpoint)" },
   ],
   // 非 expert 是混合 dtype,而且这次大头已经是 FP8(attention 全部投影、shared expert、前 3 层 dense MLP),
   // 仍是 BF16 的只有 2.10B 参数,其中 1.90B 是 embedding 与 lm_head。这个开关最多省 1.96 GiB。
   nonExpertFormats: [
-    { id: "native", label: "原生混合(实测)",     bf16Bytes: 2 },
-    { id: "fp8",    label: "BF16 部分也压成 FP8", bf16Bytes: 1 },
+    { id: "native", label: "原生混合(实测)",     bf16Bytes: 2, labelEn: "Native mixed (measured)" },
+    { id: "fp8",    label: "BF16 部分也压成 FP8", bf16Bytes: 1, labelEn: "BF16 part also quantized to FP8" },
   ],
 
   // ---- 候选实例:业务判断,与用户逐个确认(ADR-0005 §2)。2026-10-30 确认:P 系这 4 个,与 K3 / GLM-Flash / DSv4.1 对齐。
@@ -118,15 +123,15 @@ REG.models["glm-5.3"] = {
   //   两台把 expert bank 摊到 16 卡,KV 复制的代价重新占主导,TP1×DP16 回到 TP8/DP2 的 5.3 倍,PP2 又比它高 38%。
   // 括号里标该切分下 KV latent 被复制几份 —— 这是差异的机制,恒真。
   presets: [
-    { name: "两台 TP8/DP2(KV ×8)",              inst: "p5en.48xlarge",    n: 2, tp: 8, dp: 2,  pp: 1, ep: 16 },
-    { name: "一台 TP8/DP1(官方 recipe,KV ×8)",  inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1,  pp: 1, ep: 8  },
-    { name: "两台 TP1×DP16(KV ×1)",             inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 16, pp: 1, ep: 16 },
+    { name: "两台 TP8/DP2(KV ×8)", nameEn: "Two nodes TP8/DP2 (KV ×8)",              inst: "p5en.48xlarge",    n: 2, tp: 8, dp: 2,  pp: 1, ep: 16 },
+    { name: "一台 TP8/DP1(官方 recipe,KV ×8)", nameEn: "One node TP8/DP1 (official recipe, KV ×8)",  inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1,  pp: 1, ep: 8  },
+    { name: "两台 TP1×DP16(KV ×1)", nameEn: "Two nodes TP1×DP16 (KV ×1)",             inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 16, pp: 1, ep: 16 },
     // PP 在这个模型上同样最省显存:非 expert 只存 1 份,每个 stage 只持有自己那 39 层的 KV。代价是流水线气泡,这张图不算
-    { name: "两台 PP2 TP1×DP8(KV ×1)",          inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 8,  pp: 2, ep: 8  },
+    { name: "两台 PP2 TP1×DP8(KV ×1)", nameEn: "Two nodes PP2 TP1×DP8 (KV ×1)",          inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 8,  pp: 2, ep: 8  },
     // 留着不是凑数:与 GLM-5.3-Flash 页的同名预设对照,看 expert bank 的体量怎样把最优方向翻过来
-    { name: "一台 TP1×DP8(KV ×1)",              inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
+    { name: "一台 TP1×DP8(KV ×1)", nameEn: "One node TP1×DP8 (KV ×1)",              inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
     // 一台 b300 与两台 p5en 的 PP2 在上面三个口径下路数恰好相同 —— b300 的 241.7 GiB 预算约等于 p5en 的两倍减去一份 overhead
-    { name: "b300 一台 TP1×DP8(KV ×1)",         inst: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
+    { name: "b300 一台 TP1×DP8(KV ×1)", nameEn: "b300 one node TP1×DP8 (KV ×1)",         inst: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -173,5 +178,49 @@ REG.models["glm-5.3"] = {
     + `GLM-5.3-Flash / TP8 / p5en 上的 6.98 GiB,但那是另一种结构:45 层、hidden 4096、有 mHC 的 <code>hc_*</code> 残差流;`
     + `本模型 78 层、hidden 6144、没有 mHC,而且 recipe 开的 MTP 5 个 draft token 还要额外的激活与 draft 状态。`
     + `<b>不能拿 Flash 的 6.98 来修正本页。</b>一台 p5en TP8 只剩 26.9 GiB 给 KV,而一路 128K 要 11.3 GiB —— overhead 只要比猜的多 4.3 GiB,就从 2 路掉到 1 路。`,
+  ],
+  notesEn: [
+    `<b>All weights are measured values, reconciled three ways.</b> The safetensors header of each of the 141 shards was read with a Range request, `
+    + `and the <code>dtype / shape / data_offsets</code> of <b>118,629</b> tensors were summed: total bytes <code>755,617,140,416</code>, `
+    + `<b>exactly equal</b> to <code>metadata.total_size</code> in <code>index.json</code> = 703.72 GiB; total parameters (excluding <code>*_scale_inv</code>) `
+    + `<code>753,329,940,480</code>, <b>exactly equal</b> to the sum of the three entries of <code>safetensors.parameters</code> at HF <code>/api/models/zai-org/GLM-5.3</code> `
+    + `(BF16 2,103,729,152 + F8_E4M3 751,226,191,872 + F32 19,456); the expert bucket is <code>1.000244140625</code> B per parameter, `
+    + `exactly = 1 B (FP8 e4m3) + 4 B ÷ (128×128) block scale, bit-for-bit identical to GLM-5.3-Flash.`,
+
+    `<b>KV per token is 8 times that of GLM-5.3-Flash: 92,628 B (BF16).</b> All 78 layers are DSA, each with <code>kv_lora_rank 512 + qk_rope 64 = 576</code> elements `
+    + `→ <code>78 × 576 × 2 = 89,856 B</code>, plus 2,772 B of indexer key. Flash has KV in only 11 layers and no RoPE dimension (512 elements per layer), `
+    + `so it is only 11,616 B. Compare K3 at 27,648 B, DSv4.1 at 890 B, Qwen3.8-27B at 65,536 B — this is the <b>largest</b> of the six models, `
+    + `and the latent is shared by all heads, so each GPU in a TP group holds a full copy: at TP8 one 128K request needs <b>11.31 GiB</b> on every GPU.`,
+
+    `<b>IndexCache: only 21 of the 78 layers store an indexer key.</b> <code>indexer_types</code> has 21 <code>full</code> and 57 <code>shared</code> entries; `
+    + `a shared layer reuses the top-2048 chosen by the previous full layer and builds no indexer of its own. The full layers are <code>0, 1, 2, 6, 10, …, 74</code> — `
+    + `this set is <b>identical layer by layer</b> in three places: the config's <code>indexer_types</code>, the <code>skip_topk</code> that vLLM computes from <code>index_topk_freq = 4</code> and `
+    + `<code>index_skip_topk_offset = 3</code>, and the layers in the checkpoint that carry <code>indexer.wk</code> weights (plus MTP layer 78).<br>`
+    + `The key of each full layer is computed per vLLM's <code>DeepseekV32IndexerCache</code>: <code>head_dim 128 + 128 ÷ 128 × 4 = 132 B</code> `
+    + `(FP8 values + fp32 scale), independent of <code>--kv-cache-dtype</code>. <code>21 × 132 = 2,772 B/token</code>, about 3% of the latent. `
+    + `The layer counts are a primary source, but <b>the per-layer byte layout is a vLLM implementation detail</b>, marked <span class="pv pv-e">estimated</span>. `
+    + `During decode, shared layers do not scan the indexer and read only the top-k latents, so in the roofline the reads of those 57 layers do not depend on context length.`,
+
+    `<b>The MTP layer is counted in GPU memory.</b> The checkpoint contains layer 78 (<code>num_nextn_predict_layers = 1</code>) with a full set of 256 experts — `
+    + `so the expert bucket is written as "76 layers" rather than 75. Its expert weights, <b>9.00 GiB</b>, go into the expert bucket, and another 0.34 GiB of `
+    + `<code>eh_proj</code> / attention / shared expert / norms goes into the non-expert bucket. The vLLM recipe start-up commands all enable MTP (<code>num_speculative_tokens 5</code>), `
+    + `so this layer does get loaded; but <b>the KV of the MTP layer itself is not counted</b> (it is also a DSA layer: 576 × 2 + 132 = 1,284 B/token, about +1.4%), and the all-to-all count is also based on the 75 backbone layers.`,
+
+    `<b>The bulk of the non-expert weights is already FP8 this time, so that switch moves only a small part.</b> The attention <code>q_a / q_b / kv_a / kv_b / o_proj</code>, `
+    + `the shared experts of 75+1 layers, the dense MLP of the first 3 layers, and the indexer <code>wq_b / wk</code> are all native FP8, 16.79B parameters in total. `
+    + `Only 2.10B parameters remain BF16: embedding and lm_head at 0.95B each (<code>tie_word_embeddings = false</code>), `
+    + `router 0.12B, MTP <code>eh_proj</code> 0.08B, indexer <code>weights_proj</code>, and norms. `
+    + `"BF16 part also quantized to FP8" saves at most 1.96 GiB, and that is then sharded by TP — unlike the 6.45 GiB saved on GLM-5.3-Flash, here it hardly changes the conclusion.`,
+
+    `<b>This agrees with what the vLLM recipe says, but it is not a measurement.</b> The recipe states that the FP8 checkpoint "can be served on a single node of 8×H200 / 8×H20", `
+    + `and that "running the full 1M context" needs 8×B200 + FP8 KV. Under this page's assumptions (util 0.90, FP8 KV, 12 GiB overhead per GPU): `
+    + `one p5en node at TP8 gives <b>0 concurrent requests</b> at 1M, and one p6-b200 node at TP8 gives <b>1 concurrent request</b> at 1M — the direction is consistent. `
+    + `But the recipe does not give the KV block count self-reported by the engine on NVIDIA instance types; the two it does give (MI325X / MI350X) are not among the candidate instance types, `
+    + `so by the provenance definition in <code>docs/glossary.md</code>, this item is <b>not counted as measured</b>.`,
+
+    `<b>There is no measurement to borrow for the 12 GiB per-GPU overhead guess on this model.</b> The only measurement (<code>docs/measurements.md</code> M-001) is `
+    + `6.98 GiB on GLM-5.3-Flash / TP8 / p5en, but that is a different structure: 45 layers, hidden 4096, and an mHC residual stream with <code>hc_*</code>; `
+    + `this model has 78 layers, hidden 6144, no mHC, and the MTP with 5 draft tokens that the recipe enables needs extra activations and draft state. `
+    + `<b>Flash's 6.98 cannot be used to correct this page.</b> One p5en node at TP8 has only 26.9 GiB left for KV, while one 128K request needs 11.3 GiB — if the overhead is just 4.3 GiB more than guessed, concurrency drops from 2 to 1.`,
   ],
 };

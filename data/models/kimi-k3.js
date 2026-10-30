@@ -18,6 +18,7 @@ REG.models["kimi-k3"] = {
     sources: ["https://huggingface.co/moonshotai/Kimi-K3/blob/main/README.md"],
   },
   blurb: "2.7799T 总参数 · 104B 激活 · 93 层混合注意力(69 KDA + 24 Gated MLA)· 896 routed experts / top-16",
+  blurbEn: "2.7799T total params · 104B activated · 93-layer hybrid attention (69 KDA + 24 Gated MLA) · 896 routed experts / top-16",
   hidden: 7168,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构:分段列表,混合注意力是常态而非特例 ----
@@ -35,8 +36,8 @@ REG.models["kimi-k3"] = {
   // 所以必须是界面上可切的输入,不能作为常数藏在数据文件里。理由见 ADR-0007。
   // 第一项即默认值:引擎默认 auto = 模型 dtype = BF16,不加参数就是这一档。
   kvDtypes: [
-    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2 },
-    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1 },
+    { id: "bf16", label: "BF16(引擎默认)",   labelEn: "BF16 (engine default)", bytes: 2 },
+    { id: "fp8",  label: "FP8(需显式开启)", labelEn: "FP8 (opt-in)",          bytes: 1 },
   ],
 
   moe: {
@@ -74,14 +75,14 @@ REG.models["kimi-k3"] = {
   //   (b) 直接把权重物化成 FP8/BF16      → 拿到原生张量核,但显存也省不到了
   // 两条路的显存后果相反,工具必须都能表达。
   expertFormats: [
-    { id: "mxfp4", label: "MXFP4(原生)", bytesPerParam: null },
-    { id: "fp8",   label: "FP8",         bytesPerParam: 1 },
-    { id: "bf16",  label: "BF16",        bytesPerParam: 2 },
+    { id: "mxfp4", label: "MXFP4(原生)", labelEn: "MXFP4 (native)", bytesPerParam: null },
+    { id: "fp8",   label: "FP8",         labelEn: "FP8",           bytesPerParam: 1 },
+    { id: "bf16",  label: "BF16",        labelEn: "BF16",          bytesPerParam: 2 },
   ],
   // 非 expert 权重:BF16 是实际存储(精确);FP8 是假设重量化。F32 的 norms 两种情况下都不动。
   nonExpertFormats: [
-    { id: "bf16", label: "BF16(实际)", bf16Bytes: 2 },
-    { id: "fp8",  label: "FP8",        bf16Bytes: 1 },
+    { id: "bf16", label: "BF16(实际)", labelEn: "BF16 (as stored)", bf16Bytes: 2 },
+    { id: "fp8",  label: "FP8",        labelEn: "FP8",              bf16Bytes: 1 },
   ],
 
   // ---- 候选实例:业务判断,与用户逐个确认,不从 instance 目录自动推导(ADR-0005 §2)。
@@ -102,19 +103,19 @@ REG.models["kimi-k3"] = {
     // 打头的是「一台机器就够」这条:1453.7 GiB 的 MXFP4 权重装不进一台 p5en,但装得进一台 b300。
     // 括号里只说 p5en 装不进 —— 这一条在两种 expert 格式下都成立(BF16 只会更大),不随口径翻。
     // TP4×DP2 是 PP=1 里最高的一档;开 PP4 能更高,但流水线气泡这张图不算,所以不拿它当门面。
-    { name: "b300 一台(p5en 一台装不进)", inst: "p6-b300.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8 },
+    { name: "b300 一台(p5en 一台装不进)", nameEn: "One b300 node (does not fit on one p5en)", inst: "p6-b300.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 8 },
     // 方案 1 的 TP32 跨 4 个 NVLink 域,是本页 ADR-0001 的反例展品(「反射性地把 TP 开到总卡数」),
     // 保留但不再打头。
-    { name: "方案 1  TP32/EP32",   inst: "p5en.48xlarge",    n: 4, tp: 32, dp: 1,  pp: 1, ep: 32 },
-    { name: "方案 2  TP8/PP4",     inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 1,  pp: 4, ep: 8  },
-    { name: "推荐  TP8×DP4/EP32",  inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 4,  pp: 1, ep: 32 },
-    { name: "反例  纯 DP32",       inst: "p5en.48xlarge",    n: 4, tp: 1,  dp: 32, pp: 1, ep: 32 },
-    { name: "b300 两台胜四台 p5en", inst: "p6-b300.48xlarge", n: 2, tp: 8,  dp: 2,  pp: 1, ep: 16 },
+    { name: "方案 1  TP32/EP32",   nameEn: "Option 1  TP32/EP32", inst: "p5en.48xlarge",    n: 4, tp: 32, dp: 1,  pp: 1, ep: 32 },
+    { name: "方案 2  TP8/PP4",     nameEn: "Option 2  TP8/PP4", inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 1,  pp: 4, ep: 8  },
+    { name: "推荐  TP8×DP4/EP32",  nameEn: "Recommended  TP8×DP4/EP32", inst: "p5en.48xlarge",    n: 4, tp: 8,  dp: 4,  pp: 1, ep: 32 },
+    { name: "反例  纯 DP32",       nameEn: "Counterexample  pure DP32", inst: "p5en.48xlarge",    n: 4, tp: 1,  dp: 32, pp: 1, ep: 32 },
+    { name: "b300 两台胜四台 p5en", nameEn: "Two b300 nodes beat four p5en nodes", inst: "p6-b300.48xlarge", n: 2, tp: 8,  dp: 2,  pp: 1, ep: 16 },
     // 台数要让 world 落在 896 的约数上:3 台 = 24 卡,而 24 ∤ 896 → EP 被夹到 8 →
     // expert bank 复制 3 份 → 直接装不下。故用 4 台(32 卡,32 | 896,EP32 干净),
     // 同时构成与「推荐」同台数的对照:同样 4 台,b200 的 108 路 vs p5en 的 68 路
     // (默认 BF16 KV;切成 FP8 KV 则是 212 vs 136 —— 差一倍,这就是 kvDtypes 必须可切的原因)。
-    { name: "b200 四台(同台数胜 p5en)", inst: "p6-b200.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32 },
+    { name: "b200 四台(同台数胜 p5en)", nameEn: "Four b200 nodes (beat p5en at same node count)", inst: "p6-b200.48xlarge", n: 4, tp: 8, dp: 4, pp: 1, ep: 32 },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -136,5 +137,23 @@ REG.models["kimi-k3"] = {
 
     `MXFP4 在 Hopper(H200)上<b>没有原生张量核支持</b>,引擎走 dequant 到 BF16/FP8 的路径:`
     + `显存节省保留,算力加速拿不到。这张图只算显存,不算这部分性能损失。`,
+  ],
+  notesEn: [
+    `<b>Non-expert params = 57.19B, derived from an authoritative primary source</b> (no longer a residual estimate). Source: HF `
+    + `<code>/api/models/moonshotai/Kimi-K3</code>, whose <code>safetensors.parameters</code> gives `
+    + `<code>BF16 57,179,884,544</code> + <code>F32 11,122,432</code>, and bytes = `
+    + `<code>BF16×2 + F32×4 = 114,404,258,816 B = 106.5 GiB</code>.<br>`
+    + `It contains the projections of 24 MLA + 69 KDA layers, 2 shared experts, the MoE latent projection, dense layer 0, and the embedding + LM head. `
+    + `<code>quantization_config</code> explicitly excludes attention / shared experts / MLP projections, so this part is not MXFP4.<br>`
+    + `<b>An earlier estimate of "2.8T minus the expert part" gave 77.3B, an overestimate of 35%.</b> 2.8T itself is a nominal value rounded up; the real total is 2.7799T.`,
+
+    `<b>Expert weights = 1347.0 GiB, also a derived value</b>. It is <code>metadata.total_size = 1,560,860,324,864 B</code> in `
+    + `<code>model.safetensors.index.json</code> minus the non-expert part. Divided by the logical param count `
+    + `<code>2,722,740,830,208</code> it gives exactly <b>0.53125</b>, which matches the theoretical value for "4 bits + one 8-bit scale per 32 elements" `
+    + `— three independent sources confirm each other.<br>`
+    + `This file must be fetched through the <code>resolve</code> endpoint; the <code>raw</code> endpoint returns only a git-lfs pointer.`,
+
+    `MXFP4 has <b>no native tensor core support</b> on Hopper (H200); the engine takes the path of dequantizing to BF16/FP8: `
+    + `the GPU memory saving is kept, and the compute speedup is not available. This chart counts GPU memory only, not this performance loss.`,
   ],
 };

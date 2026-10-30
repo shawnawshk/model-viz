@@ -38,7 +38,7 @@
   const toggle = document.getElementById("sidebar-toggle");
   function setSidebar(collapsed) {
     document.documentElement.dataset.sidebar = collapsed ? "collapsed" : "expanded";
-    const label = collapsed ? "展开侧边栏" : "收起侧边栏";
+    const label = collapsed ? L("展开侧边栏", "Expand sidebar") : L("收起侧边栏", "Collapse sidebar");
     toggle.setAttribute("aria-expanded", String(!collapsed));
     toggle.setAttribute("aria-label", label);
     toggle.title = label;
