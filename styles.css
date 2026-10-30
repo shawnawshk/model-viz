@@ -102,6 +102,7 @@ h1, h2, h3, h4, p { margin-top: 0; }
 .local-label::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--st-good); }
 .ghost { color: var(--text-secondary); background: transparent; border: 1px solid var(--border); border-radius: 6px; font-size: var(--font-ui); padding: 7px 11px; min-height: 34px; }
 .ghost:hover { border-color: var(--accent); color: var(--accent); }
+.lang-select { cursor: pointer; }
 /* 顶栏的纯图标按钮(GitHub 仓库链接):沿用 .ghost 的边框与 hover,宽度与高度相同 */
 .icon-link { display: inline-flex; align-items: center; justify-content: center; width: 34px; padding: 0; }
 .icon-link svg { width: 18px; height: 18px; }
@@ -427,7 +428,9 @@ details.assump li { margin-bottom: 11px; overflow-wrap: anywhere; }
   .nav-link { border-radius: 5px 5px 0 0; padding: 9px 8px; font-size: var(--font-small); gap: 7px; }
   .nav-link svg { width: 14px; height: 14px; }
   .shell { margin-left: 0; }
-  .workspace-header { position: static; min-height: 56px; padding: 10px 20px; gap: 10px; }
+  /* 窄屏时语言下拉框 + 主题按钮放不进一行:顶栏允许折行,按钮组整体换到面包屑下面 */
+  .workspace-header { position: static; min-height: 56px; padding: 10px 20px; gap: 10px; flex-wrap: wrap; }
+  .header-actions { gap: 10px; }
   .breadcrumb { font-size: var(--font-small); gap: 7px; }
   .local-label { display: none; }
   .ghost { font-size: var(--font-small); min-height: 31px; }

@@ -24,6 +24,7 @@ REG.models["glm-5.3-flash"] = {
     ],
   },
   blurb: "321.3B 总参数 · 18B 激活 · 45 层混合注意力(34 KDA 线性 + 11 DSA 稀疏)· 288 routed experts / top-8 · 原生 FP8",
+  blurbEn: "321.3B total params · 18B activated · 45 hybrid-attention layers (34 KDA linear + 11 DSA sparse) · 288 routed experts / top-8 · native FP8",
   hidden: 4096,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构 ----
@@ -44,13 +45,14 @@ REG.models["glm-5.3-flash"] = {
 
   // 边界声明里 indexer key cache 那一条的后半句(前半句「按每 token N B 计」由引擎拼)。各模型的依据硬度不同,所以各写各的
   indexerAsm: `其 pooling 方式与 dtype <b>都没有一手依据</b> —— 若引擎不做池化压缩则是这个数的 4 倍(见下方假设区)`,
+  indexerAsmEn: `Its pooling method and dtype <b>have no primary source</b> — if the engine does not pool-compress, this figure is 4 times larger (see the assumptions section below)`,
 
   // ---- KV cache 的 dtype:不是模型属性,是引擎的运行时选项(--kv-cache-dtype)----
   // 理由与 K3 完全相同,见 ADR-0007。第一项即默认值(auto = 模型 dtype = BF16)。
   // 注意这个开关不影响 indexer 的 key cache —— 那一份走自己的 dtype。
   kvDtypes: [
-    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2 },
-    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1 },
+    { id: "bf16", label: "BF16(引擎默认)", labelEn: "BF16 (engine default)",   bytes: 2 },
+    { id: "fp8",  label: "FP8(需显式开启)", labelEn: "FP8 (opt-in)", bytes: 1 },
   ],
 
   moe: {
@@ -86,14 +88,14 @@ REG.models["glm-5.3-flash"] = {
   // BF16 一档不是模型的原生形态,是把 expert 反量化物化后的推算值 —— 290 GiB 会涨到 580 GiB,
   // 一台机器立刻装不下,这就是它值得放在这里的原因。
   expertFormats: [
-    { id: "fp8",  label: "FP8(原生)", bytesPerParam: null },
-    { id: "bf16", label: "BF16",      bytesPerParam: 2 },
+    { id: "fp8",  label: "FP8(原生)", labelEn: "FP8 (native)", bytesPerParam: null },
+    { id: "bf16", label: "BF16", labelEn: "BF16",      bytesPerParam: 2 },
   ],
   // 非 expert 是混合 dtype(见 notes 第 5 条),所以第一档叫「原生混合」而不是「BF16」。
   // 第二档只把 BF16 的那 6.93B 参数压成 FP8,已经是 FP8 的部分不动。
   nonExpertFormats: [
-    { id: "native", label: "原生混合(实测)",     bf16Bytes: 2 },
-    { id: "fp8",    label: "BF16 部分也压成 FP8", bf16Bytes: 1 },
+    { id: "native", label: "原生混合(实测)", labelEn: "Native mixed (measured)",     bf16Bytes: 2 },
+    { id: "fp8",    label: "BF16 部分也压成 FP8", labelEn: "BF16 part also quantized to FP8", bf16Bytes: 1 },
   ],
 
   // ---- 候选实例:业务判断,与用户逐个确认,不从 instance 目录自动推导(ADR-0005 §2)。
@@ -129,15 +131,15 @@ REG.models["glm-5.3-flash"] = {
   presets: [
     // 与 K3 相反:这个模型的非 expert 权重只有 15.46 GiB(p5en 预算的 12%),复制它很便宜;
     // 而 KV latent 会被 TP 复制 TP 份。所以在长上下文下 TP 越大越亏。
-    { name: "TP8/DP1(KV ×8)",       inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1,  pp: 1, ep: 8  },
-    { name: "TP1×DP8(KV ×1)",       inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
-    { name: "TP2×DP4(KV ×2)",       inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4,  pp: 1, ep: 8  },
+    { name: "TP8/DP1(KV ×8)", nameEn: "TP8/DP1 (KV ×8)",       inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1,  pp: 1, ep: 8  },
+    { name: "TP1×DP8(KV ×1)", nameEn: "TP1×DP8 (KV ×1)",       inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
+    { name: "TP2×DP4(KV ×2)", nameEn: "TP2×DP4 (KV ×2)",       inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4,  pp: 1, ep: 8  },
     // PP 在这个模型上显存最省:非 expert 只存 1 份,且每个 stage 只持有自己那几层的 KV。
     // 四个角上它都是单台里最高的一档 —— 但代价是流水线气泡,而这张图不算那个。
-    { name: "PP2 TP1×DP4(KV ×1)",   inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 4,  pp: 2, ep: 4  },
-    { name: "两台 TP1×DP16",         inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 16, pp: 1, ep: 16 },
+    { name: "PP2 TP1×DP4(KV ×1)", nameEn: "PP2 TP1×DP4 (KV ×1)",   inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 4,  pp: 2, ep: 4  },
+    { name: "两台 TP1×DP16", nameEn: "Two nodes TP1×DP16",         inst: "p5en.48xlarge",    n: 2, tp: 1, dp: 16, pp: 1, ep: 16 },
     // 相对比较比绝对路数稳健:b300 一台 > p5en 两台,在上面四个角上都成立(幅度 1.07–1.17×)。
-    { name: "b300 一台 ⇄ p5en 两台", inst: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
+    { name: "b300 一台 ⇄ p5en 两台", nameEn: "One b300 node vs two p5en nodes", inst: "p6-b300.48xlarge", n: 1, tp: 1, dp: 8,  pp: 1, ep: 8  },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -181,5 +183,45 @@ REG.models["glm-5.3-flash"] = {
     + `<code>qk_rope_head_dim = 0</code> —— 这个模型的 MLA 完全不带 RoPE 维度,与 DeepSeek 系`
     + `和 Kimi K3 的 512+64 都不同。这是它每 token 的 KV 比 K3 小 2.4 倍的一半原因,`
     + `另一半是持有 KV 的层从 24 降到 11。`,
+  ],
+  notesEn: [
+    `<b>All weights are measured values, reconciled three ways</b>. Method: send a Range request for each of the 62 shards, read the safetensors header, `
+    + `and sum the <code>data_offsets</code> and <code>shape</code> of 76,108 tensors. The byte total `
+    + `<code>328,326,771,576</code> is <b>exactly equal</b> to <code>metadata.total_size</code> in <code>index.json</code>. The parameter total <code>321,323,031,390</code> is `
+    + `<b>exactly equal</b> to the sum of the three entries in <code>safetensors.parameters</code> from HF `
+    + `<code>/api/models/zai-org/GLM-5.3-Flash</code>. The expert bucket is <code>1.000244140625</code> B per parameter, which is exactly 1 B (FP8 e4m3) + `
+    + `4 B ÷ (128×128) for the block scale, and <b>matches exactly</b> the e4m3 + 128-block quantization declared in <code>quantization_config</code>. `
+    + `Three independent sources confirm each other, so this bucket needs no estimate.`,
+
+    `<b>The MTP layer is counted in GPU memory</b>. The checkpoint has a layer 45 (<code>num_nextn_predict_layers = 1</code>) `
+    + `with a full set of 288 experts — which is why the line above says "43 layers × 288 experts" and not 42 layers. `
+    + `Its expert weights, <b>6.75 GiB</b>, are counted in the expert bucket, and another 0.23 GiB of eh_proj / norms / shared expert `
+    + `is counted in the non-expert bucket.<br><b>Without speculative decoding the engine does not load it</b>: in that case the expert bucket is 6.75 GiB smaller `
+    + `(2.3%), and after EP sharding the effect on each GPU is under 1 GiB. The all-to-all count is based on the 42 backbone layers and does not include it.`,
+
+    `<b>DSA is sparse attention, but it does not save GPU memory.</b> <code>index_topk = 2048</code> sets how many tokens each query `
+    + `<b>looks at</b>, not how many are <b>stored</b> — the MLA latent for all tokens must still stay in the cache, `
+    + `so the memory cost is exactly the same as full MLA. What DSA saves is attention compute and KV read bandwidth, and <b>neither is in this chart</b>. `
+    + `If you came to this page expecting that sparse attention should save GPU memory, the answer is: it does not, not even a little.`,
+
+    `<b>The indexer key cache is one extra estimated item in this model compared with K3.</b> The <code>wk</code> of the lightning indexer outputs 128 dimensions, `
+    + `and in the config <code>index_kpool = 4</code> and <code>index_kpool_compress = true</code>, `
+    + `so this page counts "4 tokens pooled into 1 key": <b>32 elements/token/layer × FP8 = 352 B/token across 11 layers</b>, `
+    + `about <b>+3%</b> of the MLA latent.<br>If the engine does not actually pool-compress (128 elements/token/layer), the figure is `
+    + `<b>1,408 B/token</b>, about <b>+13%</b>. Neither reading changes the order of magnitude of the conclusion, but <b>neither is a primary source</b> — `
+    + `the pooling method and dtype cannot be found in <code>config.json</code> or in the checkpoint, `
+    + `and, like the KV dtype, are engine implementation details. Marked <span class="pv pv-e">estimated</span>.`,
+
+    `<b>The non-expert part is a mixed dtype, so that switch changes only half of it.</b> Already FP8: the `
+    + `<code>q_a / q_b / kv_a / o_proj</code> of the 11 DSA layers, the shared experts of the 42+1 layers, and the dense MLP of the first 3 layers, `
+    + `2,743,074,816 parameters in total. Still BF16: all projections of the 34 KDA layers, <code>kv_b_proj</code>, the indexer, `
+    + `the <code>hc_*</code> tensors of mHC (0.07 GiB in total), the embedding and lm_head, 6,926,096,640 parameters in total.<br>`
+    + `So switching "non-expert weights" to FP8 only compresses the latter from 12.90 GiB to 6.45 GiB; the former is unaffected — `
+    + `6.45 GiB saved in total, then sharded by TP. <b>The extra residual-stream activations from mHC are not counted separately</b>; they fall under the 12 GiB guess.`,
+
+    `<b>Only 512 KV elements per token, not 576.</b> <code>mla_use_nope = true</code> and `
+    + `<code>qk_rope_head_dim = 0</code> — the MLA in this model has no RoPE dimension at all, unlike the 512+64 of the DeepSeek family `
+    + `and Kimi K3. This accounts for half of why its KV per token is 2.4 times smaller than K3, `
+    + `and the other half is that the layers holding KV drop from 24 to 11.`,
   ],
 };

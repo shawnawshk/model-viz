@@ -61,6 +61,8 @@ roofline 下界与显存结果用同一组输入。
 | `app.html?model=<id>` | 唯一的引擎。所有公式只有一份实现 |
 | `styles.css` | 两个页面共用的主题、导航与响应式布局 |
 | `sidebar.js` | 两个页面共用的导航（按 provider 分组模型）与侧栏的收起状态 |
+| `i18n.js` | 界面语言（简体 / 繁体 / English）：语言判定、`L(简, 英)`、繁体转换 |
+| `vendor/opencc-js/` | 繁体转换用的 OpenCC 词典（MIT + Apache-2.0），只在选了繁体时加载 |
 | `assets/providers/` | 本地 provider logo，以及 logo 的来源与许可 |
 | `favicon.svg` | 应用图标 |
 | `data/instances.js` | 机型规格：显存、NVLink 域、跨域带宽、原生 dtype、HBM 带宽、dense TFLOPS（HBM 带宽与 dense TFLOPS 附 datasheet 出处） |
@@ -70,11 +72,12 @@ roofline 下界与显存结果用同一组输入。
 
 数据文件是 `.js`，不是 `.json`。原因：在 `file://` 下，CORS 会阻止 `fetch()`。classic `<script>` 标签不受这个限制。
 
-加一个模型需要三步：
+加一个模型需要四步：
 
-1. 加一个 `data/models/<id>.js`。
+1. 加一个 `data/models/<id>.js`。要显示的字段都写一份英文孪生字段（`blurbEn`、`notesEn`、`labelEn`、`nameEn` 等）。
 2. 在 `index.html` 里加一行 `<script src>`。
 3. 在 `app.html` 里加一行 `<script src>`。
+4. 在 `verify-app.js` 的用例表里加用例。
 
 加模型时还要注意两点：
 
@@ -88,7 +91,7 @@ roofline 下界与显存结果用同一组输入。
 - [`docs/glossary.md`](docs/glossary.md)：领域词汇。包括：NVLink 域 ≠ 实例；推理 DP ≠ 训练 DP；KV 复制因子按 attention family 不同；provenance 分五级。
 - [`docs/instance-specs.md`](docs/instance-specs.md)：G5–G7 / P4d–P6 共 57 个实例的规格总目录。真值用 `describe-instance-types` 给出的 MiB。
 - [`docs/measurements.md`](docs/measurements.md)：实测记录。目前只有一条（M-001）：2026-09-16 在 p5en 上运行 GLM-5.3-Flash 服务，读取引擎自报的内存账。这条实测用来替换每卡 12 GiB overhead 这个估计常数。**每条记录都写明：结论可以推广到哪里，不能推广到哪里。**
-- [`docs/adr/`](docs/adr/)：ADR-0001 至 0014。主要决策：
+- [`docs/adr/`](docs/adr/)：ADR-0001 至 0015。主要决策：
   - TP 上限由 NVLink 域决定，不由「节点」决定；
   - 单位一律用 GiB；
   - KV cache 的 dtype 是引擎参数，不是模型属性（ADR-0009 记录了例外）；
@@ -97,7 +100,17 @@ roofline 下界与显存结果用同一组输入。
   - 同机型、同台数内的 Pareto 反事实建议器（ADR-0011）；
   - GQA family 与 dense 模型（ADR-0012）：KV 复制因子是并行配置的函数；`moe` 块是可选的；
   - 按 TP 切的查表放在哪是引擎参数，默认取 vLLM 的 host offload（ADR-0013）；
-  - QSA family（ADR-0014）：主 KV 按 kv head 切，indexer key 每卡一份；DSA 支持 IndexCache。
+  - QSA family（ADR-0014）：主 KV 按 kv head 切，indexer key 每卡一份；DSA 支持 IndexCache；
+  - 界面支持简体 / 繁体 / English（ADR-0015）：只维护简体与英文，繁体由 OpenCC 按台湾用语现转。
+
+## 界面语言
+
+页面右上角可以切换简体中文、繁體中文、English。
+
+- 默认跟随浏览器语言。`?lang=zh-Hans` / `zh-Hant` / `en` 可以直接指定，便于分享链接。选择会被记住。
+- 只维护简体和英文两份文案。页面里写 `L(简体, 英文)`，数据文件里写 `xxx` 与 `xxxEn`。
+- 繁体由 OpenCC 从简体按台湾用语自动转换，再套一张 6 个词的术语表（见 `i18n.js` 的 `HANT_TERMS`）。
+- **改任何可见的中文，都要同时改英文。** `node verify-app.js` 会检查：英文页面上不许剩汉字；中英两版的数字、`<code>`、链接逐个一致；繁体页面上不许剩简体字。
 
 ## 当前收录
 

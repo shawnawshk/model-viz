@@ -28,6 +28,8 @@ REG.models["qwen3.8-flash-next"] = {
   },
   blurb: "180.0B checkpoint 参数(125B 主干 + 51B n-gram 嵌入 + 4B MTP)· 6B 激活 · 48 层混合注意力(36 Gated DeltaNet 线性 + 12 QSA 稀疏)"
        + " · 512 routed experts / top-10 · GQA 2 kv head · 原生 BF16,官方另有 FP8 · 多模态 · 262K 原生上下文",
+  blurbEn: "180.0B checkpoint parameters (125B backbone + 51B n-gram embedding + 4B MTP) · 6B activated · 48 hybrid-attention layers (36 Gated DeltaNet linear + 12 QSA sparse)"
+       + " · 512 routed experts / top-10 · GQA 2 kv heads · native BF16, official FP8 also available · multimodal · 262K native context",
   hidden: 2560,                              // hidden_size,只用于 PP 的 send/recv 激活量(hc_count 4 时残差流其实是 4 × 2560,见 notes)
 
   // ---- 层结构 ----
@@ -39,7 +41,7 @@ REG.models["qwen3.8-flash-next"] = {
       note: "QSA = GQA 主 KV(24 q / 2 kv head,head_dim 256,按 kv head 切)+ 一份压缩 indexer key "
           + "(每 4 个 token 一行 128 维,1 个共享 head → TP 切不掉)。decode 只读 top-2048 个 token 的主 KV;"
           + "vLLM 的 QSA 不带滑窗、不带 sink(遇到就抛 NotImplementedError)" },
-    { count: 36, family: "linear", label: "Gated DeltaNet 线性注意力", heads: 48, kHeads: 16, headDim: 128, stateDtypeBytes: 4,
+    { count: 36, family: "linear", label: "Gated DeltaNet 线性注意力", labelEn: "Gated DeltaNet linear attention", heads: 48, kHeads: 16, headDim: 128, stateDtypeBytes: 4,
       note: "Gated DeltaNet。recurrent state 形状 [48 v-head × 128 × 128],与序列长度无关,per-head 可按 TP 切。"
           + "另有 kernel=4 的短卷积 state(36 层 × 10240 通道 × 3 × 2 B ≈ 2.1 MiB/请求),量级可忽略,未计入" },
   ],
@@ -48,12 +50,14 @@ REG.models["qwen3.8-flash-next"] = {
   // 边界声明里 indexer key cache 那一条的后半句(前半句由引擎拼)
   indexerAsm: `按 vLLM 对本模型的默认 <code>indexer_kv_dtype</code> = BF16 计(每 4 个 token 一行 128 维,只有 1 个 head,TP 切不掉)—— `
     + `vLLM recipe 的命令都传了 <code>--attention-config.indexer_kv_dtype fp8</code>,那样这一项减半;它不受 <code>--kv-cache-dtype</code> 影响`,
+  indexerAsmEn: `per vLLM's default <code>indexer_kv_dtype</code> = BF16 for this model (one 128-dim row per 4 tokens, only 1 head, cannot be split by TP) — `
+    + `the vLLM recipe commands all pass <code>--attention-config.indexer_kv_dtype fp8</code>, which halves this item; it is not affected by <code>--kv-cache-dtype</code>`,
 
   // ---- KV cache 的 dtype:不是模型属性,是引擎的运行时选项(--kv-cache-dtype)----
   // 理由同 ADR-0007。第一项即默认值。recipe 的 NVIDIA 命令都显式传了 --kv-cache-dtype fp8 —— 那是部署选择,不是默认值。
   kvDtypes: [
-    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2 },
-    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1 },
+    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2, labelEn: "BF16 (engine default)" },
+    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1, labelEn: "FP8 (opt-in)" },
   ],
 
   moe: {
@@ -62,6 +66,7 @@ REG.models["qwen3.8-flash-next"] = {
     latent: 2560, inter: 640,    // expert 直接吃 hidden_size
   },
   expertLayerDesc: "49 层(48 层主干 + 1 层 MTP)",
+  expertLayerDescEn: "49 layers (48 backbone + 1 MTP)",
 
   // ---- 权重:三桶实测字节(口径见 ADR-0009 §1)----
   weights: {
@@ -83,21 +88,30 @@ REG.models["qwen3.8-flash-next"] = {
     nonMatmulParams: 1_084_630_256,       // embedding 635,699,200 + vision 塔 448,931,056:不参与 decode 矩阵乘,只用于标注算力行的高估比例
   },
   nonExpertFixedDesc: "n-gram 哈希用的 3 个 I64 常量张量,280 B",
+  nonExpertFixedDescEn: "3 I64 constant tensors used for n-gram hashing, 280 B",
 
   // ---- 第三桶的文案 ----
   tpShardedLabel: "n-gram 嵌入表(PLE;常驻时按 TP 切,不按 PP 切)",
+  tpShardedLabelEn: "n-gram embedding table (PLE; sharded by TP when resident, not by PP)",
   tpShardedShort: "n-gram 表",
+  tpShardedShortEn: "n-gram table",
   tpShardedNote: "字节数实测(128 个 shard 共 3.2 亿行 × 160 维 BF16;官方 FP8 版 47.68 GiB);vLLM 默认放 host,常驻 HBM 时按 TP 切",
+  tpShardedNoteEn: "Byte count measured (128 shards, 320 million rows in total × 160 dims BF16; official FP8 build 47.68 GiB); vLLM offloads it to host by default, and when resident in HBM it is sharded by TP",
   // 常驻那一档的局限,显示在「常驻 HBM」那条 banner 里
   lookupHbmCaveat: `<b>这一档的路数是上限。</b>vLLM recipe 写着:4×H100 上 TP4 不开 offload 会在启动时 OOM,H100 上 TP / TEP 都必须 offload;`
     + `可按「÷TP 常驻」算,4×H100 TP4(FP8)每卡扣完 12 GiB overhead 还剩 16.8 GiB —— 说明常驻的真实开销比 ÷TP 更大。`
     + `另外 DEP(TP1 × DP)不支持常驻,只能 offload。`,
+  lookupHbmCaveatEn: `<b>The number of concurrent requests at this setting is an upper bound.</b> The vLLM recipe states that on 4×H100, TP4 without offload runs out of memory at startup, and on H100 both TP and TEP must offload; `
+    + `the figure can be computed as "resident ÷ TP", but on 4×H100 TP4 (FP8) each GPU has only 16.8 GiB left after the 12 GiB overhead — so the real cost of keeping the table resident is larger than ÷TP. `
+    + `In addition, DEP (TP1 × DP) does not support a resident table and can only offload.`,
 
   // ---- 每请求固定占用的文案(GDN recurrent state)----
   stateNote: "结构由 config 推导(36 层 × 48 head × 128 × 128);dtype 按 config 的 float32,vLLM 默认 auto 会落到 BF16(减半)",
+  stateNoteEn: "Structure derived from the config (36 layers × 48 heads × 128 × 128); dtype follows the config's float32, while vLLM's default auto falls back to BF16 (half the size)",
 
   // ---- 引擎不支持的 PP ----
   ppUnsupported: `vLLM recipe:N-gram Embedding 目前不支持 pipeline parallelism,启动会报错,只能用单机 TP / TEP。`,
+  ppUnsupportedEn: `vLLM recipe: N-gram Embedding does not currently support pipeline parallelism and fails at startup; use single-node TP / TEP only.`,
 
   // ---- 量化 ----
   // 原生 checkpoint 是 BF16。官方 FP8 版的 quantization_config:fmt e4m3、weight_block_size [128,128],
@@ -110,14 +124,15 @@ REG.models["qwen3.8-flash-next"] = {
   //   n-gram 表:FP8,整张表只有一个 BF16 的 per-tensor scale(shape [1])→ 51,200,245,760 + 2 = 51,200,245,762 B。
   //   所以这一档要连第三桶一起换(tpShardedBytes),否则「常驻 + FP8」会多算 47.7 GiB ÷ TP。
   expertFormats: [
-    { id: "bf16", label: "BF16(原生)", bytesPerParam: null },
+    { id: "bf16", label: "BF16(原生)", bytesPerParam: null, labelEn: "BF16 (native)" },
     { id: "fp8",  label: "FP8(官方 FP8 checkpoint,expert 与 n-gram 表都换)", bytesPerParam: 1.0001220703125,
+      labelEn: "FP8 (official FP8 checkpoint: experts + n-gram table)",
       tpShardedBytes: 51_200_245_762, measured: true },
   ],
   // 非 expert 只有 10.22 GiB,而且官方 FP8 版不动它。第二档是推算(没有 checkpoint),留着只为与另几个模型的同名开关对齐。
   nonExpertFormats: [
-    { id: "bf16", label: "BF16(原生,官方 FP8 版也不动)", bf16Bytes: 2 },
-    { id: "fp8",  label: "BF16 部分也压成 FP8(推算)",     bf16Bytes: 1, dtype: "fp8" },
+    { id: "bf16", label: "BF16(原生,官方 FP8 版也不动)", bf16Bytes: 2, labelEn: "BF16 (native; official FP8 keeps it)" },
+    { id: "fp8",  label: "BF16 部分也压成 FP8(推算)",     bf16Bytes: 1, dtype: "fp8", labelEn: "BF16 part also quantized to FP8 (extrapolated)" },
   ],
 
   // ---- 候选实例:业务判断,与用户逐个确认(ADR-0005 §2)。2026-10-30 确认:P 系 4 个 + p5(H100 80GB)。
@@ -144,15 +159,15 @@ REG.models["qwen3.8-flash-next"] = {
   //   常驻时,95 GiB 的 n-gram 表只能按 TP 切,TP1×DP8 直接装不下 —— DSv4.1 那条「TP 有下限」回来了。
   // 括号里标该切分下主 KV 被复制几份 —— 这是差异的机制,恒真。
   presets: [
-    { name: "TEP8:TP8/DP1(官方 H200 配置,KV ×4)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8 },
-    { name: "TP4×DP2(KV ×2)",                      inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8 },
-    { name: "TP2×DP4(TP = n_kv_heads,KV ×1)",      inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
+    { name: "TEP8:TP8/DP1(官方 H200 配置,KV ×4)", nameEn: "TEP8: TP8/DP1 (official H200 config, KV ×4)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8 },
+    { name: "TP4×DP2(KV ×2)", nameEn: "TP4×DP2 (KV ×2)",                      inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8 },
+    { name: "TP2×DP4(TP = n_kv_heads,KV ×1)", nameEn: "TP2×DP4 (TP = n_kv_heads, KV ×1)",      inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
     // 非 expert 只有 10 GiB,复制 8 份也便宜;但它对「查表放置」最敏感:常驻时每卡背整张 95 GiB 的表
-    { name: "TP1×DP8(KV ×1;常驻时 n-gram 表不切)", inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8 },
+    { name: "TP1×DP8(KV ×1;常驻时 n-gram 表不切)", nameEn: "TP1×DP8 (KV ×1; n-gram table not sharded when resident)", inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8 },
     // recipe 的 8×H100 配置:H100 上 n-gram 表必须 offload
-    { name: "p5 H100 TEP8(官方 H100 配置)",          inst: "p5.48xlarge",      n: 1, tp: 8, dp: 1, pp: 1, ep: 8 },
-    { name: "p5 H100 TP2×DP4(KV ×1)",               inst: "p5.48xlarge",      n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
-    { name: "b300 TP2×DP4(KV ×1)",                  inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
+    { name: "p5 H100 TEP8(官方 H100 配置)", nameEn: "p5 H100 TEP8 (official H100 config)",          inst: "p5.48xlarge",      n: 1, tp: 8, dp: 1, pp: 1, ep: 8 },
+    { name: "p5 H100 TP2×DP4(KV ×1)", nameEn: "p5 H100 TP2×DP4 (KV ×1)",               inst: "p5.48xlarge",      n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
+    { name: "b300 TP2×DP4(KV ×1)", nameEn: "b300 TP2×DP4 (KV ×1)",                  inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8 },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -210,5 +225,60 @@ REG.models["qwen3.8-flash-next"] = {
     `<b>每卡 12 GiB overhead 这个猜测在本模型上更不牢。</b>Gated Residual 的 <code>hc_count = 4</code>:残差流是 4 份并行的 2560 维(共 10240 维),`
     + `与 DSv4.1 的 <code>hc_mult = 4</code> 同类,激活峰值本该更大;recipe 的命令都开了 MTP 3 个 draft token,还要再加 draft 的激活与状态。`
     + `而 TEP8 时每卡权重只有 30 GiB,overhead 是它的 40%。唯一一档实测(<code>docs/measurements.md</code> M-001,GLM-5.3-Flash)<b>不能搬到这里</b>。`,
+  ],
+  notesEn: [
+    `<b>All weights are measured values, reconciled three ways.</b> The safetensors header of each of the 131 shards was read with a Range request, and the `
+    + `<code>dtype / shape / data_offsets</code> of <b>1,658</b> tensors were summed: total bytes <code>359,999,963,128</code>, `
+    + `<b>exactly equal</b> to <code>metadata.total_size</code> in <code>index.json</code> = 335.28 GiB (the vLLM recipe also states 335.28 GiB); total parameters `
+    + `<code>179,999,981,424</code>, <b>exactly equal</b> to <code>safetensors.parameters.BF16</code> from the HF API; in addition there are 35 I64 elements (n-gram hash constants).<br>`
+    + `Breakdown: routed experts <b>229.69 GiB (68.5%)</b>, n-gram table <b>95.37 GiB (28.4%)</b>, everything else <b>10.22 GiB (3.0%)</b>. `
+    + `Within that last bucket: Gated DeltaNet projections 3.89, embedding + lm_head 2.37 (<code>tie_word_embeddings = false</code>), `
+    + `Gated Residual hyper-connection 1.19, QSA projections 1.15, vision tower 0.84, shared expert + router 0.56 GiB. `
+    + `The model card's "125B + 51B n-gram + 4B MTP" adds up to 180B, consistent with the tensor-by-tensor sum.`,
+
+    `<b>The "expert → FP8" option is the official FP8 checkpoint, measured tensor by tensor.</b> The 152,089 tensors of <code>Qwen/Qwen3.8-Flash-Next-FP8</code> were read the same way, `
+    + `totaling <code>185,502,232,570</code> B = 172.76 GiB (exactly equal to its <code>index.json</code>; the recipe states 172.78 GiB, a 0.02 GiB difference whose source was not checked). `
+    + `Its <code>modules_to_convert</code> lists only the n-gram table; on top of that, every routed expert is quantized: experts are FP8 + one <b>BF16</b> scale per 128×128 block, `
+    + `<code>1 + 2/16384 = 1.0001220703125</code> B per parameter, exact; the n-gram table is FP8 with <b>only one</b> BF16 per-tensor scale (shape <code>[1]</code>), `
+    + `<code>51,200,245,760 + 2</code> B = 47.68 GiB. The other 5,487,198,064 parameters are <b>identical, one by one, to the BF16 build and stay BF16</b>.<br>`
+    + `So this page models this option as "switching checkpoint": experts and the n-gram table are switched together. The n-gram table is in host memory by default, so this affects HBM only when you set it to resident.`,
+
+    `<b>QSA KV per token: main KV 24,576 B (BF16) + indexer key 768 B, and the two are sharded in opposite ways.</b> `
+    + `The main KV is GQA: <code>12 layers × 2 (K+V) × 2 kv head × 256 × 2 B = 24,576 B</code>, sharded by kv head, with replication factor <code>max(1, TP ÷ 2)</code> — `
+    + `there are only 2 kv heads, so the TP sweet spot is at 2, one step lower than Qwen3.8-27B (4 kv heads). `
+    + `The indexer key is vLLM's <code>QSACompressedKeyCache</code>: one row per 4 tokens, 128 dims, <b>only 1 shared head</b>, `
+    + `<code>12 × 128 × 2 B ÷ 4 = 768 B/token</code>, one full copy on every GPU (TP cannot split it); its dtype follows <code>indexer_kv_dtype</code>, `
+    + `which vLLM defaults to BF16 for this model (<code>resolve_indexer_kv_dtype("bf16")</code>), independent of <code>--kv-cache-dtype</code>.<br>`
+    + `vLLM also keeps a 4-slot raw key ring per layer (140 BF16 per slot with MRoPE), about 13 KiB/request across 12 layers, negligible and not counted. See <code>docs/adr/0014</code>.`,
+
+    `<b>QSA sparsity saves reads, not storage.</b> The main KV of all tokens stays in the cache (GPU memory is the same as for plain GQA), but each decode step reads only the top-2048 tokens `
+    + `(<code>indexer_budget</code>, 512 micro-blocks × 4 tokens), plus the indexer scanning all compressed keys. At 128K, per request per step (TP1): `
+    + `indexer <code>32,768 rows × 256 B × 12 layers = 96 MiB</code> + main KV <code>2,048 × 2,048 B × 12 layers = 24 MiB</code>, `
+    + `versus 3 GiB for a full read, a 25x difference. The reasoning is the same as for DSA / CSA2: the roofline goes through the <code>decodeReadPerReq</code> hook and does not use the full KV size.<br>`
+    + `As a result, attention FLOPs themselves are small for this model: each token attends to only 2,048 tokens, about 0.6 GFLOP (indexer scoring adds about 0.4 more at 128K), `
+    + `while the matmuls take about 12 GFLOP for 6B activated parameters — the opposite direction from the open to-do on Qwen3.8-27B that "attention and matmul are of the same order".`,
+
+    `<b>The Gated DeltaNet recurrent state = 108.0 MiB/request, independent of context.</b> <code>36 layers × 48 v-head × 128 × 128 × 4 B = 113,246,208 B</code>. `
+    + `As with Qwen3.8-27B, the dtype has two answers: <code>config.json</code> says <code>mamba_ssm_dtype: "float32"</code>, which this page uses (FP32); `
+    + `vLLM <code>--mamba-ssm-cache-dtype auto</code> falls back to the model dtype (BF16) for Gated DeltaNet, which gives 54 MiB.<br>`
+    + `The context at which state equals KV: at TP1, <code>113,246,208 ÷ 25,344 ≈ 4,468 tokens</code>; with the official TEP8 the state is ÷8 while the main KV is only ÷2, so it drops to about 1,084 tokens. `
+    + `At 1K context, state is 51% of a single request under TEP8, so this dtype choice can change concurrency by about 1.3x at short context and by less than 1% at 128K. `
+    + `There are also two short-convolution states (about 2.1 MiB for Gated DeltaNet and about 0.2 MiB/request for the PLE dilated convolution), not counted.`,
+
+    `<b>The n-gram embedding table (called PLE in vLLM): 51.2B parameters, attached only to layer 2, and by default it never enters HBM.</b> `
+    + `16 hash heads (8 each for bigram and trigram) × about 20M prime-sized buckets per head = 320,001,536 rows × 160 dims; each token looks up 16 rows, 5 KiB in total. `
+    + `The vLLM implementation: the table is vocab-parallel sharded over the ETP group (default = TP group); <code>EngramConfig.cpu_offload</code> defaults to <code>true</code>, `
+    + `so the whole table sits in pinned host memory and is prefetched while the previous layer computes. The recipe states: offload is required on H100 and optional on H200 and above; `
+    + `host memory must be "at least 51 GB plus runtime headroom" (FP8 build).<br>`
+    + `The PLE layer's own <code>key_proj / value_proj</code> (32.77M parameters) is not sharded by TP in vLLM (<code>disable_tp=True</code>); this page computes it as ÷TP, a 0.06 GiB difference, negligible.`,
+
+    `<b>Official configuration versus the numbers on this page.</b> For 8×H200 the recipe gives <b>TEP8</b> (TP8 + EP8, FP8 checkpoint, FP8 KV, FP8 indexer, MTP 3), `
+    + `for 4×GB300 it gives TEP4; the vLLM CI accuracy test uses FP8 + TP4. This page defaults to TEP8 + native BF16 weights + engine default dtypes; `
+    + `click the TP2×DP4 preset to see the effect of KV no longer being replicated.<br>`
+    + `<b>Two vLLM limits that this page does not model</b>: PP cannot start up today (selecting PP&gt;1 shows red text); DEP (TP1 × DP) must offload.`,
+
+    `<b>The per-GPU 12 GiB overhead guess is even less solid for this model.</b> Gated Residual has <code>hc_count = 4</code>: the residual stream is 4 parallel copies of 2560 dims (10240 dims in total), `
+    + `of the same kind as <code>hc_mult = 4</code> in DSv4.1, so the activation peak should be larger; the recipe commands all enable MTP with 3 draft tokens, which adds the draft's activations and state. `
+    + `And with TEP8 the weights are only 30 GiB per GPU, so overhead is 40% of that. The only measurement (<code>docs/measurements.md</code> M-001, GLM-5.3-Flash) <b>cannot be carried over here</b>.`,
   ],
 };

@@ -32,6 +32,9 @@ REG.models["deepseek-v4.1-flash"] = {
   blurb: "552B backbone(+196B engram)· 8B prefill / 16B decode 激活 · 40 层 CED(20 encoder + 20 decoder)"
        + " · CSA2 稀疏注意力,每 token KV 仅 890 B · 384 routed experts / top-6 · expert 原生 FP4 · 多模态"
        + " · 同结构的 -1017 刷新版适用本页全部数字",
+  blurbEn: "552B backbone (+196B engram) · 8B prefill / 16B decode activated · 40-layer CED (20 encoder + 20 decoder)"
+       + " · CSA2 sparse attention, only 890 B of KV per token · 384 routed experts / top-6 · native FP4 experts · multimodal"
+       + " · the -1017 refresh with the same structure: every number on this page applies",
   hidden: 5120,                              // dim,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构 ----
@@ -68,7 +71,7 @@ REG.models["deepseek-v4.1-flash"] = {
   kvDtypeFixed: true,
   kvDtypes: [
     // label 里不写「架构固定」—— 引擎的 banner 与假设区已经在句子里说了,写进 label 会套两层括号
-    { id: "fp4", label: "FP4 E2M1", bytes: 1 },   // bytes 不参与计算:CSA2 的字节数全走 perTokenFixedBytes
+    { id: "fp4", label: "FP4 E2M1", labelEn: "FP4 E2M1", bytes: 1 },   // bytes 不参与计算:CSA2 的字节数全走 perTokenFixedBytes
   ],
 
   moe: {
@@ -100,17 +103,24 @@ REG.models["deepseek-v4.1-flash"] = {
   // 引擎默认会把 expertParams ÷ 结构 的商当层数显示。这里那个商是 41,但它不是物理层数 ——
   // 40 层各 384 个专家,外加 3 个 DSpark 层各 128 个(3 × 128 = 384,恰好等价于一层)。
   expertLayerDesc: "41 层等效(40 层 × 384 + 3 个 DSpark 层 × 128)",
+  expertLayerDescEn: "41 layers equivalent (40 layers × 384 + 3 DSpark layers × 128)",
 
   // ---- 第三桶的文案 ----
   tpShardedLabel: "engram 哈希查表(按 TP 切,不按 PP 切)",
+  tpShardedLabelEn: "engram hash lookup table (split by TP, not by PP)",
   tpShardedShort: "engram 查表",
+  tpShardedShortEn: "engram lookup table",
   tpShardedNote: "字节数实测(2 × 384M 行 × 256 维 FP8);vLLM 默认放 host(cpu_offload),常驻 HBM 时按 TP 切",
+  tpShardedNoteEn: "Byte count measured (2 × 384M rows × 256 dims FP8); vLLM offloads it to host memory by default (cpu_offload); when resident in HBM it is split by TP",
   // 常驻那一档的另一个出路,显示在「常驻 HBM」那条 banner 里
   lookupHbmCaveat: `vLLM 另有 <code>--engram-config '{"embedding_across_dp": true}'</code>:把 hash head 摊到 TP × DP 全部卡上、只存一份,`
     + `代价是每步多一次 DP 间的集合通信 —— 本页不建模这一档,它介于常驻与 offload 之间。`,
+  lookupHbmCaveatEn: `vLLM also has <code>--engram-config '{"embedding_across_dp": true}'</code>: it spreads the hash heads across all TP × DP GPUs and stores only one copy, `
+    + `at the cost of one extra collective communication across DP per step — this page does not model this option, which sits between resident and offloaded.`,
 
   // ---- 每请求固定占用的文案(滑窗环,不是 recurrent state)----
   stateNote: "滑窗环形 buffer:结构由 config 推出(window_size 128),但存储 dtype 是假设(BF16 或 FP8)",
+  stateNoteEn: "Sliding-window ring buffer: the structure is derived from the config (window_size 128), but the storage dtype is an assumption (BF16 or FP8)",
 
   // ---- 量化 ----
   // 原生格式是 E2M1 + 每 32 元素一个 E8M0 scale(config 的 expert_dtype "fp4" + scale_fmt "ue8m0",
@@ -123,16 +133,16 @@ REG.models["deepseek-v4.1-flash"] = {
   // expert 权重可选格式。只给 convert.py 真正支持的两档(--expert-dtype fp4|fp8),
   // 不编造 BF16 那一档 —— 转换脚本没这个选项。bytesPerParam=null 表示「用实测字节数」。
   expertFormats: [
-    { id: "mxfp4", label: "MXFP4 E2M1(原生)", bytesPerParam: null },
+    { id: "mxfp4", label: "MXFP4 E2M1(原生)", labelEn: "MXFP4 E2M1 (native)", bytesPerParam: null },
     // cast_e2m1fn_to_e4m3fn():1 B + 每 32×32 块一个 scale = 1.0009765625,
     // 与本 checkpoint 里原生 FP8 的 shared expert 实测值逐位相同。275.67 → 519.36 GiB。
-    { id: "fp8",  label: "FP8 E4M3", bytesPerParam: 1.0009765625 },
+    { id: "fp8",  label: "FP8 E4M3", labelEn: "FP8 E4M3", bytesPerParam: 1.0009765625 },
   ],
   // 非 expert 是混合 dtype:大头(attention 的 wq/wkv/wo、shared expert)已经是 FP8,
   // 剩下 19.8 亿 BF16 参数是 embedding、lm_head、vision 塔、aligner、norms、compressor、hc_*。
   nonExpertFormats: [
-    { id: "native", label: "原生混合(实测)",     bf16Bytes: 2 },
-    { id: "fp8",    label: "BF16 部分也压成 FP8", bf16Bytes: 1 },
+    { id: "native", label: "原生混合(实测)", labelEn: "Native mixed (measured)",     bf16Bytes: 2 },
+    { id: "fp8",    label: "BF16 部分也压成 FP8", labelEn: "BF16 part also quantized to FP8", bf16Bytes: 1 },
   ],
 
   // ---- 候选实例:业务判断,与用户逐个确认,不从 instance 目录自动推导(ADR-0005 §2)。
@@ -164,16 +174,16 @@ REG.models["deepseek-v4.1-flash"] = {
   //   常驻时,掐住你的是只能按 TP 切的 engram,TP 有下限(p5en ≥4、b200 / b300 ≥2),最优 TP 是 4 / 4 / 2。
   // 所以名字只描述结构,括号里标常驻时 engram 被切成几份 —— 这是常驻那一档差异的机制,恒真。
   presets: [
-    { name: "TP8/DP1(官方 MP=8;常驻时 engram ÷8)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8  },
-    { name: "TP4/DP2(常驻时 engram ÷4)",            inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8  },
+    { name: "TP8/DP1(官方 MP=8;常驻时 engram ÷8)", nameEn: "TP8/DP1 (official MP=8; engram ÷8 when resident)", inst: "p5en.48xlarge",    n: 1, tp: 8, dp: 1, pp: 1, ep: 8  },
+    { name: "TP4/DP2(常驻时 engram ÷4)", nameEn: "TP4/DP2 (engram ÷4 when resident)",            inst: "p5en.48xlarge",    n: 1, tp: 4, dp: 2, pp: 1, ep: 8  },
     // 这两个在 engram 常驻时装不下 —— 留着不是凑数:放 host 时它们是 p5en 上最高的两档,
     // 切成常驻就直接红字。同一个按钮在两档之间 0 路 ⇄ 几千路,这是本页最该被看见的事。
-    { name: "TP2/DP4(常驻时 engram ÷2)",            inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
-    { name: "TP1×DP8(常驻时 engram 不切)",          inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8  },
+    { name: "TP2/DP4(常驻时 engram ÷2)", nameEn: "TP2/DP4 (engram ÷2 when resident)",            inst: "p5en.48xlarge",    n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
+    { name: "TP1×DP8(常驻时 engram 不切)", nameEn: "TP1×DP8 (engram not split when resident)",          inst: "p5en.48xlarge",    n: 1, tp: 1, dp: 8, pp: 1, ep: 8  },
     // b300 显存大到常驻时 TP=2 也能塞进 engram 的一半,于是常驻那一档的最优 TP 降下来
-    { name: "b300 TP2/DP4(常驻时 engram ÷2)",       inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
+    { name: "b300 TP2/DP4(常驻时 engram ÷2)", nameEn: "b300 TP2/DP4 (engram ÷2 when resident)",       inst: "p6-b300.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 8  },
     // 两台:EP 翻倍摊薄 expert,但常驻时 engram 仍只跟 TP 走 —— 所以 TP 不能跟着降
-    { name: "两台 TP4/DP4/EP16",                     inst: "p5en.48xlarge",    n: 2, tp: 4, dp: 4, pp: 1, ep: 16 },
+    { name: "两台 TP4/DP4/EP16", nameEn: "Two nodes TP4/DP4/EP16",                     inst: "p5en.48xlarge",    n: 2, tp: 4, dp: 4, pp: 1, ep: 16 },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -251,5 +261,80 @@ REG.models["deepseek-v4.1-flash"] = {
     + `<code>hc_mult = 4</code>:残差流以 <b>4 份并行副本</b>携带(Single-Pass mHC),激活量直接 ×4;`
     + `再加 <code>index_topk = 512</code> 与 <code>candidate_topk_blocks 2048 × block 8</code> 的 `
     + `indexer scratch。同一个常数在三个模型上的可信度不一样,别把它当成被验证过的值。`,
+  ],
+  notesEn: [
+    `<b>This page also applies to <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017" target="_blank" rel="noopener noreferrer">DeepSeek-V4.1-Flash-1017</a></b> `
+    + `(the 2026-10-17 refresh, which the model card calls a "minor update"). The two are <b>file-for-file identical</b> in <code>config.json</code>, <code>inference/config.json</code>, `
+    + `and <code>model.py / convert.py / engram.py / kernel.py / vision.py / README.md</code> under <code>inference/</code>. `
+    + `The <code>total_size</code> in <code>index.json</code> and the shard mapping of 96,085 tensors are the same, and the safetensors headers of the 48 shards `
+    + `(<code>dtype / shape / data_offsets</code> of every tensor) are <b>identical one by one</b> — only the weight values changed. GPU memory and roofline depend only on structure and byte counts, `
+    + `so every number on this page holds for -1017, and no separate page is needed.`,
+
+    `<b>Production engines now implement engram, and by default it does not go into HBM.</b> Since 2026-09-21 vLLM has a feature page for engram (<code>docs/features/engram.md</code>): `
+    + `a model with <code>engram_layer_ids</code> automatically builds an <code>EngramConfig()</code>, and <code>cpu_offload</code> defaults to <code>true</code> — `
+    + `the two tables sit in pinned host memory, the rows to look up are computed ahead from the token ids and prefetched over UVA on a side stream while the first few layers compute, "The freed GPU memory goes to the KV cache." `
+    + `On the host side each DP replica holds one TP slice; DP replicas on the same node share one copy through <code>/dev/shm</code> by default (<code>dp_shared_memory</code>). `
+    + `To keep it resident in HBM, pass <code>--engram-config.cpu_offload false</code> explicitly; there is also <code>embedding_across_dp</code>, which spreads the hash heads across all TP × DP GPUs and is not modeled on this page.<br>`
+    + `This page used to treat "the whole table resident in HBM" as the default and mark it as the largest guess on the page (magnitude 40%). ADR-0013 turned it into an input, with the vLLM default as the default value. `
+    + `On p5en the official MP=8 therefore goes from 488 to 697 concurrent requests, and TP1×DP8 goes from not fitting to 4,928. The old assumption is still there: switch to "resident in HBM" to see it.`,
+
+    `<b>All weights are measured values, exactly equal to index.json</b>. Method: send two Range requests to each of the 48 shards to read the `
+    + `safetensors header, and sum the <code>dtype / shape / data_offsets</code> of <b>96,085</b> tensors. `
+    + `The byte total is <code>510,286,023,000</code>, <b>exactly equal</b> to <code>metadata.total_size</code> in <code>index.json</code> `
+    + `= 475.24 GiB.<br>`
+    + `Note that the HF <code>/api/models/</code> <code>safetensors.parameters</code> for this model `
+    + `<b>does not match</b> (off by 23.56 GB): it does not recognize the scale dtype <code>F8_E8M0</code>, `
+    + `so a full 23,563,015,184 scale bytes were not counted. The three-way reconciliation done for GLM is only a two-way one here.`,
+
+    `<b>The experts are FP4, and the shape in the checkpoint is misleading.</b> The dtype tag of the expert tensors is `
+    + `<code>I8</code>, and the K dimension is only <b>half</b> of the real one (<code>w1 (2304, 2560)</code> is actually `
+    + `<code>(2304, 5120)</code>) — two FP4 values are packed into one byte. The logical parameter count must be multiplied by 2 to match: `
+    + `<code>2 × 278,585,671,680 = 557,171,343,360 = 15,744 × 3 × 2304 × 5120</code>, without any difference.<br>`
+    + `<b>Reading the shape literally underestimates the expert parameter count by a full factor of two</b>. The measured size is <code>0.53125</code> B per parameter `
+    + `= 0.5 for FP4 + one E8M0 scale per 32 elements, which <b>matches exactly</b> the `
+    + `<code>expert_dtype: fp4</code> + <code>scale_fmt: ue8m0</code> declared in <code>quantization_config</code>.`,
+
+    `<b>890 B/token was first derived from the reference implementation code and then matched against the model card.</b> `
+    + `In <code>inference/model.py</code>: <code>compress_kv_cache</code> is registered only on the 4 `
+    + `<code>kv_source_layers</code>, with shape <code>[bsz, max_seq_len ÷ compress_ratio, 512]</code>, `
+    + `and the quantization call is <code>fp4_act_quant(latent, 16, scale_dtype=float8_e4m3fn)</code> → `
+    + `<code>512×0.5 + 512÷16 = 288 B</code>; the indexer <code>k_cache</code> likewise exists only on those 4 layers, with `
+    + `<code>fp4_act_quant(k, 32)</code> (E8M0) → <code>128×0.5 + 128÷32 = 68 B</code>.<br>`
+    + `<code>compress_ratios</code> gives 2 for layers 2/8/14 and 1 for layer 20, so `
+    + `<code>(288+68) × (0.5+0.5+0.5+1) = 356 × 2.5 = <b>890 B/token</b></code>, `
+    + `which <b>matches exactly</b> the "<b>890 bytes per token</b>" on the model card. The primary-source derivation and the official statement match independently, `
+    + `so this item needs no estimate — it is firmer than the KV assumptions for both K3 and GLM.`,
+
+    `<b>CSA2 is sparse attention, and this time it <u>does</u> save GPU memory — but not in the way you would expect.</b> `
+    + `The GLM page says "DSA sparsity does not save GPU memory": <code>index_topk</code> sets how many tokens each query <b>looks at</b>, `
+    + `not how many are <b>stored</b>. This <b>still holds</b> for this model — <code>index_topk = 512</code> does not save GPU memory either.<br>`
+    + `The real savings come from three other things: (1) <b>cross-layer sharing</b> — only 4 of the 40 layers hold KV, and the other layers read the same copy; `
+    + `(2) <b>compression along the time axis</b> — the 3 encoder layers have <code>compress_ratio = 2</code>, pooling two tokens into one latent; `
+    + `(3) <b>FP4</b> — the latent drops from 2 B/element in BF16 to 0.5 B + scale. `
+    + `Only the three together give 890 B/token (K3 is 27,648, GLM is 11,616). <b>The sparsity itself saves nothing.</b>`,
+
+    `<b>The sliding-window ring buffer dominates at short context.</b> Each layer has one fixed-size ring of 128 slots (<code>window_size = 128</code>), `
+    + `<b>5.000 MiB/request</b> across the 40 layers, <b>independent of context length</b>. The context at which it equals KV is `
+    + `<code>5,242,880 ÷ 890 ≈ 5,891 tokens</code> — <b>at 1K context it takes 85% of a single request</b>, `
+    + `and leaving it out would overstate the concurrency at 1K by 6.75 times.<br>`
+    + `It also <b>cannot be split</b>: the ring stores the 512-dimension latent shared by all heads, one full copy on each GPU, `
+    + `behaving like the KV cache and <b>opposite</b> to GLM's per-head recurrent state.`,
+
+    `<b>The runtime bytes are 1.25 GiB more than the checkpoint; this page counts the checkpoint.</b> `
+    + `During conversion <code>convert.py</code> <b>dequantizes</b> <code>wo_a</code> from FP8 <b>to BF16 and saves that to disk</b> `
+    + `(a source comment admits "an fp8 grouped GEMM would halve the memory"), and the <code>wkv</code> of 3 compressors is also raised to FP32, for a total of `
+    + `<code>+1,341,431,552 + 15,728,640 ≈ +1.25 GiB</code>.<br>`
+    + `This page keeps counting checkpoint bytes — they can be reconciled with <code>total_size</code>, while the runtime bytes depend on `
+    + `the choices of the conversion script and change with the engine. 1.25 GiB is 0.26% of 475 GiB, but this is the first crack in the word "measured".`,
+
+    `<b>The 3 DSpark layers and the vision tower are both counted as "loaded".</b> DSpark (the draft head for speculative decoding) has its own 128 experts, `
+    + `and <b>6.72 GiB</b> of the expert bucket is theirs; without speculative decoding the engine does not load them, and the sliding-window ring also has 3 fewer layers. `
+    + `The vision tower + aligner, <b>0.90 GiB</b> in total (BF16, 412M parameters), are counted as resident; `
+    + `the GPU memory of the image tokens themselves (<code>vision_max_n_token = 1024</code> per image) is <b>not counted</b> — that belongs to batch composition.`,
+
+    `<b>The 12 GiB per-GPU overhead guess is less solid for this model than for the first two.</b> `
+    + `<code>hc_mult = 4</code>: the residual stream is carried as <b>4 parallel copies</b> (Single-Pass mHC), so activations are multiplied by 4 directly; `
+    + `on top of that, there is the indexer scratch of <code>index_topk = 512</code> and <code>candidate_topk_blocks 2048 × block 8</code>. `
+    + `The same constant is not equally trustworthy across the three models; do not treat it as a validated value.`,
   ],
 };

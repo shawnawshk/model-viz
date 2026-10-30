@@ -23,6 +23,8 @@ REG.models["qwen3.8-27b"] = {
   },
   blurb: "27.8B dense(无 MoE,全部激活)· 64 层混合注意力(48 Gated DeltaNet 线性 + 16 Gated Attention,3:1)"
        + " · GQA 24 q / 4 kv head,head_dim 256 · 原生 BF16,官方另有 FP8 · 多模态 · 262K 原生上下文(YaRN 至 1M)",
+  blurbEn: "27.8B dense (no MoE, all params activated) · 64-layer hybrid attention (48 Gated DeltaNet linear + 16 Gated Attention, 3:1)"
+         + " · GQA 24 q / 4 kv heads, head_dim 256 · native BF16, official FP8 also available · multimodal · 262K native context (YaRN up to 1M)",
   hidden: 5120,                              // hidden_size,只用于 PP 的 send/recv 激活量
 
   // ---- 层结构 ----
@@ -33,7 +35,7 @@ REG.models["qwen3.8-27b"] = {
       note: "Gated Attention = GQA + 输出门。KV 按 kv head 切:TP ≤ 4 时每卡只存自己那 4/TP 个 head,"
           + "TP 组合起来恰好一份;TP=8 时每卡 1 个 head、复制 2 份。partial_rotary_factor 0.25 → RoPE 只占 64 维,"
           + "不影响 KV 字节数(K 整个 256 维都进 cache)" },
-    { count: 48, family: "linear", label: "Gated DeltaNet 线性注意力", heads: 48, kHeads: 16, headDim: 128, stateDtypeBytes: 4,
+    { count: 48, family: "linear", label: "Gated DeltaNet 线性注意力", labelEn: "Gated DeltaNet linear attention", heads: 48, kHeads: 16, headDim: 128, stateDtypeBytes: 4,
       note: "Gated DeltaNet。recurrent state 形状 [48 v-head × 128 k-dim × 128 v-dim],与序列长度无关,"
           + "per-head 可按 TP 切分,不复制。另有 kernel=4 的短卷积 state(48 层 × 10240 通道 × 3 × 2 B ≈ 2.8 MiB/请求),量级可忽略,未计入" },
   ],
@@ -43,8 +45,8 @@ REG.models["qwen3.8-27b"] = {
   // 理由与 K3 / GLM 相同,见 ADR-0007。第一项即默认值(auto = 模型 dtype = BF16)。
   // vLLM 官方 recipe 的所有启动命令都显式传了 --kv-cache-dtype fp8,并明说「fp8 KV is a choice here, not a requirement」。
   kvDtypes: [
-    { id: "bf16", label: "BF16(引擎默认)",   bytes: 2 },
-    { id: "fp8",  label: "FP8(需显式开启)", bytes: 1 },
+    { id: "bf16", label: "BF16(引擎默认)",   labelEn: "BF16 (engine default)", bytes: 2 },
+    { id: "fp8",  label: "FP8(需显式开启)", labelEn: "FP8 (opt-in)",          bytes: 1 },
   ],
 
   // 没有 moe 块 = dense 模型(ADR-0012)。引擎据此隐藏 EP 与 expert 权重两个控件,expert 桶恒为 0。
@@ -67,6 +69,7 @@ REG.models["qwen3.8-27b"] = {
                                            // 扣了就与另三个模型(没有这个字段、一律含 embedding)口径不一致,ADR-0010 当时选的是「含,高估不到 3%」
   },
   nonExpertFixedDesc: "embed / lm_head / vision / norms,官方 FP8 也保留 BF16",
+  nonExpertFixedDescEn: "embed / lm_head / vision / norms, kept in BF16 even in the official FP8 checkpoint",
   nonExpertFixedDtype: "bf16",             // 上面那部分是 BF16,roofline 算力行按 BF16 算(缺省会按 FP8/F32 算)
 
   // ---- 量化 ----
@@ -82,8 +85,8 @@ REG.models["qwen3.8-27b"] = {
   //           故量化部分每参数 1 + 2/(128×128) = 1.0001220703125 B,精确;总字节 30,866,663,264 = 28.75 GiB。
   //           不是「一半」:6.16 GiB 的 embed / lm_head / vision 官方也没量化,所以只省 44%。
   nonExpertFormats: [
-    { id: "bf16", label: "BF16(原生 checkpoint)",           bf16Bytes: 2 },
-    { id: "fp8",  label: "FP8 E4M3(官方 FP8 checkpoint,实测)", bf16Bytes: 1.0001220703125, dtype: "fp8" },
+    { id: "bf16", label: "BF16(原生 checkpoint)",           labelEn: "BF16 (native checkpoint)", bf16Bytes: 2 },
+    { id: "fp8",  label: "FP8 E4M3(官方 FP8 checkpoint,实测)", labelEn: "FP8 E4M3 (official FP8 checkpoint)", bf16Bytes: 1.0001220703125, dtype: "fp8" },
   ],
 
   // ---- 候选实例:业务判断(ADR-0005 §2)。2026-09-16 由本次会话拟定,未逐个与用户确认,可删。
@@ -126,14 +129,14 @@ REG.models["qwen3.8-27b"] = {
   // TP ≤ 4 时 KV 按 head 切、不复制,TP 同时还切权重,所以 TP 越大越好;TP=8 越过 4 个 kv head,
   // KV 开始复制 2 份、DP 少一半,并发掉回 TP1 的水平。括号里标该切分下 KV 被复制几份 —— 这是差异的机制,恒真。
   presets: [
-    { name: "TP8/DP1(TP > n_kv_heads,KV ×2)",   inst: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 1 },
-    { name: "TP4×DP2(TP = n_kv_heads,KV ×1)",   inst: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 1 },
-    { name: "TP2×DP4(KV ×1,权重 ×4)",           inst: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 1 },
-    { name: "TP1×DP8(KV ×1,权重 ×8)",           inst: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1 },
+    { name: "TP8/DP1(TP > n_kv_heads,KV ×2)",   nameEn: "TP8/DP1 (TP > n_kv_heads, KV ×2)", inst: "p5en.48xlarge", n: 1, tp: 8, dp: 1, pp: 1, ep: 1 },
+    { name: "TP4×DP2(TP = n_kv_heads,KV ×1)",   nameEn: "TP4×DP2 (TP = n_kv_heads, KV ×1)", inst: "p5en.48xlarge", n: 1, tp: 4, dp: 2, pp: 1, ep: 1 },
+    { name: "TP2×DP4(KV ×1,权重 ×4)",           nameEn: "TP2×DP4 (KV ×1, weights ×4)", inst: "p5en.48xlarge", n: 1, tp: 2, dp: 4, pp: 1, ep: 1 },
+    { name: "TP1×DP8(KV ×1,权重 ×8)",           nameEn: "TP1×DP8 (KV ×1, weights ×8)", inst: "p5en.48xlarge", n: 1, tp: 1, dp: 8, pp: 1, ep: 1 },
     // 80 GB 一档:同样的 TP4×DP2,预算从 126.9 降到 72 GiB,权重 + overhead 占掉 35%
-    { name: "p5 H100 80GB TP4×DP2",               inst: "p5.48xlarge",   n: 1, tp: 4, dp: 2, pp: 1, ep: 1 },
+    { name: "p5 H100 80GB TP4×DP2",               nameEn: "p5 H100 80GB TP4×DP2", inst: "p5.48xlarge",   n: 1, tp: 4, dp: 2, pp: 1, ep: 1 },
     // 无 NVLink:TP 只能是 1,每卡背满 51.75 GiB 权重 —— 这是 ADR-0001 在本项目里第一次实际起作用
-    { name: "g7e TP1×DP8(无 NVLink,TP 上限 1)",  inst: "g7e.48xlarge",  n: 1, tp: 1, dp: 8, pp: 1, ep: 1 },
+    { name: "g7e TP1×DP8(无 NVLink,TP 上限 1)",  nameEn: "g7e TP1×DP8 (no NVLink, TP limit 1)", inst: "g7e.48xlarge",  n: 1, tp: 1, dp: 8, pp: 1, ep: 1 },
   ],
 
   // ---- 本模型专属的口径说明,渲染进「计算口径与假设」里 ----
@@ -204,5 +207,73 @@ REG.models["qwen3.8-27b"] = {
     + `dense 27B 的权重项本来就小,漏掉的这一项相对更大;(2) embedding(1.27B,查表)与 vision 塔(0.46B,decode 不跑)共 6.2% 的参数不做矩阵乘,`
     + `算力行按参数量算把它们也算进去了。两项方向相反,都不改变「HBM 带宽受限」的 regime:GDN state 每步读 + 写各 144 MiB/请求 ÷ TP,`
     + `这个随并发线性涨的斜率比算力项大,与 GLM / K3 一样到 4,096 路也到不了拐点。`,
+  ],
+  notesEn: [
+    `<b>All weights are measured values, reconciled three ways, and this is the cleanest set so far.</b> We read the safetensors header of each of the 18 shards with Range requests `
+    + `and summed the <code>dtype / shape / data_offsets</code> of <b>1,199</b> tensors: total bytes <code>55,562,855,904</code>, `
+    + `<b>exactly equal</b> to <code>metadata.total_size</code> in <code>index.json</code> = 51.75 GiB; total params `
+    + `<code>27,781,427,952</code>, <b>exactly equal</b> to <code>safetensors.parameters.BF16</code> from HF <code>/api/models/Qwen/Qwen3.8-27B</code>; `
+    + `<b>all 1,199 tensors are BF16, not one F32</b> (the norms in K3 / GLM are F32).<br>`
+    + `Breakdown: MLP of 64 layers 31.88 GiB (61.6%), GDN projections of 48 layers 10.36, attention projections of 16 layers 3.13, embedding 2.37 + lm_head 2.37 `
+    + `(<code>tie_word_embeddings = false</code>, two 248,320 × 5120 tables, 9.2% together), MTP 0.79, vision tower 0.86.`,
+
+    `<b>The "non-expert weights → FP8" option is measured on this model, not assumed.</b> We also read all 1,606 tensors of the official <code>Qwen/Qwen3.8-27B-FP8</code> tensor by tensor: `
+    + `407 <code>F8_E4M3</code> weights with <code>24,699,207,680</code> params in total, each with a <b>BF16</b> <code>weight_scale_inv</code> `
+    + `(<code>weight_block_size [128,128]</code>; the scale in GLM is F32), so the quantized part costs <code>1 + 2/16384 = 1.0001220703125</code> B per param, exactly; `
+    + `the other 792 tensors, <code>3,082,220,272</code> params, stay BF16. Total <code>30,866,663,264</code> B = <b>28.75 GiB</b>, `
+    + `which is <b>exactly equal</b> to the HF API figure for that repo, <code>BF16 3,082,220,272 + F8_E4M3 24,699,207,680 = 27,781,427,952</code> (the same total as this checkpoint).<br>`
+    + `<b>It is not "half"</b>: embed / lm_head / vision / norms and a few small GDN tensors, 6.16 GiB in all, are not quantized in the official checkpoint either, so FP8 only reduces 51.75 to 28.75 (−44%). `
+    + `This is also the split line of <code>nonExpertBf16Params / nonExpertFixedBytes</code> in the data file — on this model they mean "what the official FP8 quantized / what it kept", `
+    + `not the "BF16 vs F32 / native FP8" split of K3 / GLM. The roofline compute line counts those 3.08B params that stay BF16 as BF16, not FP8.`,
+
+    `<b>The KV cache is the largest of the four models: 65,536 B/token (BF16).</b> 16 GQA layers × 2 (K+V) × 4 kv heads × head_dim 256 = `
+    + `<b>32,768 elements/token</b> → BF16 64 KiB, FP8 32 KiB. Compare K3 27,648 B, GLM 11,616 B, DSv4.1 890 B — `
+    + `2.4 times K3 and 74 times DSv4.1. head_dim 256 is the main cause (the common 128 would give half); the 3:1 hybrid layout is what holds it to 16 layers, `
+    + `and 64 full-GQA layers would be 256 KiB/token.<br>`
+    + `<b>The replication factor is <code>max(1, TP ÷ 4)</code>, not TP</b>: KV is sharded by kv head and only 4 heads can be split. At TP ≤ 4 each GPU stores only its own heads and the TP group together holds exactly one copy; `
+    + `at TP=8 each GPU needs at least 1 head, so it is replicated 2 times. This is the mechanism by which TP4×DP2 beats both TP8/DP1 and TP1×DP8 on p5en (100 vs 53 vs 56 concurrent requests at 128K/0.90). `
+    + `The MLA-family statement "each GPU holds a full copy of the latent" does <b>not</b> hold here; see ADR-0012.<br>`
+    + `<b>The KV of the MTP layer is not counted</b>: with speculative decoding on, the engine allocates another cache for the draft layer (also one GQA layer), adding 1/16 per token.`,
+
+    `<b>The Gated DeltaNet recurrent state = 144.0 MiB/request, independent of context, and its dtype has two "official" answers.</b> `
+    + `48 layers × 48 v-heads × 128 × 128 × 4 B = <code>150,994,944</code> B. <code>config.json</code> says <code>mamba_ssm_dtype: "float32"</code>, `
+    + `the HF reference implementation allocates accordingly, and this page counts FP32. <b>But vLLM does not</b>: <code>--mamba-ssm-cache-dtype</code> defaults to <code>auto</code>, `
+    + `and for the Gated DeltaNet path (<code>MambaStateDtypeCalculator._mamba_state_dtype</code>) auto → conv state dtype → <b>model dtype BF16</b>; `
+    + `for the KDA path (K3 / GLM) auto is float32 instead. So on vLLM with no flag it is <b>72 MiB/request</b>, and you must pass <code>float32</code> explicitly to match the config.<br>`
+    + `Break-even context where state equals KV = <code>150,994,944 ÷ 65,536</code> = <b>2,304 tokens</b> (TP=1); at TP=8 state is ÷8 while KV is only ÷4, so the break-even drops to 1,152. `
+    + `<b>At 1K the state is 69% of a single request</b> (TP ≤ 4; at TP=8 state is ÷8 while KV is only ÷4, which lowers it to 53%), so at short context that dtype choice changes concurrency by about 1.5 times, and by less than 1% at 128K. `
+    + `The vLLM recipe has a measured confirmation: on 1× RTX 5090 @32K, switching KV to FP8 only grows the pool from 76,458 to 91,022 tokens (1.19×, not 2×) — `
+    + `because state is not affected by <code>--kv-cache-dtype</code> but shares the same pool with KV.`,
+
+    `<b>The MTP layer and the vision tower are both counted as "loaded"</b>, 0.79 / 0.86 GiB (3.2% together). <code>mtp_num_hidden_layers = 1</code>: `
+    + `one full GQA layer + MLP plus <code>fc [5120, 10240]</code>, which the engine does not load when speculative decoding is off; the vision tower is a 27-layer ViT + merger, `
+    + `which text-only serving can skip with <code>--language-model-only</code> — in the vLLM recipe this switch grows the KV pool on 1× 5090 @32K from 91,022 to 135,926 tokens, `
+    + `and the extra 44,904 tokens × 16 KiB (FP8) ≈ 0.7 GiB is the same order as the 0.86 GiB of the vision tower, an indirect measurement of this item.`,
+
+    `<b>TP can only be 1 / 2 / 4 / 8.</b> The 24 q heads, 4 kv heads, and the 16 k heads / 48 v heads of GDN must all be divisible by TP `
+    + `(a TP that is a multiple of the kv head count is allowed, and then the kv heads are replicated). TP=16 (two nodes) is blocked by <code>24 % 16 ≠ 0</code>, and vLLM / SGLang refuse to start — `
+    + `selecting such a split on this page shows red text, and the numbers come from mechanical division and do not mean the split is deployable. So this model can <b>span nodes only through DP or PP</b>, and since one GPU holds it, spanning nodes is not needed anyway.`,
+
+    `<b>The 12 GiB per-GPU overhead guess affects this model the most of the four models, and its direction on this model is unknown.</b> At TP=8 the weights are only 6.47 GiB per GPU, `
+    + `so overhead is <b>1.9 times</b> the weights. On 2026-09-16 we started a service for GLM-5.3-Flash on p5en, and the non-weight, non-KV overhead reported by the engine was `
+    + `<b>6.98 GiB</b> (non-torch 1.74 + activation peak 4.04 + CUDA graph 1.20), so <b>in that configuration</b> this page was about 72% too high. `
+    + `<b>But that difference does not carry over to this model</b>: replacing 12 with 6.98 moves GLM on p5en/TP8 from 53 to 56 concurrent requests (5%), `
+    + `while this model on g7e/TP1 goes from 16 to 24 (<b>50%</b>) — an order of magnitude apart, because on a small model overhead `
+    + `is a much larger share of the fixed cost. <b>The direction is not guaranteed either</b>: TP=1 has no cross-GPU communication buffer, but activations are not sharded and may be larger, `
+    + `so the real overhead of this model is not necessarily below 12 GiB. It <b>can flip whether a small-memory instance type fits</b>: g6e (44.7 GiB), originally a candidate, `
+    + `was decided by these 5 GiB alone and was removed from the candidates for that reason; see the comment on <code>candidateInstances</code>.<br>`
+    + `The vLLM recipe also records something that is the opposite of the assumption on this page: the CUDA graph capture allocation is <b>outside the util budget</b> (on 1× 5090 "0.80 and 0.93 both leave only 47 MiB", `
+    + `and it only starts with <code>--enforce-eager</code>), while this page puts the whole 12 GiB inside the budget. Neither assumption is wrong, but align on this before back-solving overhead. `
+    + `The engine-reported numbers in the recipe (2× 5090 TP2, FP8 weights 14.28 GiB/GPU, FP8 KV, 262K: KV pool 377,456 tokens) are the first set of `
+    + `<b>engine-reported</b> readings this project has seen, but by the provenance definition in <code>docs/glossary.md</code> they are <b>not counted as <code>measured</code></b> — that level requires `
+    + `"measured on the target hardware", and the 5090 is not among the candidate instance types and the numbers were not produced by this project. <b>The only entry in <code>measured</code> is `
+    + `<code>docs/measurements.md</code> M-001</b> (GLM-5.3-Flash on p5en). `
+    + `In addition, the allocation rules of the vLLM hybrid pool (attention KV and GDN state share it, page-aligned) are not modeled on this page, so these 5090 numbers cannot be used directly for back-solving either.`,
+
+    `<b>The roofline compute line is looser on this model than on MoE models.</b> Two things: (1) the FLOPs of attention itself are not counted, and at 128K they are `
+    + `<code>4 × 131,072 × 24 heads × 256 × 16 layers ≈ 51.5 GFLOP/token</code>, the <b>same order</b> as the weight matmul <code>2 × 27.78B = 55.6 GFLOP</code> — `
+    + `the weight term of a dense 27B model is small to begin with, so the omitted term is relatively larger; (2) embedding (1.27B, table lookup) and the vision tower (0.46B, not run in decode), 6.2% of the params together, do no matmul, `
+    + `and the compute line counts them anyway because it works from param count. The two effects have opposite directions, and neither changes the "HBM-bandwidth-bound" regime: the GDN state is read and written 144 MiB/request each per step ÷ TP, `
+    + `and this slope, which grows linearly with concurrency, is larger than the compute term, so as with GLM / K3 the knee is not reached even at 4,096 concurrent requests.`,
   ],
 };
